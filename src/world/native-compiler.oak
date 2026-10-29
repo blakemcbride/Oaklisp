@@ -69,7 +69,7 @@
     (object-type . 12) (boot-code . 13) (free-ptr . 14) (cons-limit . 15)
     (segment-type . 16) (uninitialized . 17) (next-newspace-size . 18)
     (method-type . 19) (operation-type . 20) (false . 21) (process . 22)
-    (threads-enabled? . 23)))
+    (threads-enabled? . 23) (thread-index . 24)))
 
 (define native-stream-primitive-arity
   '(0 0 0 2 2 2 1 1 2 1 1 1 2 2 4 2 4 1 4))
@@ -1296,6 +1296,7 @@
 		   ((operation-type) (emit "ON_PUSH(e_operation_type);"))
 		   ((process) (emit "ON_PUSH(e_process);"))
 		   ((threads-enabled?) (emit "ON_PUSH(e_nil);"))
+		   ((thread-index) (emit "ON_PUSH(INT_TO_REF(0));"))
 		   (else (escape "" instr))))
 	      ((store-reg)
 	       (let* ((reg (cadr instr))

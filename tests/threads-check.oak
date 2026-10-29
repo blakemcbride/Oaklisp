@@ -11,3 +11,5 @@
 (check "mutex" (let ((m (make mutex))) (acquire-mutex m) (release-mutex m) 'ok) 'ok)
 (check "test-and-set" (let ((c (list #f))) (list (%test-and-set-locative (make-locative (car c)) #f #t) (car c))) '(#t #t))
 (check "arithmetic still works" (let loop ((n 1000) (a 0)) (if (= n 0) a (loop (- n 1) (+ a n)))) 500500)
+(check "main thread index" (%thread-index) 0)
+(check "named mutex" (mutex-name (make-named-mutex 'stress)) 'stress)

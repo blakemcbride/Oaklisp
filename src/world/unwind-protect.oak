@@ -32,7 +32,51 @@
 
 (define (unset-windings)
   (set! %windings '())
-  (set! %wind-count 0))
+  (set! %wind-count 0)
+  (set! %%pending-rewind #f)
+  (set-current-windings! '() 0)
+  (set-current-pending-rewind! #f))
+
+;;; The winding stack belongs to the current process, as fluid
+;;; bindings do (fluid.oak): resuming one process's continuation must
+;;; not unwind another's windings.  Until there is a process object
+;;; it is kept in the globals above.  So is the rewind a continuation
+;;; leaves for its landing (%CALL/CC, CALL/CC).
+
+(define (current-windings)
+  (let ((z (%load-process)))
+    (if (eq? z 0) %windings (process-windings z))))
+
+(define (current-wind-count)
+  (let ((z (%load-process)))
+    (if (eq? z 0) %wind-count (process-wind-count z))))
+
+(define (set-current-windings! windings count)
+  (let ((z (%load-process)))
+    (cond ((eq? z 0)
+	   (set! %windings windings)
+	   (set! %wind-count count))
+	  (else
+	   (set! (process-windings z) windings)
+	   (set! (process-wind-count z) count)))))
+
+(define (%push-winding item)
+  (set-current-windings! (cons item (current-windings))
+			 (+ (current-wind-count) 1)))
+
+(define (%pop-winding)
+  (set-current-windings! (cdr (current-windings))
+			 (- (current-wind-count) 1)))
+
+(define (current-pending-rewind)
+  (let ((z (%load-process)))
+    (if (eq? z 0) %%pending-rewind (process-pending-rewind z))))
+
+(define (set-current-pending-rewind! x)
+  (let ((z (%load-process)))
+    (if (eq? z 0)
+	(set! %%pending-rewind x)
+	(set! (process-pending-rewind z) x))))
 
 (unset-windings)
 
@@ -63,8 +107,7 @@
 	  (lambda (from-count to to-count)
 	    (unless (= from-count to-count)
 	      (rewind-aux from-count (cdr to) (- to-count 1))
-	      (set! %windings to)
-	      (set! %wind-count to-count)
+	      (set-current-windings! to to-count)
 	      (let ((item (car to)))
 ;		(set! fluid-binding-list (cddr item))
 		(set-current-fluid-bindings (cddr item))
@@ -73,15 +116,13 @@
   (define (rewind from-count to to-count)
     (unless (= from-count to-count)
       (rewind-aux from-count to to-count)
-      (set! %windings to)
-      (set! %wind-count to-count))))
+      (set-current-windings! to to-count))))
 
 ;;; Usage as above.
 
 (define (unwind from from-count to-count)
   (iterate aux ((w from)(c from-count))
-    (set! %windings w)
-    (set! %wind-count c)
+    (set-current-windings! w c)
     (unless (= c to-count)
       (let ((item (car w)))
 ;	(set! fluid-binding-list (cddr item))
@@ -93,11 +134,9 @@
 
 (define (dynamic-wind before during after)
   (before)
-  (push %windings (list* after before (get-current-fluid-bindings)))
-  (set! %wind-count (+ %wind-count 1))
+  (%push-winding (list* after before (get-current-fluid-bindings)))
   (block0 (during)
-	  (pop %windings)
-	  (set! %wind-count (- %wind-count 1))
+	  (%pop-winding)
 	  (after)))
 
 ;;; And now some fancy interfaces:
@@ -109,11 +148,9 @@
   (let ((a (genvar))(b (genvar)))
     `(let ((,b (lambda () ,before)) (,a (lambda () ,after)))
        (,b)
-       (push %windings (list* ,a ,b (get-current-fluid-bindings)))
-       (set! %wind-count (+ %wind-count 1))
+       (%push-winding (list* ,a ,b (get-current-fluid-bindings)))
        (block0 ,during
-	       (pop %windings)
-	       (set! %wind-count (- %wind-count 1))
+	       (%pop-winding)
 	       (,a)))))
 
 ;;; This one does different things depending on whether the entries
@@ -124,13 +161,11 @@
 				   normal-after abnormal-after)
   `(block
      ,normal-before
-     (push %windings (list* (lambda () ,abnormal-after)
-			    (lambda () ,abnormal-before)
-			    (get-current-fluid-bindings)))
-     (set! %wind-count (+ %wind-count 1))
+     (%push-winding (list* (lambda () ,abnormal-after)
+			   (lambda () ,abnormal-before)
+			   (get-current-fluid-bindings)))
      (block0 ,during
-	     (pop %windings)
-	     (set! %wind-count (- %wind-count 1))
+	     (%pop-winding)
 	     ,normal-after)))
 
 ;;; eof

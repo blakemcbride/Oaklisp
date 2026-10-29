@@ -1,7 +1,10 @@
 Thread Support in Oaklisp
 ==========================
 
-Status: EXPERIMENTAL (disabled by default; with `--pthreads N` the compiler deadlocks, see Initialization)
+Status: the interpreter and the bytecode compiler work with threads
+(`make check` passes in every configuration, `threads-stress.test`
+included); natively compiled code does not run threaded yet.
+Disabled by default.
 
 Enable with: `./configure --enable-threads`
 
@@ -108,19 +111,16 @@ Synchronization primitives (all in `multiproc.oak`):
 Initialization
 ===============
 
-Thread infrastructure is **not** initialized at warm boot, because
-that would make the compiler deadlock: when mutex guards are active, compiling expressions that
-contain branch instructions (if/cond/or) re-enters mutex-protected
-code in the method-installation path.
-
-Threading is initialized explicitly via `--pthreads N`, which calls
+Every warm boot gives the machine a process object
+(`init-process-object`), and from then on fluid bindings and the
+winding stack are per process.  The guard mutexes and the extra OS
+threads come with `--pthreads N`, which calls
 `setup-initial-process-object` in `multiproc.oak`.  This in turn
 calls `init-thread-infrastructure`, which:
 
-1. Creates a process descriptor and stores it in the process register
-2. Sets `%no-threading` to `#f` (enables per-process fluid bindings)
-3. Initializes all guard-variable mutexes
-4. Redefines process initialization to assign unique PIDs
+1. Makes sure the process object exists
+2. Initializes all guard-variable mutexes
+3. Redefines process initialization to assign unique PIDs
 
 Then `spawn-heavyweight-threads` creates N-1 additional native threads.
 
@@ -192,13 +192,17 @@ Testing
 `make check`'s bytecode tests (all of `tests/*.test` except the native,
 stand-alone and consistency tests, which need the build tree's own
 emulator) against the standard world, with the emulator built each
-way:
+way.  `threads-stress.test` runs `threads-stress.oak` (bignums,
+lists, interning, `add-method`, `catch`/`throw`, `eval`, all compiled
+at load) three times under `--pthreads 3`, then compiles six files at
+once in futures and requires the objects to match a single-threaded
+compile.
 
 | Config | Flags | Result |
 |--------|-------|--------|
 | 1 | Default (copying GC) | all pass (`threads.test` skips) |
-| 2 | `USE_MARK_SWEEP` | `promises.test` fails: "Illegal parametric instruction 48" on its user-locale run, every time; the rest pass (`threads.test` skips) |
-| 3 | `THREADS` | segfaults in `control.test`, `data.test`, `promises.test` and `threads.test`, every time |
+| 2 | `USE_MARK_SWEEP` | all pass (the thread tests skip) |
+| 3 | `THREADS` | all pass |
 | 4 | `THREADS + USE_MARK_SWEEP` (`--enable-threads`) | all pass |
 
 Only configurations 1 and 4 can be configured; 2 and 3 need the flags

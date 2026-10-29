@@ -101,6 +101,10 @@ static inline int CTZ64(uint64_t x) {
  *   OAK_ATOMIC_FETCH_OR_U64(ptr, val)   - atomic OR on uint64_t, relaxed
  *   OAK_ATOMIC_LOAD_REF(ptr)            - atomic load with acquire semantics
  *   OAK_ATOMIC_STORE_REF(ptr, val)      - atomic store with release semantics
+ *   OAK_ATOMIC_CAS_SIZE(ptr, expp, val) - compare-and-swap on a size_t,
+ *                                         acquire on success; on failure
+ *                                         *expp gets the value seen
+ *   OAK_ATOMIC_FENCE_ACQUIRE(), OAK_ATOMIC_FENCE_RELEASE()
  */
 
 #if (defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L \
@@ -120,6 +124,15 @@ static inline int CTZ64(uint64_t x) {
     atomic_store_explicit((_Atomic size_t *)(ptr), (val), \
 			  memory_order_release)
 
+#define OAK_ATOMIC_CAS_SIZE(ptr, expp, val) \
+    atomic_compare_exchange_strong_explicit((_Atomic size_t *)(ptr), \
+					    (size_t *)(expp), (val), \
+					    memory_order_acquire, \
+					    memory_order_relaxed)
+
+#define OAK_ATOMIC_FENCE_ACQUIRE() atomic_thread_fence(memory_order_acquire)
+#define OAK_ATOMIC_FENCE_RELEASE() atomic_thread_fence(memory_order_release)
+
 #elif defined(__GNUC__) || defined(__clang__)
 
 #define OAK_ATOMIC_FETCH_OR_U64(ptr, val) \
@@ -130,6 +143,13 @@ static inline int CTZ64(uint64_t x) {
 
 #define OAK_ATOMIC_STORE_REF(ptr, val) \
     __atomic_store_n((ptr), (val), __ATOMIC_RELEASE)
+
+#define OAK_ATOMIC_CAS_SIZE(ptr, expp, val) \
+    __atomic_compare_exchange_n((ptr), (expp), (val), 0, \
+				__ATOMIC_ACQUIRE, __ATOMIC_RELAXED)
+
+#define OAK_ATOMIC_FENCE_ACQUIRE() __atomic_thread_fence(__ATOMIC_ACQUIRE)
+#define OAK_ATOMIC_FENCE_RELEASE() __atomic_thread_fence(__ATOMIC_RELEASE)
 
 #elif defined(_MSC_VER)
 
@@ -152,6 +172,22 @@ static inline void oak_atomic_store_ref_(volatile size_t *p, size_t v) {
 }
 #define OAK_ATOMIC_STORE_REF(ptr, val) \
     oak_atomic_store_ref_((volatile size_t *)(ptr), (val))
+
+static inline int oak_atomic_cas_size_(volatile size_t *p, size_t *e, size_t v) {
+    size_t old = (size_t)_InterlockedCompareExchange64(
+	(volatile long long *)p, (long long)v, (long long)*e);
+    if (old == *e)
+	return 1;
+    *e = old;
+    return 0;
+}
+#define OAK_ATOMIC_CAS_SIZE(ptr, expp, val) \
+    oak_atomic_cas_size_((volatile size_t *)(ptr), (expp), (val))
+
+/* x86 and x64 order loads and stores enough that keeping the compiler
+   from reordering suffices. */
+#define OAK_ATOMIC_FENCE_ACQUIRE() _ReadWriteBarrier()
+#define OAK_ATOMIC_FENCE_RELEASE() _ReadWriteBarrier()
 
 #else
 #error "No atomic operations available.  Need C11, GCC, Clang, or MSVC."

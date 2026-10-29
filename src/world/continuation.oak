@@ -32,15 +32,14 @@
 
 (define-constant %continuation-size 7)
 
-(set! %%cleanup-needed #f)
-
 (define (call/cc f)
   (bind ()
     (block0
      (%call/cc f)
-     (when %%cleanup-needed
-       (set! %%cleanup-needed #f)
-       (rewind %%join-count %%new-windings %%new-wind-count)))))
+     (let ((pending (current-pending-rewind)))
+       (when pending
+	 (set-current-pending-rewind! #f)
+	 (rewind (car pending) (cadr pending) (caddr pending)))))))
 
 (define call-with-current-continuation call/cc)
 
@@ -79,23 +78,17 @@
 
 (define (%call/cc f)
   (let ((tag (%fill-continuation (%allocate continuation %continuation-size))))
-    (set! ((%slot 5) tag) %windings)
-    (set! ((%slot 6) tag) %wind-count)
+    (set! ((%slot 5) tag) (current-windings))
+    (set! ((%slot 6) tag) (current-wind-count))
     (f (lambda (v)
-	 (let ((join-count (find-join-point %windings %wind-count
+	 (let ((join-count (find-join-point (current-windings)
+					    (current-wind-count)
 					    ((%slot 5) tag) ((%slot 6) tag))))
-	   (unwind %windings %wind-count join-count)
-	   ;; We'd like to do this now, but we're in the wrong stack context,
-	   ;;  so we'll remember to do it once we get there.
-	   ;;(rewind join-count ((%slot 5) tag) ((%slot 6) tag))
-
-	   ;;This is the first time I've been forced to pass parameters by
-	   ;; stashing them in globals in Lisp!
-	   (set! %%join-count join-count)
-	   (set! %%new-windings ((%slot 5) tag))
-	   (set! %%new-wind-count ((%slot 6) tag))
-	   (set! %%cleanup-needed #t)
-	   )
+	   (unwind (current-windings) (current-wind-count) join-count)
+	   ;; The rewind has to happen in the continuation's stack
+	   ;; context, so CALL/CC does it on landing.
+	   (set-current-pending-rewind!
+	    (list join-count ((%slot 5) tag) ((%slot 6) tag))))
 	 (%continue tag v)))))
 
 #|

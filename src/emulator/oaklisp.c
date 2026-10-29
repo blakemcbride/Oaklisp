@@ -26,6 +26,7 @@
 #include <stddef.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <string.h>
 #include "config.h"
 #include "data.h"
 #include "cmdline.h"
@@ -109,10 +110,14 @@ oak_main(int argc, char **argv, const oak_embedding *emb)
 #endif
 #endif
 
+  /* Cleared: e_process in particular has to start as the fixnum 0,
+     which is how the world knows no process object exists yet. */
 #ifdef THREADS
   register_array[my_index] = (register_set_t*)xmalloc(sizeof(register_set_t));
+  memset(register_array[my_index], 0, sizeof(register_set_t));
 #else
   reg_set = (register_set_t*)xmalloc(sizeof(register_set_t));
+  memset(reg_set, 0, sizeof(register_set_t));
 #endif
 
   /* Set the registers to the boot code */

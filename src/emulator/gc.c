@@ -492,11 +492,15 @@ gc(bool pre_dump, bool full_gc, char *reason, size_t amount)
        us to read uninitialized gc_ready[] slots. */
     gc_thread_count = next_index;
 
+    /* The flags are written by the other threads, so read them as
+       volatile: nothing in this loop would make the compiler reload
+       them. */
     while (ready == false) {
       ready = true;
       for (i = 0; i < gc_thread_count; i++) {
-	if (gc_ready[i] == 0 && !gc_thread_dead[i]) {
+	if (((volatile int *)gc_ready)[i] == 0 && !gc_thread_dead[i]) {
 	    ready = false;
+	    oak_thread_yield();
 	    break;
 	}
       }
@@ -874,6 +878,14 @@ gc_top:
 
   /* The raw refs cached in native direct-call sites just moved. */
   oak_native_flush_sites();
+
+#ifdef USE_MARK_SWEEP
+  /* The mark-sweep bitmaps, free lists and TLABs still describe the
+     space just evacuated.  Rebuild them before the other threads are
+     released: they would otherwise allocate from TLABs in it and set
+     bits in bitmaps about to be freed. */
+  ms_reinit();
+#endif
 
 #ifdef THREADS
 #ifdef USE_MARK_SWEEP

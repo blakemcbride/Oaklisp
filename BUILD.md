@@ -49,7 +49,7 @@ Option                    Default   Description
                                     latexmk nor prebuilt/doc)
 --enable-ndebug           yes       High-speed mode (sets -DFAST)
 --enable-threads          no        Native threads with concurrent GC
-                                    (experimental; see below)
+                                    (not for native code; see below)
 --enable-cold-linker      no        Build oak-cold-linker, a C version of
                                     the cold linker (see Bootstrapping)
 --with-instructions-per-ref=N  4/2  16-bit instructions per code ref:
@@ -345,10 +345,10 @@ Thread Support
 builds the emulator with native (pthread) threads and the concurrent
 mark-sweep collector they require (-DTHREADS -DUSE_MARK_SWEEP), which
 is off by default.  Green threads (DELAY, FUTURE, PROCESS-RUN-FN)
-work without it.  The state of native threads is experimental: once
---pthreads N has initialized them, code that invokes the compiler
-deadlocks on the guard mutexes, and even precompiled code is not
-reliable; see Threads.md.  The option also costs performance when
+work without it.  With --pthreads N the interpreter and the bytecode
+compiler run on N OS threads (several compilations can run at once in
+futures); natively compiled code does not run threaded yet; see
+Threads.md.  The option also costs performance when
 threads are not in use, almost all of it from the mark-sweep
 allocator rather than the thread support itself.  Measured with
 "make bench" on the same world (ratio of CPU time to the default

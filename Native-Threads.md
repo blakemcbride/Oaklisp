@@ -1,7 +1,9 @@
 Native Thread Support in Oaklisp
 =================================
 
-Status: EXPERIMENTAL / INCOMPLETE (disabled by default)
+Status: the interpreter and the bytecode compiler work with threads
+(see Threads.md); natively compiled code does not run threaded yet.
+Disabled by default.
 
 Enable with: `./configure --enable-threads`
 
@@ -109,14 +111,18 @@ What is protected:
 - **Thread termination**: `init_thread()` (threads.c) prints a warning
   and exits the thread cleanly if its thunk returns.
 - **pthread_create failure**: `info_p` is freed.
-- **Process object and fluid bindings**: `init-process-object` runs as
-  the first warm boot action, giving the machine a process object so
-  the scheduler (and so DELAY/FORCE) works.  `--pthreads N` calls
-  `setup-initial-process-object`, whose `init-thread-infrastructure`
-  sets `%no-threading` to `#f`, so `fluid.oak` binds per process, makes
-  the guard mutexes, and then spawns the extra heavyweight threads.
-  None of that happens at every warm boot because the compiler
-  deadlocks when the mutexes are active.
+- **Process object, fluid bindings and windings**: `init-process-object`
+  runs as the first warm boot action, giving the machine a process
+  object so the scheduler (and so DELAY/FORCE) works.  From then on
+  fluid bindings (`fluid.oak`) and the winding stack, `%windings` and
+  `%wind-count` (`unwind-protect.oak`), live in the current process
+  object, so resuming one process's continuation never unwinds
+  another's `wind-protect`s and one process's `bind` is invisible to
+  the others; before a process exists they are global.  A new process
+  starts with a copy of its creator's fluid bindings and no windings.
+  `--pthreads N` calls `setup-initial-process-object`, whose
+  `init-thread-infrastructure` makes the guard mutexes and then spawns
+  the extra heavyweight threads.
 - **Guard mutexes**: each is a variable that is `#f` until
   `init-thread-infrastructure` sets it to a real mutex, and the code it
   guards acquires and releases it only when it is set:
@@ -125,16 +131,22 @@ What is protected:
   kernel1-install.oak that mutates `operation-method-alist`),
   `*expression-table-mutex*`, `*stream-primitive-mutex*`,
   `*locale-mutex*` and `*fluid-table-mutex*`.
-- **Method cache**: `OP_TYPE_METH_CACHE` is enabled under threads.
-  Cache writes use a seqlock pattern: method and offset are written
-  first, then the type field is stored last with `__atomic_store_n`
-  (release semantics) as a commit flag.  Cache reads load the type
-  with `__atomic_load_n` (acquire semantics), read method/offset, then
-  re-verify the type to ensure a consistent snapshot.
+- **Method cache**: `OP_TYPE_METH_CACHE` is enabled under threads,
+  behind a seqlock: sequence counts striped by operation address
+  (`mcache_seq` in loop.c).  A fill takes its stripe's count from even
+  to odd with a compare-and-swap (or leaves the cache alone if another
+  fill holds it), writes type, method and offset, and makes it even
+  again; a hit needs the same even count before and after its reads.
   `OP_METH_ALIST_MTF` is disabled under threads since it mutates the
   shared alist structure.
 - **Mutex spinning**: `acquire-mutex` calls `%thread-yield` (opcode 72,
-  `sched_yield()`) between attempts rather than busy-waiting.
+  `sched_yield()`) between attempts rather than busy-waiting.  A mutex
+  records the thread holding it (`%thread-index`, LOAD-REG 24) and may
+  be named (`make-named-mutex`); after `mutex-report-spins` attempts a
+  waiter prints which mutex it waits for and who holds it.
+- **Alarms**: the timer counter and increment are per thread (locals
+  of each thread's `loop()`), so one thread's `%enable-alarms` cannot
+  re-arm preemption inside another's scheduler critical section.
 
 What is not protected:
 

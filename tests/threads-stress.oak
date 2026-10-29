@@ -1,0 +1,52 @@
+;;; Run with --pthreads: the main computation is preempted onto the
+;;; scheduler threads while it compiles, allocates, interns, adds
+;;; methods and throws.  Loading this file compiles each form.
+
+(define (check name got expected)
+  (if (equal? got expected)
+      (format #t "PASS ~A~%" name)
+      (format #t "FAIL ~A: got ~S expected ~S~%" name got expected))
+  (flush standard-output))
+
+(set! #*print-length #f)
+(set! #*print-level #f)
+
+(define (stress-bignums n acc)
+  (if (= n 0)
+      acc
+      (stress-bignums (- n 1) (+ acc (* n n n n n n n n)))))
+
+(define (stress-lists n)
+  (let loop ((i n) (l '()))
+    (if (= i 0)
+	(length l)
+	(loop (- i 1) (if (> (length l) 500) '() (cons (list i (* i 1000000000000)) l))))))
+
+(define (stress-symbols n)
+  (let loop ((i 0) (ok #t))
+    (if (= i n)
+	ok
+	(loop (+ i 1)
+	      (and ok (eq? (#^symbol (format #f "stress-sym-~D" (remainder i 50)))
+			   (#^symbol (format #f "stress-sym-~D" (remainder i 50)))))))))
+
+(define-instance stress-op operation)
+
+(define (stress-methods n)
+  (dotimes (i n)
+    (eval `(add-method (stress-op (fixnum) x) (+ x ,i)) system-locale))
+  (stress-op 1))
+
+(define (stress-throws n)
+  (let loop ((i 0) (s 0))
+    (if (= i n)
+	s
+	(loop (+ i 1) (+ s (catch k (if (odd? i) (k 1) 2)))))))
+
+(dotimes (round 3)
+  (check "bignums" (stress-bignums 2000 0) (stress-bignums 2000 0))
+  (check "lists" (stress-lists 50000) 302)
+  (check "symbols" (stress-symbols 2000) #t)
+  (check "methods" (stress-methods 20) 20)
+  (check "throws" (stress-throws 1000) 1500)
+  (check "eval" (eval '(let ((f (lambda (x) (* x x)))) (f 12)) system-locale) 144))

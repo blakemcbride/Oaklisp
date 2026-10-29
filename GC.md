@@ -36,10 +36,10 @@ How to build each:
 # Config 1: Default (copying GC, single-threaded)
 make
 
-# Config 2: Mark-sweep, single-threaded (fails promises.test)
+# Config 2: Mark-sweep, single-threaded
 make CPPFLAGS="-DUSE_MARK_SWEEP"
 
-# Config 3: Copying GC, multi-threaded (segfaults; see Threads.md)
+# Config 3: Copying GC, multi-threaded
 make CPPFLAGS="-DTHREADS"
 
 # Config 4: Concurrent mark-sweep, multi-threaded
@@ -48,9 +48,38 @@ make
 ```
 
 `--enable-threads` gives config 4; configs 2 and 3 have no configure
-option and need the flags passed by hand.  Only configs 1 and 4 pass
-the test suite (see Threads.md, Testing).
+option and need the flags passed by hand.  All four pass the test
+suite (see Threads.md, Testing).  Adding `-DOAK_GC_VERIFY` to a
+threads build makes every concurrent mark-sweep cycle check itself:
+see "Verify mode" below.
 
+
+Verify mode
+-----------
+
+`make CPPFLAGS="-DOAK_GC_VERIFY"` in a threads build (GCC or Clang)
+checks the concurrent collector as it runs.  At the initial mark it
+traces the whole snapshot stop-the-world into a separate bitmap; at
+the end of the remark it marks the heap again from scratch and
+reports every live object below `sweep_limit` that the concurrent
+mark missed, with the object referring to it (its type, whether it
+was marked, born black, reachable at the snapshot) and where both
+were allocated, from a ring of the last four million allocations
+(`OAK_GC_VERIFY_LOG=0` in the environment turns the ring off: its
+atomic add on every allocation shifts the timing).  It also reports
+any allocation made while another thread has the world stopped.  A
+missed object is kept, so the run goes on.
+
+Interior pointers and splitting
+-------------------------------
+
+MAKE-LAMBDA allocates an operation and its method as one object, and
+the method is referred to on its own (`e_current_method`, context
+frames), often after the operation is garbage; the mark therefore
+maps any pointer that does not land on an object start to the object
+containing it.  When the free list for a request's size class is
+empty, `ms_free_list_alloc` splits an entry of a larger class (whose
+end lies behind the lazy sweep's cursor) rather than collecting.
 
 Runtime Options
 ===============
@@ -263,11 +292,20 @@ global heap.  TLAB size: 4096 words (`TLAB_SIZE`).
 4. If a concurrent GC is active, set the mark bit ("born-black")
 
 **Slow path (acquires `alloc_lock`):**
-1. Try free list (`ms_free_list_alloc`)
+1. Try free list (`ms_free_list_alloc`; an empty size class splits
+   an entry of a larger one)
 2. Try lazy sweep + free list
 3. Try TLAB refill from global bump pointer
 4. Try global bump pointer (for large allocations)
-5. If all fail: trigger `ms_collect()`
+5. If all fail: `ms_collect()`, and back to 1 until the request is
+   met.  `ms_collect` either runs the cycle as the coordinator (and
+   when that leaves nothing big enough for the request, the copying
+   collector, growing the heap) or, when another thread's cycle is
+   under way, waits for it.  The slow path never calls `gc()` itself:
+   run by a thread that is not the coordinator while a cycle is in
+   progress, the copying collector would skip its stop-the-world
+   handshake and move objects under the marker.  The GC and FULL-GC
+   instructions likewise go through `ms_collect_explicit`.
 
 TLABs are retired before every STW pause (`ms_tlab_retire_all`):
 unused TLAB space is zeroed and given an objstart bit so sweep can
@@ -393,15 +431,18 @@ roles:
 | Pre-dump compaction | Copying GC (produces contiguous heap for serialization) |
 | Bitmap rebuild after expansion | `ms_reinit()` |
 
-The copying GC is always available.  During a copying GC fallback:
+The copying GC is always available.  During a copying GC fallback
+(the coordinator's decision, `ms_space_for`: nothing in the bump
+region or on a free list is big enough for the request):
 1. `ms_collect()` sets `original_newspace_size = 3 * live_data` so the
    copying GC allocates a large enough destination space
 2. `gc()` runs its normal transport/scavenge cycle
 3. During transport, `ms_record_transport(new_place)` records each
    destination address in a deferred buffer
-4. After copying completes, `ms_reinit()` allocates fresh bitmaps and
-   replays the transport buffer to set objstart bits for all surviving
-   objects
+4. Before releasing the other threads, `gc()` calls `ms_reinit()`,
+   which allocates fresh bitmaps, drops every thread's TLAB (they
+   point into the freed space) and replays the transport buffer to
+   set objstart bits for all surviving objects
 
 Without this replay mechanism, objects surviving a copying GC fallback
 would have no objstart bits and be invisible to subsequent mark-sweep
@@ -600,13 +641,13 @@ Recommendations
 ===============
 
 **For single-threaded use:**  The default build (Config 1, copying GC).
-Config 2 (`USE_MARK_SWEEP` alone) fails `promises.test`.
 
 **For multi-threaded use:**  Config 4 (`THREADS + USE_MARK_SWEEP`) is
 strongly recommended.  The concurrent mark-sweep collector minimizes
 STW pause times (only initial mark and remark are STW; sweep is lazy),
 and TLABs eliminate allocation lock contention for the common case.
-Config 3 (`THREADS` alone) segfaults in the test suite.
+Config 3 (`THREADS` alone) has longer pauses (every collection is a
+stop-the-world copy) and all allocations contend on `alloc_lock`.
 
 **Heap sizing:**  The default 128K refs (1 MB) is adequate for
 interactive use.  For compiling large files or running allocation-heavy

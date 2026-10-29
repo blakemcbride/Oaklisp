@@ -644,9 +644,6 @@ void
 oak_rt_gc(int full)
 {
   gc(false, full != 0, "explicit call", 0);
-#ifdef USE_MARK_SWEEP
-  ms_reinit();
-#endif
   if (value_stack.sp + 1 >= value_stack.bp + value_stack.size)
     stack_flush(&value_stack, value_stack.filltarget);
   *++value_stack.sp = e_false;
@@ -674,9 +671,6 @@ oak_rt_dump_world(ref_t ** spp)
   sp -= 1;
   value_stack.sp = sp;
   gc(false, false, "impending world dump", 0);
-#ifdef USE_MARK_SWEEP
-  ms_reinit();
-#endif
   dump_world(false);
   sp = value_stack.sp;
   dump_file_name = old_dump_file_name;

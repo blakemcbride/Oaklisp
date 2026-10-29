@@ -65,6 +65,15 @@
 	      (%thread-yield)))
 
 ;;
+;; The index of the OS thread running the caller: 0 for the main
+;; thread, and always 0 without THREADS.
+;;
+(define-constant %thread-index
+  (add-method ((make-open-coded-operation '((load-reg thread-index)) 0 1)
+	       (object))
+	      (%thread-index)))
+
+;;
 ;; Returns #t if the emulator was compiled with THREADS support,
 ;; nil otherwise.  Used to auto-detect thread capability at warm boot.
 ;;

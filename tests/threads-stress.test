@@ -1,0 +1,41 @@
+#!/bin/sh
+# Native threads under load: several runs of threads-stress.oak with
+# --pthreads 3, each under a timeout, so a deadlock or heap corruption
+# fails it; then futures compile several files at once, and the
+# objects must match a single-threaded compile.  Skipped without
+# threads.
+. "$(dirname "$0")/testlib.sh"
+enabled=$(oak -- --eval '(print (%threads-enabled?) standard-output)' --exit 2>&1 | tail -c 3)
+case $enabled in *T*) ;; *) skip "emulator built without threads";; esac
+status=0
+for run in 1 2 3; do
+  timeout 300 "$OAKLISP" --batch --world "$OAKWORLD" -- \
+    --locale system-locale --pthreads 3 --load "$testdir/threads-stress.oak" --exit \
+    > stress-$run.out 2>&1
+  rc=$?
+  passes=$(grep -c '^PASS' stress-$run.out)
+  fails=$(grep -c '^FAIL' stress-$run.out)
+  echo "run $run: exit $rc, $passes passed, $fails failed"
+  test $rc = 0 && test $fails = 0 && test $passes = 18 || { tail -5 stress-$run.out; status=1; }
+done
+
+files="arith data control objects io promises"
+rm -rf stress-seq stress-par; mkdir stress-seq stress-par
+for f in $files; do
+  oak -- --outdir stress-seq --compile "$testdir/$f" --exit >/dev/null 2>&1 \
+    || { echo "single-threaded compile of $f failed"; status=1; }
+done
+list=; for f in $files; do list="$list \"$testdir/$f\""; done
+timeout 600 "$OAKLISP" --batch --world "$OAKWORLD" -- \
+  --locale system-locale --pthreads 3 \
+  --eval '(set! #*compiler-output-directory "stress-par")' \
+  --eval "(print (map force (map (lambda (f) (future (block (compile-file system-locale f) #t))) (list$list))) standard-output)" \
+  --exit > stress-par.out 2>&1
+rc=$?
+echo "concurrent compile: exit $rc"
+test $rc = 0 || { tail -5 stress-par.out; status=1; }
+for f in $files; do
+  cmp -s stress-seq/$f.oa stress-par/$f.oa \
+    || { echo "concurrently compiled $f.oa differs"; status=1; }
+done
+exit $status

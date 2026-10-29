@@ -425,9 +425,24 @@ if ((highcrap != 0x0) && (highcrap != 0x7)) {code;} }
 
 #include "gc-ms.h"
 
+#ifdef OAK_GC_VERIFY
+/* Verify mode: the coordinator's index while the world is stopped. */
+extern volatile int ms_verify_stw_owner;
+extern void ms_verify_stw_alloc(int idx, const char *how);
+#define VERIFY_STW_ALLOC(idx, how)					\
+  if (ms_verify_stw_owner >= 0 && ms_verify_stw_owner != (idx))		\
+    ms_verify_stw_alloc((idx), (how));
+extern void ms_verify_log_alloc(ref_t *p, int path, size_t words);
+#define VERIFY_LOG_ALLOC(p, path, n) ms_verify_log_alloc((p), (path), (n));
+#else
+#define VERIFY_STW_ALLOC(idx, how)
+#define VERIFY_LOG_ALLOC(p, path, n)
+#endif
+
 #define ALLOCATE_PROT(p, words, reason, before, after)			\
 {									\
   int _tlab_idx = *(int *)oak_tls_get(index_key);			\
+  VERIFY_STW_ALLOC(_tlab_idx, reason)					\
   if ((words) <= TLAB_SIZE &&						\
       tlab_cursor_array[_tlab_idx] &&					\
       tlab_cursor_array[_tlab_idx] + (words)				\
@@ -436,6 +451,7 @@ if ((highcrap != 0x0) && (highcrap != 0x7)) {code;} }
     (p) = tlab_cursor_array[_tlab_idx];					\
     tlab_cursor_array[_tlab_idx] += (words);				\
     ms_bump_alloc_notify_atomic((p), (words));				\
+    VERIFY_LOG_ALLOC((p), 1, (words))						\
   } else {								\
     /* Slow path — acquire global allocator lock. */			\
     while (oak_mutex_trylock(&alloc_lock) != 0) {			\
@@ -444,23 +460,23 @@ if ((highcrap != 0x0) && (highcrap != 0x7)) {code;} }
     (p) = ms_alloc_slow_locked((words),					\
 			       &tlab_cursor_array[_tlab_idx],		\
 			       &tlab_end_array[_tlab_idx]);		\
-    if (!(p)) {								\
+    /* ms_collect either runs a cycle as the coordinator -- and when	\
+       that leaves no room for the request, the copying collector,	\
+       growing the heap -- or, when another thread's cycle is under	\
+       way, waits for it; after a wait the retry can still fail, so	\
+       go round again.  The copying collector is never called from	\
+       here: run by a thread that is not the coordinator while a	\
+       cycle is in progress, it would skip its handshake and move	\
+       objects under the marker. */					\
+    while (!(p)) {							\
       before;								\
       ms_collect(false, (reason), (words));				\
       after;								\
       (p) = ms_alloc_slow_locked((words),				\
 				 &tlab_cursor_array[_tlab_idx],		\
 				 &tlab_end_array[_tlab_idx]);		\
-      if (!(p)) {							\
-	before;								\
-	gc(false, true, (reason), (words));				\
-	ms_reinit();							\
-	after;								\
-	(p) = free_point;						\
-	free_point += (words);						\
-	ms_bump_alloc_notify((p), (words));				\
-      }									\
     }									\
+    VERIFY_LOG_ALLOC((p), 2, (words))						\
     oak_mutex_unlock(&alloc_lock);					\
   }									\
 }
@@ -511,7 +527,6 @@ if ((highcrap != 0x0) && (highcrap != 0x7)) {code;} }
 	     will expand the heap. */			\
 	  before;					\
 	  gc(false, true, (reason), (words));		\
-	  ms_reinit();					\
 	  after;					\
 	  (p) = free_point;				\
 	  free_point += (words);			\

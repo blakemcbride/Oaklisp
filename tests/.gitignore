@@ -9,3 +9,6 @@ native-check/
 native-parity/
 standalone/
 restargs-check/
+stress-*.out
+stress-seq/
+stress-par/

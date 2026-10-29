@@ -64,20 +64,43 @@
 ;;; initialization of this class is redefined after the first one is
 ;;; made (as a warm boot action). See process2.oak for more code.
 
-(define-instance process type '(pid process-fluid-binding-list) (list object))
+(define-instance process type
+  '(pid process-fluid-binding-list windings wind-count pending-rewind)
+  (list object))
 (define-instance process-id operation)
 (define-instance fluid-bindings settable-operation)
 (define-instance copy-fluid-bindings operation)
 
+;;; A process's winding stack (unwind-protect.oak).
+(define-instance process-windings settable-operation)
+(define-instance process-wind-count settable-operation)
+(define-instance process-pending-rewind settable-operation)
+
+(add-method (process-windings (process windings) self) windings)
+(add-method ((setter process-windings) (process windings) self new)
+  (set! windings new))
+(add-method (process-wind-count (process wind-count) self) wind-count)
+(add-method ((setter process-wind-count) (process wind-count) self new)
+  (set! wind-count new))
+(add-method (process-pending-rewind (process pending-rewind) self)
+  pending-rewind)
+(add-method ((setter process-pending-rewind) (process pending-rewind) self new)
+  (set! pending-rewind new))
+
 (define trace-processes #f)
 
-(add-method (initialize (process pid process-fluid-binding-list) self)
+(add-method (initialize (process pid process-fluid-binding-list
+				  windings wind-count pending-rewind) self)
   (when trace-processes
      (format #t "init: oak process descriptor~%"))
   (set! pid 0)
+  ;; The creator's bindings: the global list for the first process.
   (set! process-fluid-binding-list
 	(map (lambda (z) (cons (car z) (cdr z)))
-	     fluid-binding-list))
+	     (get-current-fluid-bindings)))
+  (set! windings '())
+  (set! wind-count 0)
+  (set! pending-rewind #f)
   self)
 
 (add-method (process-id (process pid) self)
@@ -126,23 +149,50 @@
 ;;; %TEST-AND-SET-LOCATIVE is used to create a spin-lock, so mutexes
 ;;; spin lock too.  Hence semaphores should be used when possible.
 
+;;; A mutex records the OS thread holding it (%THREAD-INDEX) and may
+;;; have a name.  A thread that has spun MUTEX-REPORT-SPINS times
+;;; waiting says so on standard error, naming the mutex and its
+;;; holder, which is how a deadlock shows itself.  The owner is a
+;;; thread, not a process, so a lightweight process that waits on a
+;;; mutex another process on its own thread holds reports its own
+;;; thread as the holder.
 
-(define-instance mutex type '(access-cons) (list object))
+(define-instance mutex type '(access-cons owner name) (list object))
 
 (define-instance acquire-mutex operation)
 (define-instance release-mutex operation)
+(define-instance mutex-name settable-operation)
 
-(add-method (initialize (mutex access-cons) self)
+(add-method (initialize (mutex access-cons owner name) self)
   (set! access-cons (cons nil nil))
+  (set! owner #f)
+  (set! name #f)
   self)
 
-(add-method (acquire-mutex (mutex access-cons) self)
-  (let loop ()
-    (unless (%test-and-set-locative (make-locative (car access-cons)) #f #t)
-      (%thread-yield)
-      (loop))))
+(add-method (mutex-name (mutex name) self) name)
+(add-method ((setter mutex-name) (mutex name) self new) (set! name new))
 
-(add-method (release-mutex (mutex access-cons) self)
+(define (make-named-mutex name)
+  (let ((m (make mutex)))
+    (set! (mutex-name m) name)
+    m))
+
+(define mutex-report-spins 1000000)
+
+(add-method (acquire-mutex (mutex access-cons owner name) self)
+  (iterate spin ((n 0))
+    (cond ((%test-and-set-locative (make-locative (car access-cons)) #f #t)
+	   (set! owner (%thread-index)))
+	  (else
+	   (when (= n mutex-report-spins)
+	     (format standard-error
+		     "~&;; thread ~D waiting for mutex ~S, held by thread ~D~%"
+		     (%thread-index) (or name self) owner))
+	   (%thread-yield)
+	   (spin (+ n 1))))))
+
+(add-method (release-mutex (mutex access-cons owner) self)
+  (set! owner #f)
   (set! (car access-cons) nil))
 
 ;;; process2.oak
@@ -150,7 +200,7 @@
 ;; see process.oak for an explaination
 
 (define *pid-counter* 1) ;; the 0th process is not created with this counter
-(define *pid-counter-mutex* (make mutex))
+(define *pid-counter-mutex* (make-named-mutex 'pid-counter))
 
 (define (new-pid)
   (let ((newp nil))
@@ -185,16 +235,21 @@
   (unless %threads-initialized
     (init-process-object)
     (set! %no-threading #f)
-    (set! *symbol-table-mutex* (make mutex))
-    (set! *add-method-mutex* (make mutex))
-    (set! *expression-table-mutex* (make mutex))
-    (set! *stream-primitive-mutex* (make mutex))
-    (set! *locale-mutex* (make mutex))
-    (set! *fluid-table-mutex* (make mutex))
-    (add-method (initialize (process pid process-fluid-binding-list) self)
+    (set! *symbol-table-mutex* (make-named-mutex 'symbol-table))
+    (set! *add-method-mutex* (make-named-mutex 'add-method))
+    (set! *expression-table-mutex* (make-named-mutex 'expression-table))
+    (set! *stream-primitive-mutex* (make-named-mutex 'stream-primitive))
+    (set! *locale-mutex* (make-named-mutex 'locale))
+    (set! *fluid-table-mutex* (make-named-mutex 'fluid-table))
+    (add-method (initialize (process pid process-fluid-binding-list
+				      windings wind-count pending-rewind) self)
       (set! pid (new-pid))
       (set! process-fluid-binding-list
 	    (copy-fluid-bindings (current-process)))
+      ;; A new process starts outside any dynamic extent.
+      (set! windings '())
+      (set! wind-count 0)
+      (set! pending-rewind #f)
       self)
     (set! %threads-initialized #t)))
 
@@ -280,7 +335,7 @@
 ;;;   could acquire the same mutex at the same time)
 
 (define *scheduleQ* (make-queue))
-(define *scheduleQ-mutex* (make mutex))
+(define *scheduleQ-mutex* (make-named-mutex 'scheduleq))
 
 (define (acquire-scheduler)
   (%disable-alarms)

@@ -82,12 +82,13 @@
   (intern (#^string self)))
 
 (let ((counter 0))
+  ;; The mutex covers only the counter: interning takes it too.
   (define (gensym x)
     (if *symbol-table-mutex* (acquire-mutex *symbol-table-mutex*))
-    (let ((result (#^symbol (format #f "~A~D" x counter))))
+    (let ((n counter))
       (set! counter (+ counter 1))
       (if *symbol-table-mutex* (release-mutex *symbol-table-mutex*))
-      result)))
+      (#^symbol (format #f "~A~D" x n)))))
 
 (define generate-symbol gensym)
 

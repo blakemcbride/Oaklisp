@@ -21,19 +21,26 @@
 
 (define top-level-fluid-binding-list (list (cons nil nil)))
 
+;;; Fluid bindings belong to the current process, so that lightweight
+;;; processes (and the OS threads running them) do not see each
+;;; other's BINDs.  Until there is a process object (cold boot; the
+;;; process register holds the fixnum 0) they are kept in the global
+;;; FLUID-BINDING-LIST.  A new process starts with a copy of its
+;;; creator's (multiproc.oak).
+
 (define *fluid-table-mutex* #f)
 
 
 (define get-current-fluid-bindings
   (add-method ((make operation))
-    (let ((z (or %no-threading (%load-process))))
+    (let ((z (%load-process)))
       (if (eq? z 0)
 	  fluid-binding-list
 	  (fluid-bindings z)))))
 
 (define set-current-fluid-bindings
   (add-method ((make operation) new-binding-list)
-    (let ((z (or %no-threading (%load-process))))
+    (let ((z (%load-process)))
       (if (eq? z 0)
 	  (set! fluid-binding-list new-binding-list)
 	  (set! (fluid-bindings z) new-binding-list)))))
@@ -41,7 +48,7 @@
 (define add-to-current-fluid-bindings
   (add-method ((make operation) c-cell)
     (if *fluid-table-mutex* (acquire-mutex *fluid-table-mutex*))
-    (let ((z (or %no-threading (%load-process))))
+    (let ((z (%load-process)))
       (if (eq? z 0)
 	  (set! (cdr top-level-fluid-binding-list)
 		(cons c-cell (cdr top-level-fluid-binding-list)))
@@ -53,11 +60,7 @@
 ;;; This is to be called at warm boot time:
 
 (define (revert-fluid-binding-list)
-  (set! fluid-binding-list top-level-fluid-binding-list))
-;(define (revert-fluid-binding-list)
-;  (set-current-fluid-bindings top-level-fluid-binding-list))
-;(define (revert-fluid-binding-list)
-;  (set-current-fluid-bindings (cons (cons nil nil) nil)))
+  (set-current-fluid-bindings top-level-fluid-binding-list))
 
 ;;; And at cold boot time too, I suppose:
 

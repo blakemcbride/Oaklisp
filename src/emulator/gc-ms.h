@@ -61,6 +61,9 @@ void ms_destroy(void);
 
 /* Re-initialize after the heap is replaced (e.g., load-world). */
 void ms_reinit(void);
+#ifdef THREADS
+void ms_collect_explicit(const char *reason);
+#endif
 
 /* Try to allocate n_words from free lists.  Returns pointer to the
    first word of a region of at least n_words, or NULL if no free list

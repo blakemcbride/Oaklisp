@@ -125,6 +125,15 @@ static inline void _check_val_bounds(ref_t *sp, int offset, ref_t *bp, int line)
 }
 #endif
 
+#ifdef THREADS
+/* Sequence counts for the operations' method caches, striped by
+   operation address (see FUNCALL). */
+#define MCACHE_STRIPES 1024
+static size_t mcache_seq[MCACHE_STRIPES];
+#define MCACHE_SEQ(op) \
+  (&mcache_seq[((unsigned long)(op) >> 4) & (MCACHE_STRIPES - 1)])
+#endif
+
 /* File handles are represented as Oaklisp fixnums. The three standard
    streams are hotwired to be 0, 1 and 2, so a world image dumped with
    the standard streams open (every one is) contains no host FILE *
@@ -153,8 +162,17 @@ loop(ref_t initial_tos)
   ref_t y = INT_TO_REF(0);
 
 #if ENABLE_TIMER
+#ifdef THREADS
+  /* Alarms are per thread: each OS thread runs its own LOOP, and
+     DISABLE-ALARMS in one thread's critical section must not be undone
+     by another thread's ENABLE-ALARMS.  (Natively compiled code, which
+     uses the globals, does not run with threads.) */
+  unsigned timer_counter = 0;
+  unsigned timer_increment = 0;
+#else
 #define timer_counter oak_timer_counter
 #define timer_increment oak_timer_increment
+#endif
 #endif
 
   /* Instructions executed since the last crash recovery. */
@@ -1030,11 +1048,10 @@ loop(ref_t initial_tos)
 
 	    case 51:		/* GC */
 	      UNLOCALIZE_ALL();
+#if defined(THREADS) && defined(USE_MARK_SWEEP)
+	      ms_collect_explicit("explicit call");
+#else
 	      gc(false, false, "explicit call", 0);
-#ifdef USE_MARK_SWEEP
-	      /* The copying collector replaced new space; the mark-sweep
-		 bitmaps and free lists still describe the freed one. */
-	      ms_reinit();
 #endif
 	      LOCALIZE_ALL();
 	      PUSHVAL(e_false);
@@ -1221,9 +1238,10 @@ loop(ref_t initial_tos)
 
 	    case 64:		/* FULL-GC */
 	      UNLOCALIZE_ALL();
+#if defined(THREADS) && defined(USE_MARK_SWEEP)
+	      ms_collect_explicit("explicit call");
+#else
 	      gc(false, true, "explicit call", 0);
-#ifdef USE_MARK_SWEEP
-	      ms_reinit();
 #endif
 	      LOCALIZE_ALL();
 	      PUSHVAL(e_false);
@@ -1347,9 +1365,6 @@ loop(ref_t initial_tos)
 		dump_file_name = s;
 		UNLOCALIZE_ALL();
 		gc(false, false, "impending world dump", 0);
-#ifdef USE_MARK_SWEEP
-		ms_reinit();
-#endif
 		dump_world(false);
 		LOCALIZE_ALL();
 		dump_file_name = old_dump_file_name;
@@ -1774,6 +1789,13 @@ loop(ref_t initial_tos)
 		  PUSHVAL(e_nil);
 #endif
 		  GOTO_TOP;
+		case 24:	/* THREAD-INDEX */
+#ifdef THREADS
+		  PUSHVAL(INT_TO_REF(my_index));
+#else
+		  PUSHVAL(INT_TO_REF(0));
+#endif
+		  GOTO_TOP;
 		default:
 		  fprintf(stderr, "Error (vm interpreter): "
 			  "LOAD-REG %d, unknown .\n", arg_field);
@@ -1818,29 +1840,28 @@ loop(ref_t initial_tos)
 #ifdef OP_TYPE_METH_CACHE
 		  /* Check for cache hit: */
 #ifdef THREADS
-		  /* Atomic read: type first (acquire), then method/offset,
-		     then re-verify type hasn't changed (seqlock pattern).
-		     All three slots are read atomically: another thread can
-		     be filling this same cache entry concurrently, and a
-		     plain read of a word being written is a data race.
-
-		     The type slot is the guard, and it is only ever moved
-		     between distinct values -- a miss means the cached type
-		     differs from ours, and %INSTALL-METHOD-WITH-ENV parks it
-		     at fixnum 0 when it invalidates -- so seeing the same
-		     type before and after means the method and offset go
-		     together. */
+		  /* A seqlock: the operation's three cache slots go together
+		     only if the stripe's sequence count (mcache_seq, by
+		     operation address) is the same even number before and
+		     after reading them.  The type slot alone cannot guard
+		     them: a fill for another type writes the method and
+		     offset before the type, so a reader can see the old type
+		     on both sides of the new method and offset, and run
+		     another type's method with its bp offset. */
 		  {
+		    size_t *seqp = MCACHE_SEQ(x);
+		    size_t seq1 = OAK_ATOMIC_LOAD_REF(seqp);
 		    ref_t cached_type = OAK_ATOMIC_LOAD_REF(
 		      &REF_SLOT(x, OPERATION_CACHE_TYPE_OFF));
-		    if (y_type == cached_type)
+		    if (!(seq1 & 1) && y_type == cached_type)
 		      {
 			ref_t cached_meth = OAK_ATOMIC_LOAD_REF(
 			  &REF_SLOT(x, OPERATION_CACHE_METH_OFF));
 			ref_t cached_off = OAK_ATOMIC_LOAD_REF(
 			  &REF_SLOT(x, OPERATION_CACHE_TYPE_OFF_OFF));
-			/* Re-verify type to ensure consistent read. */
-			if (y_type == OAK_ATOMIC_LOAD_REF(
+			OAK_ATOMIC_FENCE_ACQUIRE();
+			if (OAK_ATOMIC_LOAD_REF(seqp) == seq1
+			    && y_type == OAK_ATOMIC_LOAD_REF(
 			      &REF_SLOT(x, OPERATION_CACHE_TYPE_OFF)))
 			  {
 			    maybe_put(trace_mcache, "H");
@@ -1895,17 +1916,26 @@ loop(ref_t initial_tos)
 		         Write method and offset first, then type last
 		         (type acts as commit flag for readers). */
 #ifdef THREADS
-		      SATB_BARRIER(&REF_SLOT(x, OPERATION_CACHE_METH_OFF));
-		      OAK_ATOMIC_STORE_REF(
-			&REF_SLOT(x, OPERATION_CACHE_METH_OFF),
-			e_current_method);
-		      OAK_ATOMIC_STORE_REF(
-			&REF_SLOT(x, OPERATION_CACHE_TYPE_OFF_OFF),
-			offset);
-		      SATB_BARRIER(&REF_SLOT(x, OPERATION_CACHE_TYPE_OFF));
-		      OAK_ATOMIC_STORE_REF(
-			&REF_SLOT(x, OPERATION_CACHE_TYPE_OFF),
-			y_type);
+		      /* Fill only with the stripe's count taken from even to
+			 odd; if another fill has it, leave the cache be. */
+		      {
+			size_t *seqp = MCACHE_SEQ(x);
+			size_t seq = OAK_ATOMIC_LOAD_REF(seqp);
+			if (!(seq & 1) && OAK_ATOMIC_CAS_SIZE(seqp, &seq, seq + 1))
+			  {
+			    OAK_ATOMIC_FENCE_RELEASE();
+			    SATB_BARRIER(&REF_SLOT(x, OPERATION_CACHE_TYPE_OFF));
+			    OAK_ATOMIC_STORE_REF(
+			      &REF_SLOT(x, OPERATION_CACHE_TYPE_OFF), y_type);
+			    SATB_BARRIER(&REF_SLOT(x, OPERATION_CACHE_METH_OFF));
+			    OAK_ATOMIC_STORE_REF(
+			      &REF_SLOT(x, OPERATION_CACHE_METH_OFF),
+			      e_current_method);
+			    OAK_ATOMIC_STORE_REF(
+			      &REF_SLOT(x, OPERATION_CACHE_TYPE_OFF_OFF), offset);
+			    OAK_ATOMIC_STORE_REF(seqp, seq + 2);
+			  }
+		      }
 #else
 		      SATB_BARRIER(&REF_SLOT(x, OPERATION_CACHE_TYPE_OFF));
 		      REF_SLOT(x, OPERATION_CACHE_TYPE_OFF) = y_type;
