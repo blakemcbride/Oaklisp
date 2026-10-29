@@ -137,7 +137,11 @@ What is protected:
   `*add-method-mutex*` (the part of `%install-method-with-env` in
   kernel1-install.oak that mutates `operation-method-alist`),
   `*expression-table-mutex*`, `*stream-primitive-mutex*`,
-  `*locale-mutex*` and `*fluid-table-mutex*`.
+  `*locale-mutex*`, `*fluid-table-mutex*`, `*mix-types-mutex*`
+  (mix-types.oak, taken directly), `*output-mutex*` (format.oak),
+  `*native-compiler-mutex*` and the per-file `load` mutexes
+  (load-file.oak).  Threads.md's "Shared state" table has the rule
+  for each piece of shared state.
 - **Method cache**: `OP_TYPE_METH_CACHE` is enabled under threads,
   behind a seqlock: sequence counts striped by operation address
   (`mcache_seq` in loop.c).  A fill takes its stripe's count from even

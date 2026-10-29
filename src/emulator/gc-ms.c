@@ -506,13 +506,16 @@ static ref_t *sweep_limit;
 volatile int gc_concurrent_in_progress = 0;
 
 /* Whether the calling thread's last ms_collect ran the cycle itself
-   (as opposed to waiting for another thread's). */
-static bool ms_collect_coordinated;
+   (as opposed to waiting for another thread's).  Per thread: a single
+   flag let a thread that had only waited see the one another thread's
+   cycle had set, and run the copying collector under that cycle's
+   mark. */
+static bool ms_collect_coordinated[MAX_THREAD_COUNT];
 
 bool
 ms_collect_was_coordinator(void)
 {
-    return ms_collect_coordinated;
+    return ms_collect_coordinated[*(int *)oak_tls_get(index_key)];
 }
 
 static oak_mutex_t gc_concurrent_lock = OAK_MUTEX_INITIALIZER;
@@ -1394,7 +1397,7 @@ ms_collect(bool pre_dump, char *reason, size_t amount)
     /* If a concurrent GC is already running (another thread triggered
        collection), wait for it to complete and return.  The caller's
        ALLOCATE_PROT will retry the allocation after we return. */
-    ms_collect_coordinated = false;
+    ms_collect_coordinated[*(int *)oak_tls_get(index_key)] = false;
     if (gc_concurrent_in_progress) {
 	int parked_index = *(int *)oak_tls_get(index_key);
 
@@ -1442,7 +1445,7 @@ ms_collect(bool pre_dump, char *reason, size_t amount)
 #ifdef THREADS
     /* We are the GC coordinator for this cycle. */
     gc_concurrent_in_progress = 1;
-    ms_collect_coordinated = true;
+    ms_collect_coordinated[*(int *)oak_tls_get(index_key)] = true;
 #endif
 
     old_used = (long)(free_point - new_space.start) -

@@ -30,30 +30,42 @@
 
 (define-instance mix-types operation)
 
+;;; The alist is shared by every thread.  Its walk and the insert run
+;;; under *MIX-TYPES-MUTEX* (made by the thread infrastructure; taken
+;;; directly, this being before %GUARD exists, which is fine: the
+;;; sections are a walk and a cons and cannot throw); the type itself
+;;; is made outside, and installed unless another thread has got there
+;;; meanwhile.
+
+(define *mix-types-mutex* #f)
+
 (add-method (mix-types (mixin-manager type-alist) self types)
-  ;; Run through the list looking for what we want.
-  (iterate aux ((l type-alist))
-    (if (null? l)
-	;; not on list, make it.
+  (labels
+      ((lookup
+	(lambda ()
+	  ;; The type made of exactly TYPES, or nil.  (EQUAL? does not
+	  ;; exist yet, so the lists are compared element by element.)
+	  (iterate aux ((l type-alist))
+	    (if (null? l)
+		nil
+		(iterate loop ((x types) (y (caar l)))
+		  (cond ((null? x)
+			 (if (null? y) (cdar l) (aux (cdr l))))
+			((or (null? y) (not (eq? (car x) (car y))))
+			 (aux (cdr l)))
+			(else (loop (cdr x) (cdr y)))))))))
+       (locked
+	(lambda (thunk)
+	  (if *mix-types-mutex* (acquire-mutex *mix-types-mutex*))
+	  (let ((result (thunk)))
+	    (if *mix-types-mutex* (release-mutex *mix-types-mutex*))
+	    result))))
+    (or (locked lookup)
 	(let ((newtype (make type '() types)))
-	  (set! type-alist (cons (cons types newtype) type-alist))
-	  newtype)
-
-	;; We want to write test (EQUAL? TYPES (CAAR L)) here, but
-	;; EQUAL? doesn't work yet so the comparison is done inline,
-	;; element by element.
-
-	(labels ((non-equal-exit (lambda () (aux (cdr l)))))
-
-	  (iterate loop ((x types) (y (caar l)))
-	    (cond ((null? x)
-		   (if (null? y)
-		       ;; They are equal, return the right type:
-		       (cdar l)
-		       (non-equal-exit)))
-		  ((or (null? y)
-		       (not (eq? (car x) (car y))))
-		   (non-equal-exit))
-		  (else (loop (cdr x) (cdr y)))))))))
+	  (locked (lambda ()
+		    (or (lookup)
+			(block
+			  (set! type-alist (cons (cons types newtype) type-alist))
+			  newtype))))))))
 
 ;;; eof

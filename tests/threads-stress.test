@@ -16,7 +16,7 @@ for run in 1 2 3; do
   passes=$(grep -c '^PASS' stress-$run.out)
   fails=$(grep -c '^FAIL' stress-$run.out)
   echo "run $run: exit $rc, $passes passed, $fails failed"
-  test $rc = 0 && test $fails = 0 && test $passes = 18 || { tail -5 stress-$run.out; status=1; }
+  test $rc = 0 && test $fails = 0 && test $passes = 20 || { tail -5 stress-$run.out; status=1; }
 done
 
 files="arith data control objects io promises"

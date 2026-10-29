@@ -350,7 +350,7 @@
       argless-tag-trap-table arged-tag-trap-table object-type boot-code
       free-ptr cons-limit segment-type uninitialized next-newspace-size
       method-type operation-type false process threads-enabled?
-      thread-index))
+      thread-index thread-count))
 
 ;;; Try and longify an instruction.  Return a list of opcodes to replace the old one.
 

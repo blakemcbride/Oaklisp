@@ -74,6 +74,14 @@
 	      (%thread-index)))
 
 ;;
+;; The OS threads running Oaklisp code: 1 without THREADS.
+;;
+(define-constant %thread-count
+  (add-method ((make-open-coded-operation '((load-reg thread-count)) 0 1)
+	       (object))
+	      (%thread-count)))
+
+;;
 ;; Returns #t if the emulator was compiled with THREADS support,
 ;; nil otherwise.  Used to auto-detect thread capability at warm boot.
 ;;

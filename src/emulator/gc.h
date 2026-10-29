@@ -49,6 +49,7 @@ extern void gc(bool pre_dump, bool full_gc, char *reason,
 #ifdef THREADS
 extern int gc_ready[];
 extern int gc_thread_dead[];
+extern int oak_live_thread_count(void);
 extern bool gc_pending;
 extern oak_mutex_t gc_lock;
 #endif

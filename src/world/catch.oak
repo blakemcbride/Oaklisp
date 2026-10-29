@@ -34,14 +34,40 @@
 
 
 
+;;; The fourth slot holds (fluid-bindings . process) of the catch.  A
+;;; throw from another process (an error in a forced promise, handled
+;;; by the forcer's CATCH-ERRORS) first unwinds the thrower's own
+;;; windings as the thrower, then makes the catcher the current
+;;; process again and unwinds its windings down to the catch: each
+;;; process's winding thunks run as that process, which is what holds
+;;; its mutexes.  (The slot is a pair rather than a new slot because
+;;; %ESCAPE-OBJECT-LENGTH is a frozen constant, inlined by the
+;;; compiling world: the object cannot grow in a bootstrap.)
+
 (define throw
   (add-method ((make operation)
 	       (escape-object saved-wind-count saved-fluid-binding-list)
 	       tag value)
-    (unwind (current-windings) (current-wind-count) saved-wind-count)
-;    (set! fluid-binding-list saved-fluid-binding-list)
-    (set-current-fluid-bindings saved-fluid-binding-list)
-    (%throw tag value)))
+    (let* ((saved saved-fluid-binding-list)
+	   ;; NATIVE-CATCH is a macro, so in a bootstrap pass whose
+	   ;; compiling world has the older one, every other file's
+	   ;; catches store the bindings list alone; its cdr is a list
+	   ;; or nil, never a process or 0.
+	   (new? (and (pair? saved)
+		      (not (null? (cdr saved)))
+		      (not (pair? (cdr saved)))))
+	   (bindings (if new? (car saved) saved))
+	   (saved-process (if new? (cdr saved) 0))
+	   (here (%load-process)))
+      (unless (or (eq? here saved-process)
+		  (eq? here 0)
+		  (eq? saved-process 0))
+	(unwind (current-windings) (current-wind-count)
+		(process-base-wind-count here))
+	(%store-process saved-process))
+      (unwind (current-windings) (current-wind-count) saved-wind-count)
+      (set-current-fluid-bindings bindings)
+      (%throw tag value))))
 
 (define-constant %throw
   (add-method ((make-open-coded-operation '((throw)) 2 1)
@@ -79,8 +105,7 @@
     (let ((,var (%filltag
 		 (%allocate escape-object %escape-object-length))))
       (set! ((%slot 3) ,var) (current-wind-count))
-;      (set! ((%slot 4) ,var) fluid-binding-list)
-      (set! ((%slot 4) ,var) (get-current-fluid-bindings))
+      (set! ((%slot 4) ,var) (cons (get-current-fluid-bindings) (%load-process)))
       ,@body)))
 
 (define-syntax (catch v . body)

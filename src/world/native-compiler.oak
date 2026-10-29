@@ -69,7 +69,7 @@
     (object-type . 12) (boot-code . 13) (free-ptr . 14) (cons-limit . 15)
     (segment-type . 16) (uninitialized . 17) (next-newspace-size . 18)
     (method-type . 19) (operation-type . 20) (false . 21) (process . 22)
-    (threads-enabled? . 23) (thread-index . 24)))
+    (threads-enabled? . 23) (thread-index . 24) (thread-count . 25)))
 
 (define native-stream-primitive-arity
   '(0 0 0 2 2 2 1 1 2 1 1 1 2 2 4 2 4 1 4))
@@ -1297,6 +1297,7 @@
 		   ((process) (emit "ON_PUSH(e_process);"))
 		   ((threads-enabled?) (emit "ON_PUSH(e_nil);"))
 		   ((thread-index) (emit "ON_PUSH(INT_TO_REF(0));"))
+		   ((thread-count) (emit "ON_PUSH(INT_TO_REF(1));"))
 		   (else (escape "" instr))))
 	      ((store-reg)
 	       (let* ((reg (cadr instr))
@@ -1788,6 +1789,12 @@
 ;;; name the link cannot find rather than to wrong code.
 
 (define (native-write-summary file prefix)
+  ;; Written whole, then renamed into place, so a reader (a whole-program
+  ;; build in another thread or process) never sees a partial summary.
+  (native-write-summary-to (append file "-tmp") prefix)
+  (rename-file (append file "-tmp") file))
+
+(define (native-write-summary-to file prefix)
   (with-open-file (s file out)
     (format s ";oaklisp-summary prefix=~A~%" prefix)
     (print (list
@@ -1908,7 +1915,15 @@
 			      (or (null? flags) (car flags))))
    . flags))
 
+;;; The per-file state above is global, so one native compile runs at
+;;; a time, under *NATIVE-COMPILER-MUTEX* (multiproc.oak).
+
 (define (native-compile-file-aux the-locale file-name top-native?)
+  (%guard *native-compiler-mutex*
+	  (lambda ()
+	    (native-compile-file-locked the-locale file-name top-native?))))
+
+(define (native-compile-file-locked the-locale file-name top-native?)
   (let* ((sub-locale (make locale (list the-locale)))
 	 (forms (read-file (append file-name ".oak")))
 	 (out-name (compiler-output-name file-name))

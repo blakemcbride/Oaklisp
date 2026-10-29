@@ -249,6 +249,20 @@ static void *init_thread (void *info_p)
 }
 #endif
 
+/* The OS threads running Oaklisp code: 1 without threads. */
+int oak_live_thread_count(void)
+{
+#ifdef THREADS
+  int n = 0, i, count = next_index;
+  for (i = 0; i < count; i++)
+    if (!gc_thread_dead[i])
+      n++;
+  return n;
+#else
+  return 1;
+#endif
+}
+
 void set_gc_flag (bool flag)
 {
 #ifdef THREADS

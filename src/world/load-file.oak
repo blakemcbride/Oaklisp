@@ -86,11 +86,33 @@
 		     (error "No loadable file ~S found.~%" file))))))))
 
 
+  ;; Loads of one file are serialized (LOAD-MUTEX-FOR, below); loads
+  ;; of different files run in parallel.
+  (define (load-locked arglist)
+    (%guard (load-mutex-for (car arglist))
+	    (lambda () (load-aux arglist))))
+
   (define (load file . args)
-    (listify-args load-aux
+    (listify-args load-locked
 		  ((if (symbol? file) downcase identity)
 		   (#^string file))
 		  . args)))
+
+;;; A mutex per file name, made under a mutex of its own; #f while the
+;;; guards are off, when a load is just a load.
+
+(define *load-table-mutex* #f)
+(define *load-mutexes* #f)
+
+(define (load-mutex-for name)
+  (and *load-table-mutex*
+       (%guard *load-table-mutex*
+	       (lambda ()
+		 (let ((entry (present? *load-mutexes* name)))
+		   (if entry
+		       (cdr entry)
+		       (set! (present? *load-mutexes* name)
+			     (make-named-mutex name))))))))
 
 
 

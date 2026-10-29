@@ -462,7 +462,7 @@ COMPILE_ALL = for f in $$files; do \
 	  case " $(COMPFILES:.oa=) " in *" $$f "*) loc="--locale compiler-locale";; esac; \
 	  case $$f in system-version) src=$(abs_builddir)/$$f;; *) src=$(abs_srcdir)/$$f;; esac; \
 	  $(OAKBOOT) $(OAKFLAGS) $$mods --world $$world \
-	    -- $$loc --target $$target --outdir . --compile $$src --exit > $$f.log 2>&1 \
+	    -- $$extra $$loc --target $$target --outdir . --compile $$src --exit > $$f.log 2>&1 \
 	    || { echo "compile failed: $$f (see `pwd`/$$f.log)"; exit 1; }; \
 	done
 
@@ -522,6 +522,29 @@ check-fixpoint: oakworld.bin $(ALLOAFILES)
 	done; \
 	test $$rc = 0 && echo "check-fixpoint: the world reproduces its own objects."; \
 	exit $$rc
+
+# With threads, the compiler must produce the same objects with three
+# OS threads live, the scheduler preempting it onto them (and
+# threads-stress.test compiles several files at once).  Skipped in an
+# emulator without threads.
+check-threaded-fixpoint: oakworld.bin $(ALLOAFILES)
+	@if $(OAKBOOT) --world oakworld.bin -- --locale system-locale \
+	     --eval '(print (%threads-enabled?) standard-output)' --exit 2>&1 \
+	   | tail -c 3 | grep -q T; then \
+	  rm -rf threaded-fixpoint-check && $(MKDIR_P) threaded-fixpoint-check && \
+	  ( cd threaded-fixpoint-check && files='$(ALLOAFILES:.oa=)' \
+	      world=$(abs_builddir)/oakworld.bin target=$(OAK_BYTECODE_ARCH) \
+	      extra='--pthreads 3' && $(COMPILE_ALL) ) && \
+	  rc=0 && cd threaded-fixpoint-check && for f in $(ALLOAFILES); do \
+	    cmpbody() { tail -n +2 "$$1" > cmp1.tmp; tail -n +2 "$$2" > cmp2.tmp; cmp -s cmp1.tmp cmp2.tmp; }; \
+	    cmpbody $$f ../$$f \
+	      || { echo "$$f: compiled with three threads live, differs"; rc=1; }; \
+	  done; \
+	  test $$rc = 0 && echo "check-threaded-fixpoint: the threaded compiler reproduces the objects."; \
+	  exit $$rc; \
+	else \
+	  echo "check-threaded-fixpoint: no threads; skipped"; \
+	fi
 
 # The self-hosting check of CompilerPlan.md milestone 5: the native
 # world's compiler -- the compiler compiled to C by itself, every block
@@ -593,7 +616,7 @@ check-cold-linkers: oakworld.bin new.cold $(TOOLFILES)
 	rm -f linkcheck-*.cold linkcheck-*.sym; \
 	exit $$rc
 
-.PHONY: check-fixpoint check-native-fixpoint check-guile-compile \
+.PHONY: check-fixpoint check-native-fixpoint check-threaded-fixpoint check-guile-compile \
  check-cold-linkers
 
 CLEANFILES = guile.stamp

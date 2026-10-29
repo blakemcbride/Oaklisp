@@ -56,8 +56,17 @@
   self)
 
 
+
+;;; A reader takes the table vector once and sizes its index by it, so
+;;; it always sees one complete table: RESIZE fills the new vector
+;;; before installing it, an insert replaces a bucket's list in one
+;;; store, and a removal builds a new list.  So lookups are safe
+;;; against a writer in another thread (the runtime's tables are
+;;; written under their mutexes); writers against each other are not.
+
 (add-method (present? (generic-hash-table key-op =? table count size) self x)
-  (ass =? x (nth table (modulo (key-op x) size))))
+  (let ((t table))
+    (ass =? x (nth t (modulo (key-op x) (length t))))))
 
 (add-method ((setter present?) (generic-hash-table key-op =? table count size)
 			       self x v)
@@ -88,17 +97,18 @@
 
 (add-method (resize (generic-hash-table key-op table count size) self new-size)
   (let ((old-table table)
-	(old-size size))
-    (set! table (make simple-vector new-size))
-    (set! size new-size)
+	(old-size size)
+	(new-table (make simple-vector new-size)))
     (dotimes (i new-size)
-      (set! (nth table i) '()))
+      (set! (nth new-table i) '()))
     (dotimes (i old-size)
       (dolist (entry (nth old-table i))
 	(let* ((key (key-op (car entry)))
-	       (j (modulo key size))
-	       (jloc (make-locative (nth table j))))
+	       (j (modulo key new-size))
+	       (jloc (make-locative (nth new-table j))))
 	  (set! (contents jloc) (cons entry (contents jloc))))))
+    (set! table new-table)
+    (set! size new-size)
     self))
 
 
@@ -160,7 +170,8 @@
   self)
 
 (add-method (present? (eq-hash-table table count size) self x)
-  (%assq x (%vref-nocheck table (modulo (object-hash x) size))))
+  (let ((t table))
+    (%assq x (%vref-nocheck t (modulo (object-hash x) (length t))))))
 
 (add-method ((setter present?) (eq-hash-table table count size) self x v)
   (let* ((lslot (make-locative
@@ -188,16 +199,17 @@
 
 (add-method (resize (eq-hash-table table count size) self new-size)
   (let ((old-table table)
-	(old-size size))
-    (set! table (make simple-vector new-size))
-    (set! size new-size)
+	(old-size size)
+	(new-table (make simple-vector new-size)))
     (dotimes (i new-size)
-      (set! (nth table i) '()))
+      (set! (nth new-table i) '()))
     (dotimes (i old-size)
       (dolist (entry (nth old-table i))
-	(push (nth table
-		   (modulo (object-hash (car entry)) size))
+	(push (nth new-table
+		   (modulo (object-hash (car entry)) new-size))
 	      entry)))
+    (set! table new-table)
+    (set! size new-size)
     self))
 
 (define (make-eq-hash-table) (make eq-hash-table))

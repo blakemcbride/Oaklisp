@@ -27,16 +27,43 @@
 ;;; <number> ::= [ '+' | '-' ] <digit>+
 ;;;
 
-(let ((formats (lambda (arglist)
-		 (apply format arglist)
-		 (#^string (car arglist)))))
+;;; With threads, a call's whole output reaches the stream at once,
+;;; under *OUTPUT-MUTEX* (made by the thread infrastructure), so
+;;; lines from several threads do not interleave; it is rendered to a
+;;; string first, outside the mutex, since rendering may run anything.
+;;; Output by PRINT or WRITE-STRING straight to a shared stream is not
+;;; covered.
+
+(define *output-mutex* #f)
+
+(let ((formats (lambda (arglist)	; (s control-string . args): fill S
+		 (apply format-to-stream arglist)
+		 (#^string (car arglist))))
+      (format-locked (lambda (arglist)	; (stream control-string . args)
+		       (let ((s (make string-output-stream)))
+			 (apply format-to-stream (cons s (cdr arglist)))
+			 (%guard *output-mutex*
+				 (lambda ()
+				   (write-string (#^string s) (car arglist))))
+			 #f))))
+
+  ;; The formatter itself, to any stream; FORMAT's rendering to a
+  ;; string goes through this, not through FORMAT, so that the mutex
+  ;; branch below is never re-entered for the string stream.
+  (define (format-to-stream stream control-string . args)
+    (formati stream control-string 0 (length control-string) . args))
 
   (define (format stream control-string . args)
-    (if (null? stream)
-	(let ((s (make string-output-stream)))
-	  (listify-args formats s control-string . args))
-	(formati (if (eq? stream #t) standard-output stream)
-		 control-string 0 (length control-string) . args))))
+    (cond ((null? stream)
+	   (let ((s (make string-output-stream)))
+	     (listify-args formats s control-string . args)))
+	  (*output-mutex*
+	   (listify-args format-locked
+			 (if (eq? stream #t) standard-output stream)
+			 control-string . args))
+	  (else
+	   (format-to-stream (if (eq? stream #t) standard-output stream)
+			     control-string . args)))))
 
 
 (define (formati stream control-string index limit . args)

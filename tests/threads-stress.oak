@@ -43,6 +43,43 @@
 	s
 	(loop (+ i 1) (+ s (catch k (if (odd? i) (k 1) 2)))))))
 
+(define stress-out (make string-output-stream))
+
+(define (stress-writer id n)
+  (dotimes (i n) (format stress-out "writer ~D line ~D of ~D~%" id i n))
+  #t)
+
+;;; Every line of the shared stream intact: their count, or #f.
+(define (stress-lines-ok? s)
+  (let ((len (length s)))
+    (iterate scan ((i 0) (start 0) (n 0))
+      (cond ((= i len) (and (= start len) n))
+	    ((eq? (nth s i) #\newline)
+	     (let* ((line (subseq-indexes s start i))
+		    (l (length line)))
+	       (if (and (> l 14)
+			(equal? (subseq-indexes line 0 7) "writer ")
+			(equal? (subseq-indexes line (- l 7) l) " of 200"))
+		   (scan (+ i 1) (+ i 1) (+ n 1))
+		   #f)))
+	    (else (scan (+ i 1) start n))))))
+
+(define (stress-definer k n)
+  (dotimes (i n)
+    (eval `(define ,(#^symbol (format #f "stress-var-~D-~D" k i)) ,i)
+	  system-locale))
+  #t)
+
+(define (stress-definitions-ok?)
+  (let ((ok #t))
+    (dotimes (k 3)
+      (dotimes (i 100)
+	(unless (eq? (eval (#^symbol (format #f "stress-var-~D-~D" (+ k 1) i))
+			   system-locale)
+		     i)
+	  (set! ok #f))))
+    ok))
+
 (dotimes (round 3)
   (check "bignums" (stress-bignums 2000 0) (stress-bignums 2000 0))
   (check "lists" (stress-lists 50000) 302)
@@ -50,3 +87,16 @@
   (check "methods" (stress-methods 20) 20)
   (check "throws" (stress-throws 1000) 1500)
   (check "eval" (eval '(let ((f (lambda (x) (* x x)))) (f 12)) system-locale) 144))
+
+;;; Several threads at once: formatting to one stream, and defining
+;;; globals in system-locale while others look them up.
+(check "format lines intact"
+       (block (map force (map (lambda (id) (future (stress-writer id 200)))
+			      '(1 2 3 4)))
+	      (stress-lines-ok? (#^string stress-out)))
+       800)
+(check "concurrent definitions"
+       (block (map force (map (lambda (k) (future (stress-definer k 100)))
+			      '(1 2 3)))
+	      (stress-definitions-ok?))
+       #t)

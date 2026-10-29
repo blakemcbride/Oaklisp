@@ -22,6 +22,9 @@
 (define-instance dump-world operation)
 
 (add-method (dump-world (string) self)
+  ;; Only the dumping thread's state would be in the image.
+  (when (> (%thread-count) 1)
+    (error "DUMP-WORLD with ~D OS threads live.~%" (%thread-count)))
   (%dump-world (make-locative (%vref self 0)) (length self)))
 
 ;;; Load a new world image, replacing the current one.

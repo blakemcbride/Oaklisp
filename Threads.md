@@ -190,6 +190,39 @@ Performance
 See `GC.md` for full garbage collection documentation.
 
 
+Shared state
+============
+
+What several threads may touch at once, and the rule that makes it
+safe (ThreadUpdate.md Phase 3):
+
+| State | Where | Rule |
+|-------|-------|------|
+| Symbol table, `gensym` counter | symbols.oak | `*symbol-table-mutex*`, reads and writes |
+| Locales: variable tables, macro alists, frozen lists | locales.oak | writes under `*locale-mutex*`; reads unlocked, safe because a hash table's readers see one complete table (below); two installs of one name: last writer wins |
+| Hash tables | hash-table.oak | `present?` takes the vector once and sizes its index by it; `resize` fills the new vector before installing it; an insert replaces a bucket's list in one store, a removal builds a new list. So lookups are safe against one writer in another thread; concurrent writers to a user's table need a mutex of the user's |
+| Fluid bindings | fluid.oak | per process; installs in the global top-level list under `*fluid-table-mutex*` |
+| Winding stack, pending rewind | unwind-protect.oak | per process, a new process starting with its creator's (its extent begins inside the creator's). A throw to another process's catch (an error in a forced promise, handled by the forcer) unwinds the thrower's own windings as the thrower, then restores the catcher as the current process and unwinds its windings to the catch |
+| Error handlers | error2.oak | a fluid, so per process |
+| Method cache | loop.c | striped seqlock; `OP_METH_ALIST_MTF` off |
+| Operation-method alists, bp alists | kernel1-install.oak | `%install-method-with-env` under `*add-method-mutex*`; readers walk lists that only grow at the head or have a cdr replaced |
+| Mixed-type cache | mix-types.oak | `*mix-types-mutex*` around the walk and the insert; the type is made outside it |
+| Expression table, fancy accessors | anonymous.oak | `*expression-table-mutex*` (reentrant: evaluation inside can print) |
+| Stream-primitive cache | streams.oak | `*stream-primitive-mutex*` |
+| Output streams | format.oak | a `format` call's output reaches the stream at once, under `*output-mutex*`, rendered first outside it; `print` or `write-string` straight to a shared stream from several threads interleaves |
+| Input streams | — | one reader per stream; not locked |
+| Scheduler queue | multiproc.oak | `*scheduleQ-mutex*`, held by the OS thread, alarms off |
+| Process ids | multiproc.oak | lock-free compare-and-swap |
+| `load` | load-file.oak | a mutex per file name: the same file loads serially, different files in parallel |
+| The bytecode compiler | compiler-locale | per-compilation state in fluids and the AST; `crunch-class-alist`, the opcode tables and `nichevo` are read-only after load; concurrent `compile-file`s give byte-identical objects (`threads-stress.test`), and so does compiling with threads live (`check-threaded-fixpoint`) |
+| The native compiler | native-compiler.oak | its per-file state is global, so a native compile holds `*native-compiler-mutex*` throughout; `.ois` summaries are written whole then renamed into place; oakc is a single-threaded build step |
+| Weak pointers | weak.c | a C mutex |
+| `dump-world` | dump-world.oak | refused with more than one OS thread live (`%thread-count`); `--dump` at exit stops the world |
+| VM registers (`STORE-REG`) | loop.c | per thread: `bp`, `env`, `nargs`, `process`; set at boot only: `t`, `nil`, the types, the subtype and tag-trap tables; `free-ptr` and `cons-limit` under `alloc_lock`; `next-newspace-size` a global knob |
+| Allocation | data.h | TLAB fast path per thread; the slow path under `alloc_lock`; a thread out of memory while a cycle marks parks until the cycle's sweep has begun |
+| Warm boot actions, command line, `features` | warm.oak, cmdline*.oak, hash-reader.oak | boot only, or set rarely; not locked |
+
+
 Testing
 =======
 

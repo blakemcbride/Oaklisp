@@ -10,6 +10,8 @@
 $MAKE -C "$top_builddir/src/world" check-fixpoint || fail "check-fixpoint"
 $MAKE -C "$top_builddir/src/world" check-native-fixpoint \
   || fail "check-native-fixpoint"
+$MAKE -C "$top_builddir/src/world" check-threaded-fixpoint \
+  || fail "check-threaded-fixpoint"
 $MAKE -C "$top_builddir/src/world" check-cold-linkers || fail "check-cold-linkers"
 if test "$GUILE" != no; then
   $MAKE -C "$top_builddir/src/world" check-guile-compile || fail "check-guile-compile"

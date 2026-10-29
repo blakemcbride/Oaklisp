@@ -23,6 +23,7 @@
 
 #ifdef THREADS
 extern int next_index;
+extern int oak_live_thread_count(void);
 extern oak_tls_key_t index_key;
 extern oak_mutex_t index_lock;
 extern oak_mutex_t alloc_lock;

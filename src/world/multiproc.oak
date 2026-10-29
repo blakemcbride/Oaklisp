@@ -63,7 +63,8 @@
 ;;; its creator's.
 
 (define-instance process type
-  '(pid process-fluid-binding-list windings wind-count pending-rewind)
+  '(pid process-fluid-binding-list windings wind-count pending-rewind
+    base-wind-count)
   (list object))
 (define-instance process-id operation)
 (define-instance fluid-bindings settable-operation)
@@ -82,13 +83,19 @@
   (set! wind-count new))
 (add-method (process-pending-rewind (process pending-rewind) self)
   pending-rewind)
+;;; The wind count the process started with (its creator's): below it
+;;; the winding stack is the creator's, above it the process's own.
+(define-instance process-base-wind-count operation)
+(add-method (process-base-wind-count (process base-wind-count) self)
+  base-wind-count)
 (add-method ((setter process-pending-rewind) (process pending-rewind) self new)
   (set! pending-rewind new))
 
 (define trace-processes #f)
 
 (add-method (initialize (process pid process-fluid-binding-list
-				  windings wind-count pending-rewind) self)
+				  windings wind-count pending-rewind
+				  base-wind-count) self)
   (when trace-processes
      (format #t "init: oak process descriptor~%"))
   (set! pid (new-pid))
@@ -97,8 +104,14 @@
   (set! process-fluid-binding-list
 	(map (lambda (z) (cons (car z) (cdr z)))
 	     (get-current-fluid-bindings)))
-  (set! windings '())
-  (set! wind-count 0)
+  ;; And the creator's winding stack as it stands: the new process's
+  ;; dynamic extent begins inside its creator's, so a throw from it
+  ;; to a catch of the creator's (an error in a forced promise,
+  ;; handled by the forcer) unwinds down to that catch's level.  The
+  ;; list is shared and never mutated: unwinding replaces the head.
+  (set! windings (current-windings))
+  (set! wind-count (current-wind-count))
+  (set! base-wind-count wind-count)
   (set! pending-rewind #f)
   self)
 
@@ -255,6 +268,11 @@
 
 (define %threads-initialized #f)
 
+;;; The native compiler's guard (native-compiler.oak keeps its per-file
+;;; state in globals); defined here, in system-locale, so that both
+;;; sides see it.
+(define *native-compiler-mutex* #f)
+
 (define (init-process-object)
   ;;; Give this virtual machine a process object.  Anything that reaches
   ;;; the scheduler -- PROCESS-ID, PAUSE, PROCESS-RUN-FN, FORCE of a
@@ -279,6 +297,11 @@
     (set! *stream-primitive-mutex* (make-named-mutex 'stream-primitive))
     (set! *locale-mutex* (make-named-mutex 'locale))
     (set! *fluid-table-mutex* (make-named-mutex 'fluid-table))
+    (set! *mix-types-mutex* (make-named-mutex 'mix-types))
+    (set! *output-mutex* (make-named-mutex 'output))
+    (set! *native-compiler-mutex* (make-named-mutex 'native-compiler))
+    (set! *load-mutexes* (make-string-hash-table))
+    (set! *load-table-mutex* (make-named-mutex 'load-table))
     (set! %threads-initialized #t)))
 
 (define (setup-initial-process-object)

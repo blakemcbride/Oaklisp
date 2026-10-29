@@ -189,7 +189,7 @@
     %fluid _add-method native-add-method %empty-environment
     %install-method-with-env %install-method %install-lambda
     %install-lambda-with-env
-    get-current-fluid-bindings set-current-fluid-bindings
+    get-current-fluid-bindings set-current-fluid-bindings %load-process
     fluid-binding-list
     signal-destructure-error
     make-undefined-variable-value

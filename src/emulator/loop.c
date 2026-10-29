@@ -134,6 +134,9 @@ static size_t mcache_seq[MCACHE_STRIPES];
   (&mcache_seq[((unsigned long)(op) >> 4) & (MCACHE_STRIPES - 1)])
 #endif
 
+/* The OS threads running Oaklisp code (threads.c; 1 without threads). */
+extern int oak_live_thread_count(void);
+
 /* File handles are represented as Oaklisp fixnums. The three standard
    streams are hotwired to be 0, 1 and 2, so a world image dumped with
    the standard streams open (every one is) contains no host FILE *
@@ -1795,6 +1798,9 @@ loop(ref_t initial_tos)
 #else
 		  PUSHVAL(INT_TO_REF(0));
 #endif
+		  GOTO_TOP;
+		case 25:	/* THREAD-COUNT */
+		  PUSHVAL(INT_TO_REF(oak_live_thread_count()));
 		  GOTO_TOP;
 		default:
 		  fprintf(stderr, "Error (vm interpreter): "

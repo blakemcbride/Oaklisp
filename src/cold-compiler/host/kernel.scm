@@ -642,7 +642,8 @@
     (let ((v (oak-obj-v escape-object)))
       (when (> (vector-length v) 4)
 	(vector-set! v 3 (if *wind-count-cell* (variable-ref *wind-count-cell*) 0))
-	(vector-set! v 4 (oak-fluid-bindings))))
+	;; (fluid-bindings . process); 0: no process in the host.
+	(vector-set! v 4 (cons (oak-fluid-bindings) 0))))
     escape-object))
 
 (define (oak-throw escape-object value)
