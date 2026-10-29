@@ -53,8 +53,8 @@ and then reworked/extended by BAP.
 1. Native 64-bit as well as 32-bit builds, either byte order
 2. Dumping a world without exiting, and loading a world at runtime
    (see Dump.md)
-3. Native threads alongside green threads (see Threads.md,
-   Native-Threads.md), with a concurrent mark-sweep GC (see GC.md)
+3. Native threads alongside green threads (see Threads.md), with a
+   concurrent mark-sweep GC (see GC.md)
 4. A native compiler from Oaklisp to C: mixed-mode native code in the
    running world, and stand-alone executables with oakc (see
    Compiler.md)

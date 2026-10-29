@@ -59,16 +59,9 @@
 
 ;;; process priorities
 
-;;; make threads extra "level" in build process.  Prior to that being
-;;; loaded, NO THREAD STUFF AT ALL.
-
-;;; ability to build emulator without thread support
-
-;;; race conditions (symbol tables, hash tables, add-method)
-
-;;; performance
-
-;;; make sure throwing out of thread gets an error
-
-
-;;; completely rewrite allocation subsystem
+;;; Done since (Threads.md): the emulator builds with or without
+;;; threads (--enable-threads); the symbol table, add-method and the
+;;; runtime's other shared state are guarded, hash tables are safe for
+;;; readers against one writer (a user's concurrent writers lock their
+;;; own); an error in a thread is re-signaled by thread-join; the
+;;; performance is measured in BUILD.md.

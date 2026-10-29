@@ -1,15 +1,21 @@
 Thread Support in Oaklisp
 ==========================
 
-Status: the interpreter and the bytecode compiler work with threads
-(`make check` passes in every configuration, `threads-stress.test`
-included); natively compiled code does not run threaded yet.
-Disabled by default.
+Status: the interpreter, the bytecode compiler and natively compiled
+code (mixed mode and oakc executables) work with threads: `make check`
+passes in every configuration, `threads-stress.test`,
+`threads-api.test` and the threaded stand-alone executable included,
+and the concurrent collector passes its verify mode.  Off by default.
 
-Enable with: `./configure --enable-threads`
+Enable with: `./configure --enable-threads`, which builds the emulator
+with OS threads and the concurrent mark-sweep collector they require
+(`-DTHREADS -DUSE_MARK_SWEEP`).  Portable across Linux, macOS and
+Windows (see `Portability.md` and `Windows.md`).
 
-Portable across Linux, macOS, and Windows (see `Portability.md` and
-`Windows.md`).
+Green threads (`delay`, `future`, `process-run-fn`) work in every
+build.  With threads, `--pthreads N` runs the lightweight scheduler
+on N OS threads, and `make-thread` starts OS threads of a program's
+own (The API, below).
 
 
 Architecture
@@ -17,19 +23,22 @@ Architecture
 
 Two-level concurrency model:
 
-1. **Heavyweight threads** (native OS threads) — each with its own VM
-   registers, value stack, context stack, and GC buffer.  Created via
-   `%make-heavyweight-thread` (opcode 70).  Uses pthreads on
-   POSIX/MinGW, native Win32 threads on MSVC (via `oak-thread.h`).
+1. **Heavyweight threads** (OS threads) -- each with its own VM
+   registers, value stack, context stack, GC buffer and allocation
+   buffer.  Created with `%make-heavyweight-thread` (opcode 70), by
+   `--pthreads N` for the scheduler and by `make-thread` for
+   programs.  pthreads on POSIX and MinGW, Win32 threads on MSVC
+   (`oak-thread.h`).
 
-2. **Lightweight processes** (green threads) — Oaklisp-level
-   continuations multiplexed within a single native thread via a
-   cooperative scheduler with timer-driven preemption.  Context switch
-   via `pause()` using `call/cc`.
+2. **Lightweight processes** (green threads) -- Oaklisp-level
+   continuations multiplexed over the OS threads by a cooperative
+   scheduler with timer-driven preemption.  A context switch is
+   `pause`, with `call/cc`.
 
-Each native thread runs its own lightweight process scheduler.  The
-global scheduler queue (`*scheduleQ*`) is shared across all threads,
-protected by a mutex.
+Every OS thread of `--pthreads N` runs the lightweight scheduler; the
+queue (`*scheduleQ*`) is shared, under a mutex, so a process
+preempted on one OS thread may resume on another.  Idle scheduler
+threads park.
 
 
 C Emulator (`src/emulator/`)
@@ -39,43 +48,49 @@ Key files and `#ifdef THREADS` sections:
 
 | File | Thread-related content |
 |------|----------------------|
-| `threads.h` | Mutex declarations, `THREADY()` macro, TLS key, `oak_threads_system_init()` |
-| `threads.c` | `create_thread()`, `init_thread()`, `wait_for_gc()`, `set_gc_flag()`, dynamic mutex init |
-| `data.h` | Per-thread register macros, `ALLOCATE_PROT` spin-lock, GC buffer arrays |
-| `loop.c` | Opcodes 67-72, `POLL_GC_SIGNALS()`, thread index init |
-| `gc.c` | `FORTHREADS` macro, per-thread root scanning, GC coordination |
-| `oaklisp.c` | Thread-0 TLS init, per-thread stack/register allocation |
-| `stacks.c` | Thread index retrieval in `init_stacks()` |
-| `config.h` | `MAX_THREAD_COUNT` (200), disables move-to-front under threads |
-| `gc-ms.c` | Mark-sweep GC, TLABs, TLAB retire/refill, deferred objstart buffer |
-| `gc-ms.h` | MS-GC and TLAB declarations, `TLAB_SIZE` (4096 words) |
-| `oak-native.h`, `native.c`, `native-ops.c` | Natively compiled code: `my_index` is the thread-local `oak_thread_index_var`, `ON_STORE` (barrier), `ON_PENDING` (rendezvous), seqlocked call sites, the registry under `native_lock`, `oak_native_run_thread` |
+| `threads.h`, `oak-thread.h` | The mutexes, `THREADY()`, the TLS key and `oak_thread_index_var`, `oak_thread0_init`, `oak_thread_entry`, the blocking-call brackets; the POSIX/Win32 abstraction |
+| `threads.c` | `create_thread()`, `init_thread()`, `wait_for_gc()`, `set_gc_flag()`, thread 0's setup, parking (stream primitives 19-21), dynamic mutex init for MSVC |
+| `data.h` | Per-thread register macros, the per-thread alarm clock in `register_set_t`, `ALLOCATE_PROT` (the TLAB fast path), GC buffer arrays |
+| `loop.c` | Opcodes 67-72, `POLL_GC_SIGNALS()`, the method cache's striped seqlock reads, the NATIVE instruction's hand-over |
+| `gc.c` | `FORTHREADS` macro, per-thread root scanning, the stop-the-world handshake |
+| `gc-ms.c`, `gc-ms.h` | Concurrent mark-sweep: TLABs, SATB barrier buffers, the coalescing sweep, the heap growth rule, verify mode |
+| `oaklisp.c`, `embed-native.c` | The two entry points: thread 0 through `oak_thread0_init`, the thread entry (`loop` or the native call driver) |
+| `stacks.c` | Thread index retrieval in `init_stacks()`, a thread's exit on context underflow |
 | `dispatch.h`, `dispatch.c` | `oak_mcache_read`/`oak_mcache_fill`: the operations' method caches under their striped sequence counts, for the interpreter and native code |
+| `oak-native.h`, `native.c`, `native-ops.c` | Natively compiled code: `my_index` is the thread-local `oak_thread_index_var`, `ON_STORE` (barrier), `ON_PENDING` (rendezvous), seqlocked call sites, the registry under `native_lock`, `oak_native_run_thread` |
+| `config.h` | `MAX_THREAD_COUNT` (200), disables move-to-front under threads |
 
-Per-thread state (via TLS `index_key`):
+Per-thread state (by `my_index`, the thread's slot, from the TLS key
+in the interpreter and `oak_thread_index_var` elsewhere):
 
-    register_array[my_index]           VM registers (e_pc, e_env, e_bp, ...)
+    register_array[my_index]           VM registers (e_pc, e_env, e_bp, ...,
+                                       the alarm clock)
     value_stack_array[my_index]        Value stack
     cntxt_stack_array[my_index]        Context stack
     gc_examine_buffer_array[my_index]  GC worklist
-    tlab_cursor_array[my_index]        TLAB bump pointer (USE_MARK_SWEEP only)
-    tlab_end_array[my_index]           TLAB end pointer  (USE_MARK_SWEEP only)
-    satb_buffer_array[my_index][]      SATB write barrier log (USE_MARK_SWEEP only)
-    satb_count_array[my_index]         SATB buffer entry count (USE_MARK_SWEEP only)
+    tlab_cursor_array[my_index]        TLAB bump pointer
+    tlab_end_array[my_index]           TLAB end pointer
+    satb_buffer_array[my_index][]      SATB write barrier log
+    satb_count_array[my_index]         SATB buffer entry count
 
 Global shared state:
 
     Heap (new_space, old_space)     Protected by alloc_lock
     free_point, new_space.end       Modified under alloc_lock
     gc_pending, gc_ready[]          GC coordination flags
-    objstart_bitmap, mark_bitmap    GC bitmaps (USE_MARK_SWEEP only)
-    free_list_heads[]               Segregated free lists (USE_MARK_SWEEP only)
+    objstart_bitmap, mark_bitmap    GC bitmaps
+    free_list_heads[]               Segregated free lists
 
-GC coordination: one thread sets `gc_pending`, all others call
-`wait_for_gc()` (blocking on `gc_lock`).  Under `USE_MARK_SWEEP`, the
-mark phase runs mostly concurrently with only brief STW pauses for
-initial mark and remark; sweep runs lazily during allocation.  Without
-`USE_MARK_SWEEP`, GC is fully stop-the-world (copying collector).
+GC coordination: one thread sets `gc_pending`, all others reach a
+safepoint (the interpreter polls every instruction, native code at
+every call, return and backward branch, allocation on its slow path)
+and call `wait_for_gc()`, blocking on `gc_lock`; a parked, sleeping or
+blocked-in-C thread counts as there already.  `next_index` is
+snapshotted at the start of a collection, so a thread created during
+it is never read half-initialized, and a thread that has exited is
+skipped.  The mark phase runs concurrently with two brief pauses
+(initial mark and remark); the sweep is lazy, during allocation; the
+copying collector runs only to grow the heap (see GC.md).
 
 Thread-related opcodes:
 
@@ -84,9 +99,14 @@ Thread-related opcodes:
 | 67 | ENABLE-ALARMS | `timer_increment = 1` (enable preemption) |
 | 68 | DISABLE-ALARMS | `timer_increment = 0` (disable preemption) |
 | 69 | RESET-ALARM-COUNTER | `timer_counter = 0` |
-| 70 | HEAVYWEIGHT-THREAD | Create native thread running given thunk; returns #t/#f |
-| 71 | TEST-AND-SET-LOCATIVE | Atomic CAS on locative cell (mutex primitive) |
+| 70 | HEAVYWEIGHT-THREAD | Create an OS thread running the given thunk; returns #t/#f |
+| 71 | TEST-AND-SET-LOCATIVE | One compare-and-swap on the cell (the mutex primitive) |
 | 72 | THREAD-YIELD | `oak_thread_yield()` under THREADS, no-op otherwise |
+
+And LOAD-REG 23 to 25 (`%threads-enabled?`, `%thread-index`,
+`%thread-count`), stream primitives 19 to 21 (park, unpark, sleep).
+The alarm clock is per thread: one thread's `%enable-alarms` cannot
+re-arm preemption inside another's scheduler critical section.
 
 
 Oaklisp Runtime (`src/world/`)
@@ -94,9 +114,11 @@ Oaklisp Runtime (`src/world/`)
 
 | File | Content |
 |------|---------|
-| `multi-em.oak` | Primitive ops: `%make-heavyweight-thread`, `%load-process`, `%store-process`, `%test-and-set-locative`, `%thread-yield`, `%threads-enabled?` |
-| `multiproc.oak` | Queues, process descriptors, mutexes, scheduler, semaphores, futures |
-| `multi-off.oak` | Guard variable `%no-threading` for cold-boot |
+| `multi-em.oak` | Primitive ops: `%make-heavyweight-thread`, `%load-process`, `%store-process`, `%test-and-set-locative`, `%thread-yield`, `%threads-enabled?`, `%thread-index`, `%thread-count` |
+| `multiproc.oak` | Queues, process descriptors, mutexes, scheduler, semaphores, futures, the thread API, condition variables, the atomics |
+| `multi-off.oak` | `%guard`, the runtime's guarded section |
+| `unwind-protect.oak` | `%with-guard`, the windings (per process) |
+| `multiproc-tests.oak` | Basic tests of the lightweight processes |
 
 Synchronization primitives (all in `multiproc.oak`):
 
@@ -106,18 +128,22 @@ Synchronization primitives (all in `multiproc.oak`):
   OS thread on the mutex's waiter list (stream primitive 19, 10 ms at
   a time) until `release-mutex` unparks it; only the scheduler's own
   lock, and a mutex taken inside the scheduler's section, is waited
-  for by yielding.  Reentrant, held by the process, released only by
-  the holder; `with-mutex` releases on any exit; a wait of a million
-  steps or five seconds parked is reported on standard error with
-  the holder.  The runtime's own guarded sections go through
-  `%guard`.  The scheduler's lock is held by the OS thread instead
-  (`%thread-mutex`).
+  for by yielding.  Reentrant, held by the process (a process
+  preempted inside a critical section and resumed on another OS
+  thread still holds its lock), released only by the holder; may be
+  named (`make-named-mutex`); `with-mutex` releases on any exit; a
+  wait of a million steps or five seconds parked is reported on
+  standard error with the holder, which is how a deadlock shows
+  itself.  The scheduler's lock is a `%thread-mutex`, held by the OS
+  thread (`%thread-index`): its section switches processes but runs
+  with alarms off.
 - **Semaphore**: Mutex + waiting queue.  Blocked processes enqueued,
   woken on `signal`.
 - **Futures**: Lazy evaluation with dependent process queue;
   auto-scheduled computation.
 - **Scheduler**: Global `*scheduleQ*` protected by mutex + alarm
   disable.  `pause()` does `call/cc` context switch.
+- **Threads, condition variables, atomics**: The API, below.
 
 
 Natively compiled code
@@ -156,75 +182,95 @@ interpreter:
   (`oak_thread_blocking_begin`/`end`), so a collection in another
   thread does not wait for it.
 - `%test-and-set-locative` in native code is `oak_rt_test_and_set`,
-  under the interpreter's lock; `%make-heavyweight-thread` and
+  the same compare-and-swap; `%make-heavyweight-thread` and
   `%thread-yield` are real; parking and sleeping synchronize the
   stack first.
 - A stand-alone executable's new OS thread runs the call driver
   (`oak_native_run_thread`) instead of `loop`: threads.c calls
   `oak_thread_entry`, which each entry point sets.
 
+
 Initialization
 ===============
 
-Every warm boot gives the machine a process object, and from then on
-fluid bindings and the winding stack are per process.  In an emulator
-with threads the warm boot also runs `init-thread-infrastructure`
-(`init-threads-at-boot` in `multiproc.oak`), which makes the guard
-mutexes; the guards are therefore on whether or not `--pthreads`
-follows.
-Without threads they stay `#f` and the guarded sections cost nothing
-beyond a closure.  `--pthreads N` (`setup-initial-process-object`)
-then only spawns the N-1 extra OS threads, each of which starts by
-giving itself a process of its own.
+Every warm boot gives the machine a process object
+(`init-process-object`, the first warm boot action), and from then on
+fluid bindings and the winding stack are per process: resuming one
+process's continuation never unwinds another's `wind-protect`s, and
+one process's `bind` is invisible to the others.  A new process starts
+with a copy of its creator's fluid bindings and the creator's winding
+stack (its extent begins inside the creator's); before a process
+exists they are global.
 
-Then `spawn-heavyweight-threads` creates N-1 additional native threads.
+In an emulator with threads the warm boot also runs
+`init-thread-infrastructure` (`init-threads-at-boot`, multiproc.oak),
+which makes the guard mutexes and registers the main thread, so the
+guards are on whether or not `--pthreads` follows and `make-thread`
+works at once.  `--pthreads N` (`spawn-heavyweight-threads`) then only
+starts the N-1 scheduler threads, each of which begins by giving
+itself a process of its own (`start-busy-work`).
 
-On a non-THREADS emulator, `%threads-enabled?` returns nil and the
-`--pthreads` option prints a warning and exits.  Without `--pthreads`,
-all guard-variable mutexes remain `#f` — zero overhead.
+In an emulator without threads the guards stay `#f`, so a guarded
+section costs a call and nothing more, `%threads-enabled?` is nil,
+`make-thread` is an error, and `--pthreads` prints a warning and
+exits.
 
 
 Thread Safety
 ==============
 
-The runtime's known shared data structures are protected as follows
-(general hash tables are not; see below):
+**C emulator:**
 
-**C emulator (protected by mutex or volatile):**
-- `signal_poll_flag` — `volatile sig_atomic_t` for signal safety
-- `alloc_lock` — protects `free_point`, `new_space.end`, and
-  STORE-REG cases 14/15 in `loop.c`
-- `wp_lock` — protects `ref_to_wp()` and `rebuild_wp_hashtable()` in
-  `weak.c`
-- `dump_lock` — protects DUMP-WORLD (case 73) and LOAD-WORLD (case 74)
-  in `loop.c`
+- `signal_poll_flag` -- `volatile sig_atomic_t`, delivered by thread 0
+- `alloc_lock` -- the allocation slow path, `free_point`,
+  `new_space.end`, STORE-REG of `free-ptr` and `cons-limit`
+- `gc_lock` -- held for the length of a collection; `wait_for_gc`,
+  parking and the blocking-call brackets leave their parked state
+  under it, so a stop-the-world that counted a thread stays stopped
+- `wp_lock` -- `ref_to_wp()` and `rebuild_wp_hashtable()` in `weak.c`
+- `dump_lock` -- DUMP-WORLD and LOAD-WORLD, in the interpreter and in
+  native code
+- `native_lock`, `site_lock` -- the native registry and the call-site
+  caches
+- The method cache -- a seqlock with sequence counts striped by
+  operation address (`mcache_seq`, dispatch.c): a fill takes its
+  stripe's count from even to odd with a compare-and-swap (or leaves
+  the cache alone if another fill holds it), writes type, method and
+  offset, and makes it even again; a hit needs the same even count
+  before and after its reads.  `OP_METH_ALIST_MTF` is off under
+  threads: it would mutate the shared alists.
+- A thread whose thunk returns underflows its context stack, which
+  `stack_unflush` turns into the thread's exit (`oak_thread_exit_unwind`);
+  a failed `pthread_create` frees what it had allocated; a thread's
+  slot is reused once it has exited.
 
-**Oaklisp runtime (protected by guard-variable mutex pattern):**
-- `*symbol-table-mutex*` — `intern` and `gensym` in `symbols.oak`
-- `*add-method-mutex*` — `%install-method-with-env` in `kernel1-install.oak`
-- `*expression-table-mutex*` — `expression-table` and `fancy-accessor-*`
-  lists in `anonymous.oak`
-- `*stream-primitive-mutex*` — `sp-alist` cache in `streams.oak`
-- `*locale-mutex*` — `(setter variable-here?)`, `(setter macro-here?)`,
-  `(setter frozen-here?)` in `locales.oak`
-- `*fluid-table-mutex*` — `add-to-current-fluid-bindings` in `fluid.oak`
+**Oaklisp runtime -- the guarded sections:** each guard is a variable
+that is `#f` until `init-thread-infrastructure` sets it to a mutex.
+The code it guards runs its critical section through `%guard`
+(multi-off.oak), which with the mutex set is `%with-guard`
+(unwind-protect.oak): acquire, run, release on any exit, through a
+winding whose thunks are the mutex's own; and with it `#f` just runs
+the section.  The mutexes are reentrant and held by the process, so a
+section may call into another, and a section preempted and resumed on
+another OS thread still releases its own lock.  Only
+`%install-method-with-env` and `mix-types` take their mutexes
+directly: their sections are plain stores.  The guards:
+`*symbol-table-mutex*` (`intern`, `gensym` in symbols.oak),
+`*add-method-mutex*` (the part of `%install-method-with-env` in
+kernel1-install.oak that mutates `operation-method-alist`),
+`*expression-table-mutex*` (anonymous.oak),
+`*stream-primitive-mutex*` (streams.oak), `*locale-mutex*` (the
+setters in locales.oak), `*fluid-table-mutex*` (fluid.oak),
+`*mix-types-mutex*` (mix-types.oak), `*output-mutex*` (format.oak),
+`*native-compiler-mutex*` (native-compiler.oak), `*threads-mutex*`
+and the per-file `load` mutexes (load-file.oak).  The "Shared state"
+table below has the rule for each piece of shared state.
 
-All guard variables are `#f` during cold/warm boot (no mutex overhead)
-and initialized to `(make mutex)` in `init-thread-infrastructure`
-(`multiproc.oak`) when `--pthreads` is used.
-
-**Cold-world files:** the guards in cold-world files (symbols,
-kernel1-install, locales, fluid, anonymous, streams) are plain
-`if` tests of the guard variable around the mutex calls, since those
-files run long before `multiproc.oak` makes any mutex.
-
-**User responsibility:** General user-created hash tables used
-concurrently need application-level locking.
-
-**Method cache:** `OP_TYPE_METH_CACHE` is always enabled.  Cache writes
-use a seqlock pattern with `OAK_ATOMIC_STORE_REF` (release) /
-`OAK_ATOMIC_LOAD_REF` (acquire).  `OP_METH_ALIST_MTF` is disabled
-under threads since it mutates the shared alist structure.
+**Not protected, by design:** a user's hash table with concurrent
+writers (lookups are safe against one writer), and `print` or
+`write-string` straight to a shared stream from several threads
+(their output interleaves; a `format` call's does not).  Input streams
+have one reader each.
 
 
 Performance
@@ -260,10 +306,10 @@ The API
 =======
 
 Documented in the language manual's Threads chapter
-(`doc/lang/threads.tex`).  `make-thread` starts an OS thread running a
-thunk as one process (a copy of the creator's fluid bindings, the
-creator's winding stack); `thread-join` waits for it, parked, and
-gives its value or re-signals its error; `thread-alive?`,
+(`doc/lang/threads.tex`) and the summary.  `make-thread` starts an OS
+thread running a thunk as one process (a copy of the creator's fluid
+bindings, the creator's winding stack); `thread-join` waits for it,
+parked, and gives its value or re-signals its error; `thread-alive?`,
 `thread-name`, `current-thread`, `thread-count`, `thread-sleep`.
 `condition-variable` with `condition-wait` (releases the mutex, parks,
 takes it again), `condition-notify`, `condition-notify-all`.
@@ -275,7 +321,8 @@ scheduler threads of `--pthreads N` park the same way while the queue
 is empty, and `release-scheduler` wakes one when a process is queued,
 so idle threads cost nothing.  A waiting thread runs no other process
 meanwhile; with one OS thread, waiting on a condition variable that
-only another OS thread could notify never ends.
+only another OS thread could notify never ends.  `doc/examples` has
+`parallel-map.oak` and `producer-consumer.oak`.
 
 
 Shared state
@@ -292,19 +339,20 @@ safe (ThreadUpdate.md Phase 3):
 | Fluid bindings | fluid.oak | per process; installs in the global top-level list under `*fluid-table-mutex*` |
 | Winding stack, pending rewind | unwind-protect.oak | per process, a new process starting with its creator's (its extent begins inside the creator's). A throw to another process's catch (an error in a forced promise, handled by the forcer) unwinds the thrower's own windings as the thrower, then restores the catcher as the current process and unwinds its windings to the catch |
 | Error handlers | error2.oak | a fluid, so per process |
-| Method cache | loop.c | striped seqlock; `OP_METH_ALIST_MTF` off |
+| Method cache | dispatch.c, loop.c | striped seqlock; `OP_METH_ALIST_MTF` off |
 | Operation-method alists, bp alists | kernel1-install.oak | `%install-method-with-env` under `*add-method-mutex*`; readers walk lists that only grow at the head or have a cdr replaced |
 | Mixed-type cache | mix-types.oak | `*mix-types-mutex*` around the walk and the insert; the type is made outside it |
 | Expression table, fancy accessors | anonymous.oak | `*expression-table-mutex*` (reentrant: evaluation inside can print) |
 | Stream-primitive cache | streams.oak | `*stream-primitive-mutex*` |
 | Output streams | format.oak | a `format` call's output reaches the stream at once, under `*output-mutex*`, rendered first outside it; `print` or `write-string` straight to a shared stream from several threads interleaves |
-| Input streams | — | one reader per stream; not locked |
+| Input streams | -- | one reader per stream; not locked |
 | Scheduler queue, idle scheduler list | multiproc.oak | `*scheduleQ-mutex*`, held by the OS thread, alarms off |
 | Thread objects (`*threads*`), a thread's state and joiners | multiproc.oak | `*threads-mutex*`; each thread's own mutex |
 | Process ids | multiproc.oak | lock-free compare-and-swap |
 | `load` | load-file.oak | a mutex per file name: the same file loads serially, different files in parallel |
 | The bytecode compiler | compiler-locale | per-compilation state in fluids and the AST; `crunch-class-alist`, the opcode tables and `nichevo` are read-only after load; concurrent `compile-file`s give byte-identical objects (`threads-stress.test`), and so does compiling with threads live (`check-threaded-fixpoint`) |
 | The native compiler | native-compiler.oak | its per-file state is global, so a native compile holds `*native-compiler-mutex*` throughout; `.ois` summaries are written whole then renamed into place; oakc is a single-threaded build step |
+| Native modules, call-site caches | native.c | `native_lock` around registration and resolution, `site_lock` and a per-site sequence count around fills |
 | Weak pointers | weak.c | a C mutex |
 | `dump-world` | dump-world.oak | refused with more than one OS thread live (`%thread-count`); `--dump` at exit stops the world |
 | VM registers (`STORE-REG`) | loop.c | per thread: `bp`, `env`, `nargs`, `process`; set at boot only: `t`, `nil`, the types, the subtype and tag-trap tables; `free-ptr` and `cons-limit` under `alloc_lock`; `next-newspace-size` a global knob |
@@ -315,39 +363,46 @@ safe (ThreadUpdate.md Phase 3):
 Testing
 =======
 
-`make check`'s bytecode tests (all of `tests/*.test` except the native,
-stand-alone and consistency tests, which need the build tree's own
-emulator) against the standard world, with the emulator built each
-way.  `threads-stress.test` runs `threads-stress.oak` (bignums,
-lists, interning, `add-method`, `catch`/`throw`, `eval`, all compiled
-at load) three times under `--pthreads 3`, once more compiled
-natively, then compiles six files at once in futures and requires the
-objects to match a single-threaded compile; `threads-api.test` runs
-its program natively too.  In the threads build the native,
-native-parity and stand-alone tests run as well (`standalone.test`
-then also builds the thread API program as a straight-C executable,
-whose threads run the native call driver), and the stress program
-compiled natively passes under `-DOAK_GC_VERIFY`.
+`make check` in the threads build runs every test: the bytecode tests,
+`threads.test` (the smoke test and `--pthreads 3`), `threads-api.test`
+(the API, then the same program compiled natively), the native,
+native-parity and stand-alone tests (the latter also builds the
+thread API program as a straight-C executable, whose threads run the
+native call driver), and `consistency.test` with the bytecode, native
+and threaded fixpoints (`check-threaded-fixpoint` compiles every
+source with three threads live).  `threads-stress.test` runs
+`threads-stress.oak` (bignums, lists, interning, `add-method`,
+`catch`/`throw`, `eval`, four threads formatting into one stream,
+three defining globals while others look them up; all compiled at
+load) three times under `--pthreads 3`, once more compiled natively,
+then compiles six files at once in futures and requires the objects
+to match a single-threaded compile.  The stress program, bytecode and
+native, passes under `-DOAK_GC_VERIFY` (GC.md), which checks every
+concurrent cycle for a missed object.
 
 | Config | Flags | Result |
 |--------|-------|--------|
-| 1 | Default (copying GC) | all pass (`threads.test` skips) |
+| 1 | Default (copying GC) | all pass (the thread tests skip) |
 | 2 | `USE_MARK_SWEEP` | all pass (the thread tests skip) |
 | 3 | `THREADS` | all pass |
 | 4 | `THREADS + USE_MARK_SWEEP` (`--enable-threads`) | all pass |
 
-Only configurations 1 and 4 can be configured; 2 and 3 need the flags
-passed by hand.
+Only configurations 1 and 4 can be configured; 2 and 3 take the flags
+by hand (`CPPFLAGS=-DTHREADS` or `-DUSE_MARK_SWEEP` to configure), and
+run the bytecode tests against a world built elsewhere.
 
 
 Future Enhancements
 ====================
 
-Potential improvements, not required for current thread support:
+Not required for the current thread support:
 
-- **Generational hints**: Track old->young pointers via a card table;
-  skip scanning old-generation objects in minor collections
-- **Parallel marking**: Multiple GC worker threads share the mark stack,
-  reducing mark phase latency on multi-core systems
-- **Incremental compaction**: Gradually relocate objects to reduce
-  fragmentation without a full STW copying collection
+- **A remembered set for spatic**: every cycle scans the world image
+  for pointers into the heap; logging stores into spatic would make
+  that incremental
+- **Locks per stream**: `print` to a shared stream from several
+  threads without interleaving (only `format` is atomic per call)
+- **No allocation stalls during marking** and **no copying fallback**:
+  GCEnhancements.md
+- **Parallel marking**: Multiple GC worker threads share the mark
+  stack, reducing mark phase latency on multi-core systems
