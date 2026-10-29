@@ -120,12 +120,19 @@ What is protected:
   another's `wind-protect`s and one process's `bind` is invisible to
   the others; before a process exists they are global.  A new process
   starts with a copy of its creator's fluid bindings and no windings.
-  `--pthreads N` calls `setup-initial-process-object`, whose
-  `init-thread-infrastructure` makes the guard mutexes and then spawns
-  the extra heavyweight threads.
+  In a threads emulator the warm boot also makes the guard mutexes
+  (`init-threads-at-boot`); `--pthreads N` spawns the extra
+  heavyweight threads, each starting with a process of its own.
 - **Guard mutexes**: each is a variable that is `#f` until
-  `init-thread-infrastructure` sets it to a real mutex, and the code it
-  guards acquires and releases it only when it is set:
+  `init-thread-infrastructure` sets it to a real mutex.  The code it
+  guards runs its critical section through `%guard` (multi-off.oak),
+  which with the mutex set is `%with-guard` (unwind-protect.oak):
+  acquire, run, release on any exit, under `wind-protect`; and with it
+  `#f` just runs the section.  The mutexes are reentrant and held by
+  the process, so a section may call into another, and a section that
+  is preempted and resumed on another OS thread still releases its own
+  lock.  Only `%install-method-with-env` takes its mutex directly: its
+  section is plain stores.  The guards:
   `*symbol-table-mutex*` (`intern`, `gensym` in symbols.oak),
   `*add-method-mutex*` (the part of `%install-method-with-env` in
   kernel1-install.oak that mutates `operation-method-alist`),
@@ -141,9 +148,14 @@ What is protected:
   shared alist structure.
 - **Mutex spinning**: `acquire-mutex` calls `%thread-yield` (opcode 72,
   `sched_yield()`) between attempts rather than busy-waiting.  A mutex
-  records the thread holding it (`%thread-index`, LOAD-REG 24) and may
-  be named (`make-named-mutex`); after `mutex-report-spins` attempts a
-  waiter prints which mutex it waits for and who holds it.
+  records the process holding it and a depth (reentrant; release by
+  anyone else is an error), and may be named (`make-named-mutex`);
+  after `mutex-report-spins` attempts a waiter prints which mutex it
+  waits for and who holds it.  The scheduler's lock is a
+  `%thread-mutex`, held by the OS thread (`%thread-index`, LOAD-REG
+  24): its section switches processes but runs with alarms off.
+  `with-mutex` (exported) holds a mutex for a body and releases it on
+  any exit.
 - **Alarms**: the timer counter and increment are per thread (locals
   of each thread's `loop()`), so one thread's `%enable-alarms` cannot
   re-arm preemption inside another's scheduler critical section.

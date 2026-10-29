@@ -98,8 +98,12 @@ Oaklisp Runtime (`src/world/`)
 
 Synchronization primitives (all in `multiproc.oak`):
 
-- **Mutex**: Spin-lock via `%test-and-set-locative`.  Yields between
-  attempts via `%thread-yield` (opcode 72).
+- **Mutex**: Spin-lock via `%test-and-set-locative`, yielding between
+  attempts (`%thread-yield`, opcode 72).  Reentrant, held by the
+  process, released only by the holder; `with-mutex` releases on any
+  exit.  The runtime's own guarded sections go through `%guard`.
+  The scheduler's lock is held by the OS thread instead
+  (`%thread-mutex`).
 - **Semaphore**: Mutex + waiting queue.  Blocked processes enqueued,
   woken on `signal`.
 - **Futures**: Lazy evaluation with dependent process queue;
@@ -111,16 +115,16 @@ Synchronization primitives (all in `multiproc.oak`):
 Initialization
 ===============
 
-Every warm boot gives the machine a process object
-(`init-process-object`), and from then on fluid bindings and the
-winding stack are per process.  The guard mutexes and the extra OS
-threads come with `--pthreads N`, which calls
-`setup-initial-process-object` in `multiproc.oak`.  This in turn
-calls `init-thread-infrastructure`, which:
-
-1. Makes sure the process object exists
-2. Initializes all guard-variable mutexes
-3. Redefines process initialization to assign unique PIDs
+Every warm boot gives the machine a process object, and from then on
+fluid bindings and the winding stack are per process.  In an emulator
+with threads the warm boot also runs `init-thread-infrastructure`
+(`init-threads-at-boot` in `multiproc.oak`), which makes the guard
+mutexes; the guards are therefore on whether or not `--pthreads`
+follows.
+Without threads they stay `#f` and the guarded sections cost nothing
+beyond a closure.  `--pthreads N` (`setup-initial-process-object`)
+then only spawns the N-1 extra OS threads, each of which starts by
+giving itself a process of its own.
 
 Then `spawn-heavyweight-threads` creates N-1 additional native threads.
 

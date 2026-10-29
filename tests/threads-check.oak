@@ -13,3 +13,5 @@
 (check "arithmetic still works" (let loop ((n 1000) (a 0)) (if (= n 0) a (loop (- n 1) (+ a n)))) 500500)
 (check "main thread index" (%thread-index) 0)
 (check "named mutex" (mutex-name (make-named-mutex 'stress)) 'stress)
+(check "guards on at boot" (not (not *symbol-table-mutex*)) #t)
+(check "guard mutex named" (mutex-name *symbol-table-mutex*) 'symbol-table)

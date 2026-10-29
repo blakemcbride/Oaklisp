@@ -475,6 +475,18 @@ extern void ms_verify_log_alloc(ref_t *p, int path, size_t words);
       (p) = ms_alloc_slow_locked((words),				\
 				 &tlab_cursor_array[_tlab_idx],		\
 				 &tlab_end_array[_tlab_idx]);		\
+      if (!(p) && ms_collect_was_coordinator()) {			\
+	/* Our own cycle, and still nothing big enough: the copying	\
+	   collector, which grows the heap.  Safe here, unlike after	\
+	   a wait: a cycle needs alloc_lock to start, and this thread	\
+	   holds it, so none is under way. */				\
+	before;								\
+	gc(false, true, (reason), (words));				\
+	after;								\
+	(p) = free_point;						\
+	free_point += (words);						\
+	ms_bump_alloc_notify((p), (words));				\
+      }									\
     }									\
     VERIFY_LOG_ALLOC((p), 2, (words))						\
     oak_mutex_unlock(&alloc_lock);					\

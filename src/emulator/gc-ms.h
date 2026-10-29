@@ -63,6 +63,7 @@ void ms_destroy(void);
 void ms_reinit(void);
 #ifdef THREADS
 void ms_collect_explicit(const char *reason);
+bool ms_collect_was_coordinator(void);
 #endif
 
 /* Try to allocate n_words from free lists.  Returns pointer to the

@@ -252,9 +252,13 @@ ms_free_list_alloc(size_t n_words)
 static bool
 ms_space_for(size_t n_words)
 {
-    if (n_words <= (size_t)(new_space.end - free_point))
+    int sc = ms_size_class(n_words);
+
+    /* The same tests as the allocator's, exactly: a request this says
+       fits must then be met, or the caller would collect for ever. */
+    if (n_words < (size_t)(new_space.end - free_point))
 	return true;
-    for (int c = ms_size_class(n_words); c < NUM_SIZE_CLASSES; c++) {
+    for (int c = sc; c < NUM_SIZE_CLASSES; c++) {
 	ref_t *p = free_list_heads[c];
 	while (p) {
 	    size_t actual_size = (c == 0) ? 1 : (size_t)p[1];
@@ -263,7 +267,11 @@ ms_space_for(size_t n_words)
 		p = (ref_t *)(*p);
 		continue;
 	    }
-	    if (actual_size >= n_words)
+	    if (c == sc
+		? actual_size >= n_words
+		: (actual_size > n_words
+		   && (!lazy_sweep_active
+		       || BM_IDX(p + actual_size) <= lazy_sweep_cursor)))
 		return true;
 	    p = (ref_t *)(*p);
 	}
@@ -496,6 +504,16 @@ static ref_t *sweep_limit;
 
 #ifdef THREADS
 volatile int gc_concurrent_in_progress = 0;
+
+/* Whether the calling thread's last ms_collect ran the cycle itself
+   (as opposed to waiting for another thread's). */
+static bool ms_collect_coordinated;
+
+bool
+ms_collect_was_coordinator(void)
+{
+    return ms_collect_coordinated;
+}
 
 static oak_mutex_t gc_concurrent_lock = OAK_MUTEX_INITIALIZER;
 static oak_cond_t  gc_concurrent_done_cv = OAK_COND_INITIALIZER;
@@ -1376,6 +1394,7 @@ ms_collect(bool pre_dump, char *reason, size_t amount)
     /* If a concurrent GC is already running (another thread triggered
        collection), wait for it to complete and return.  The caller's
        ALLOCATE_PROT will retry the allocation after we return. */
+    ms_collect_coordinated = false;
     if (gc_concurrent_in_progress) {
 	int parked_index = *(int *)oak_tls_get(index_key);
 
@@ -1423,6 +1442,7 @@ ms_collect(bool pre_dump, char *reason, size_t amount)
 #ifdef THREADS
     /* We are the GC coordinator for this cycle. */
     gc_concurrent_in_progress = 1;
+    ms_collect_coordinated = true;
 #endif
 
     old_used = (long)(free_point - new_space.start) -

@@ -21,3 +21,14 @@
 ;;; Set this to FALSE when threading is turned on.
 
 (define %no-threading 0)
+
+;;; Runs THUNK inside mutex M, or just runs it while M is #f: before
+;;; the thread infrastructure exists, in an emulator without threads,
+;;; and in the Guile host.  The runtime's guarded sections (INTERN,
+;;; the locale setters, ...) go through this.  %WITH-GUARD, defined
+;;; once WIND-PROTECT exists (unwind-protect.oak), releases the mutex
+;;; however the thunk exits; the mutexes themselves are reentrant
+;;; (multiproc.oak), so a section may call into another.
+
+(define (%guard m thunk)
+  (if m (%with-guard m thunk) (thunk)))

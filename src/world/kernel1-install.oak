@@ -48,11 +48,14 @@
 				  x (car real-ivar-map)))))))))
   ;; flush the method cache
   (set! ((%slot 2) op) 0)
-  ;; create and install the method (critical section)
-  (if *add-method-mutex* (acquire-mutex *add-method-mutex*))
+  ;; Create the method, then install it.  The installation is the
+  ;; critical section: plain stores, so it cannot throw, which is why
+  ;; it takes the mutex itself rather than through %GUARD (which does
+  ;; not exist this early anyway).
   (let ((the-method (%allocate %method 3)))
     (set! ((%slot 1) the-method) code-body)
     (set! ((%slot 2) the-method) env)
+    (if *add-method-mutex* (acquire-mutex *add-method-mutex*))
     (cond ((and (eq? self object) ((%slot 1) op))
 	   (set! ((%slot 1) op) the-method))
 	  (else

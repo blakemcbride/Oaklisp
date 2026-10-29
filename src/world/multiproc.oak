@@ -58,11 +58,9 @@
 ;;; access from the task code independant of which virtual machine
 ;;; (i.e. pthread) is running the task.
 
-;;; The count of process id number is protected by a mutex, however,
-;;; which requires that some process already be running. The first
-;;; process is created before mutexes are defined, therefore, and so
-;;; initialization of this class is redefined after the first one is
-;;; made (as a warm boot action). See process2.oak for more code.
+;;; Process ids come from NEW-PID (below), lock-free; the first process
+;;; of a run gets the global fluid bindings, every later one a copy of
+;;; its creator's.
 
 (define-instance process type
   '(pid process-fluid-binding-list windings wind-count pending-rewind)
@@ -93,8 +91,9 @@
 				  windings wind-count pending-rewind) self)
   (when trace-processes
      (format #t "init: oak process descriptor~%"))
-  (set! pid 0)
-  ;; The creator's bindings: the global list for the first process.
+  (set! pid (new-pid))
+  ;; A copy of the creator's bindings: the global list when there is
+  ;; no process yet (the first one, at warm boot).
   (set! process-fluid-binding-list
 	(map (lambda (z) (cons (car z) (cdr z)))
 	     (get-current-fluid-bindings)))
@@ -149,66 +148,104 @@
 ;;; %TEST-AND-SET-LOCATIVE is used to create a spin-lock, so mutexes
 ;;; spin lock too.  Hence semaphores should be used when possible.
 
-;;; A mutex records the OS thread holding it (%THREAD-INDEX) and may
-;;; have a name.  A thread that has spun MUTEX-REPORT-SPINS times
-;;; waiting says so on standard error, naming the mutex and its
-;;; holder, which is how a deadlock shows itself.  The owner is a
-;;; thread, not a process, so a lightweight process that waits on a
-;;; mutex another process on its own thread holds reports its own
-;;; thread as the holder.
+;;; A mutex is held by a process and is reentrant: ACQUIRE-MUTEX by the
+;;; holder counts, and RELEASE-MUTEX by anyone else is an error.  The
+;;; holder is the process rather than the OS thread because a
+;;; lightweight process can be preempted inside a critical section and
+;;; resume on another thread, while another process running meanwhile
+;;; on the first thread must not be taken for the holder.  The
+;;; scheduler's own lock is the exception (%THREAD-MUTEX): its section
+;;; switches processes, but runs with alarms off, so it never leaves
+;;; its thread.  A mutex may have a name, and a process that has spun
+;;; MUTEX-REPORT-SPINS times waiting says so on standard error, naming
+;;; the mutex and its holder, which is how a deadlock shows itself.
+;;; WITH-MUTEX (below) releases on any exit.
 
-(define-instance mutex type '(access-cons owner name) (list object))
+(define-instance mutex type '(access-cons owner depth name) (list object))
 
 (define-instance acquire-mutex operation)
 (define-instance release-mutex operation)
 (define-instance mutex-name settable-operation)
+(define-instance %mutex-self operation)
 
-(add-method (initialize (mutex access-cons owner name) self)
+(add-method (initialize (mutex access-cons owner depth name) self)
   (set! access-cons (cons nil nil))
   (set! owner #f)
+  (set! depth 0)
   (set! name #f)
   self)
 
 (add-method (mutex-name (mutex name) self) name)
 (add-method ((setter mutex-name) (mutex name) self new) (set! name new))
 
-(define (make-named-mutex name)
-  (let ((m (make mutex)))
+;;; Who holds it: the current process (the fixnum 0 before there is
+;;; one), or for a %THREAD-MUTEX the OS thread.
+
+(add-method (%mutex-self (mutex) self) (%load-process))
+
+(define-instance %thread-mutex type '() (list mutex))
+
+(add-method (%mutex-self (%thread-mutex) self) (%thread-index))
+
+(define (%make-named-mutex type name)
+  (let ((m (make type)))
     (set! (mutex-name m) name)
     m))
 
+(define (make-named-mutex name) (%make-named-mutex mutex name))
+
 (define mutex-report-spins 1000000)
 
-(add-method (acquire-mutex (mutex access-cons owner name) self)
-  (iterate spin ((n 0))
-    (cond ((%test-and-set-locative (make-locative (car access-cons)) #f #t)
-	   (set! owner (%thread-index)))
-	  (else
-	   (when (= n mutex-report-spins)
-	     (format standard-error
-		     "~&;; thread ~D waiting for mutex ~S, held by thread ~D~%"
-		     (%thread-index) (or name self) owner))
-	   (%thread-yield)
-	   (spin (+ n 1))))))
+(add-method (acquire-mutex (mutex access-cons owner depth name) self)
+  (let ((me (%mutex-self self)))
+    (if (eq? owner me)
+	(set! depth (+ depth 1))
+	(iterate spin ((n 0))
+	  (cond ((%test-and-set-locative (make-locative (car access-cons))
+					 #f #t)
+		 (set! owner me)
+		 (set! depth 1))
+		(else
+		 (when (= n mutex-report-spins)
+		   (format standard-error
+			   "~&;; ~S waiting for mutex ~S, held by ~S~%"
+			   me (or name self) owner))
+		 (%thread-yield)
+		 (spin (+ n 1))))))))
 
-(add-method (release-mutex (mutex access-cons owner) self)
-  (set! owner #f)
-  (set! (car access-cons) nil))
+(add-method (release-mutex (mutex access-cons owner depth name) self)
+  (cond ((not (eq? owner (%mutex-self self)))
+	 (error "RELEASE-MUTEX of ~S by ~S, which does not hold it (~S does)."
+		(or name self) (%mutex-self self) owner))
+	((> depth 1)
+	 (set! depth (- depth 1)))
+	(else
+	 (set! depth 0)
+	 (set! owner #f)
+	 (set! (car access-cons) nil))))
+
+;;; (WITH-MUTEX m . body): BODY holding M, released however BODY exits.
+
+(define-syntax (with-mutex m . body)
+  (let ((v (genvar)))
+    `(let ((,v ,m))
+       (wind-protect (acquire-mutex ,v) (block ,@body) (release-mutex ,v)))))
 
 ;;; process2.oak
 
 ;; see process.oak for an explaination
 
-(define *pid-counter* 1) ;; the 0th process is not created with this counter
-(define *pid-counter-mutex* (make-named-mutex 'pid-counter))
+(define *pid-counter* 0)
 
 (define (new-pid)
-  (let ((newp nil))
-    (acquire-mutex *pid-counter-mutex*)
-    (set! newp *pid-counter*)
-    (set! *pid-counter* (+ *pid-counter* 1))
-    (release-mutex *pid-counter-mutex*)
-    newp))
+  ;; Lock-free, a compare-and-swap on the counter's cell: a new OS
+  ;; thread makes its first process while its process register still
+  ;; holds its parent's, so this must not depend on who holds a mutex.
+  (iterate retry ()
+    (let ((old *pid-counter*))
+      (if (%test-and-set-locative (make-locative *pid-counter*) old (+ old 1))
+	  old
+	  (retry)))))
 
 ;;; --------------------------------------------------
 ;;; bootstrap initial process and redefine initialization
@@ -230,10 +267,11 @@
     (%store-process (make process))))
 
 (define (init-thread-infrastructure)
-  ;;; Initialize mutexes, process register, and per-process fluid bindings.
-  ;;; Safe to call multiple times; only runs once.
+  ;;; The process object is per run: the process register is not part
+  ;;; of a dumped world.  The rest is in the world once made, and a
+  ;;; dumped world keeps it along with %THREADS-INITIALIZED.
+  (init-process-object)
   (unless %threads-initialized
-    (init-process-object)
     (set! %no-threading #f)
     (set! *symbol-table-mutex* (make-named-mutex 'symbol-table))
     (set! *add-method-mutex* (make-named-mutex 'add-method))
@@ -241,36 +279,28 @@
     (set! *stream-primitive-mutex* (make-named-mutex 'stream-primitive))
     (set! *locale-mutex* (make-named-mutex 'locale))
     (set! *fluid-table-mutex* (make-named-mutex 'fluid-table))
-    (add-method (initialize (process pid process-fluid-binding-list
-				      windings wind-count pending-rewind) self)
-      (set! pid (new-pid))
-      (set! process-fluid-binding-list
-	    (copy-fluid-bindings (current-process)))
-      ;; A new process starts outside any dynamic extent.
-      (set! windings '())
-      (set! wind-count 0)
-      (set! pending-rewind #f)
-      self)
     (set! %threads-initialized #t)))
 
 (define (setup-initial-process-object)
-  ;;; Initialize thread infrastructure (if not already done) and spawn
-  ;;; any extra heavyweight threads requested via --pthreads.
+  ;;; --pthreads N: the extra heavyweight threads.  The infrastructure
+  ;;; itself is up since warm boot.
   (init-thread-infrastructure)
   (spawn-heavyweight-threads))
 
-;;; The mutexes are NOT auto-initialized at warm boot: the compiler
-;;; deadlocks when they are active (branch-instruction compilation
-;;; re-enters mutex-protected code).  Call (setup-initial-process-object)
-;;; or use --pthreads to enable them explicitly.  The process object is
-;;; another matter -- without it the process register holds the fixnum 0
-;;; and the scheduler, and so DELAY/FORCE, cannot run at all -- so that
-;;; much does happen at every warm boot.
-
-;;; Before CMDLINE-EAT, so that an --eval or a --load can already use
+;;; Every warm boot makes the process object: without it the process
+;;; register holds the fixnum 0 and the scheduler, and so DELAY/FORCE,
+;;; cannot run at all.  In an emulator with threads the guard mutexes
+;;; come on then too, whether or not --pthreads follows; without
+;;; threads they stay #f and the guarded sections cost nothing.  Both
+;;; before CMDLINE-EAT, so that an --eval or a --load can already use
 ;;; the scheduler.
 
-(add-warm-boot-action-first init-process-object)
+(define (init-threads-at-boot)
+  (if (%threads-enabled?)
+      (init-thread-infrastructure)
+      (init-process-object)))
+
+(add-warm-boot-action-first init-threads-at-boot)
 
 
 ;;--------------------------------------------------
@@ -335,7 +365,7 @@
 ;;;   could acquire the same mutex at the same time)
 
 (define *scheduleQ* (make-queue))
-(define *scheduleQ-mutex* (make-named-mutex 'scheduleq))
+(define *scheduleQ-mutex* (%make-named-mutex %thread-mutex 'scheduleq))
 
 (define (acquire-scheduler)
   (%disable-alarms)
@@ -418,13 +448,16 @@
   (while #t (pause)))
 
 
-;;; this is the function that bootstraps a new heavyweight process...
-;;; start new hw threads as (%make-heavyweight-thread start-busy-work)
-;;; THIS IS DONE AT WARM BOOT TIME AND SHOULD NOT BE DONE BY A USER
+;;; What a new heavyweight thread runs: (%make-heavyweight-thread
+;;; start-busy-work), from SPAWN-HEAVYWEIGHT-THREADS.  The thread
+;;; starts with its parent's process in its process register; it gets
+;;; one of its own (with the parent's fluid bindings) before it does
+;;; anything that could be taken as the parent's doing, mutexes being
+;;; held by processes.
 
 (define (start-busy-work)
-  (process-run-fn busy-work nil)
-  (start))
+  (%store-process (make process))
+  (busy-work))
 
 ;;; --------------------------------------------------
 ;;;  Check to see if the user added a -pthreads option

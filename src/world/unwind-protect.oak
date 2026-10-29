@@ -153,6 +153,13 @@
 	       (%pop-winding)
 	       (,a)))))
 
+;;; The runtime's guarded sections (%GUARD, multi-off.oak): the mutex
+;;; is released however THUNK exits, and taken again should a
+;;; continuation re-enter.
+
+(define (%with-guard m thunk)
+  (wind-protect (acquire-mutex m) (thunk) (release-mutex m)))
+
 ;;; This one does different things depending on whether the entries
 ;;; and exists are normal or abnormal.
 

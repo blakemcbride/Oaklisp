@@ -135,21 +135,19 @@
 (let ((sp-alist '()))
 
   (add-method (%stream-primitive (object) n)
-    (if *stream-primitive-mutex* (acquire-mutex *stream-primitive-mutex*))
-    (let ((result
-	   (let ((x (assq n sp-alist)))
-	     (cond (x => cdr)
-		   (else
-		    (let ((op
-			   (make
-			    (mix-types oc-mixer (list open-coded-mixin operation))
-			    `((stream-primitive ,n))
-			    (nth '(0 0 0 2 2 2 1 1 2 1 1 1 2 2 4 2 4 1 4) n)
-			    1)))
-		      (set! sp-alist (cons (cons n op) sp-alist))
-		      op))))))
-      (if *stream-primitive-mutex* (release-mutex *stream-primitive-mutex*))
-      result)))
+    (%guard *stream-primitive-mutex*
+	    (lambda ()
+	      (let ((x (assq n sp-alist)))
+		(cond (x => cdr)
+		      (else
+		       (let ((op
+			      (make
+			       (mix-types oc-mixer (list open-coded-mixin operation))
+			       `((stream-primitive ,n))
+			       (nth '(0 0 0 2 2 2 1 1 2 1 1 1 2 2 4 2 4 1 4) n)
+			       1)))
+			 (set! sp-alist (cons (cons n op) sp-alist))
+			 op))))))))
 
 #||
 ;;; This is what all the stream primitives do:

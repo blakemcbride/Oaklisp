@@ -231,15 +231,17 @@ OA_COMPILE_none = @echo "no way to build the world: no old world ($(OLD_WORLD)) 
 multiproc.oa: OAKEXTRALOAD = --load old/multi-em
 multiproc.oa: $(if $(filter world,$(OAK_COMPILE)),old/multi-em.oa)
 
-file-io.oa: OAKEXTRALOAD = --load old/streams
-file-io.oa: $(if $(filter world,$(OAK_COMPILE)),old/streams.oa)
+# (streams.oak's %STREAM-PRIMITIVE runs its section through %GUARD from
+# multi-off.oak, so that goes in first.)
+file-io.oa: OAKEXTRALOAD = --load old/multi-off --load old/streams
+file-io.oa: $(if $(filter world,$(OAK_COMPILE)),old/multi-off.oa old/streams.oa)
 # Likewise native-compiler.oak, number 16; load-file.oak and warm.oak
 # use %EMBEDDED-PROGRAM-CHAR from subprimitive.oak, so an older world
 # needs the fresh subprimitive.oa to open code it the same way.
-native-compiler.oa: OAKEXTRALOAD = --load old/streams
-native-compiler.oa: $(if $(filter world,$(OAK_COMPILE)),old/streams.oa)
-load-file.oa: OAKEXTRALOAD = --load old/subprimitive --load old/streams
-load-file.oa: $(if $(filter world,$(OAK_COMPILE)),old/subprimitive.oa old/streams.oa)
+native-compiler.oa: OAKEXTRALOAD = --load old/multi-off --load old/streams
+native-compiler.oa: $(if $(filter world,$(OAK_COMPILE)),old/multi-off.oa old/streams.oa)
+load-file.oa: OAKEXTRALOAD = --load old/subprimitive --load old/multi-off --load old/streams
+load-file.oa: $(if $(filter world,$(OAK_COMPILE)),old/subprimitive.oa old/multi-off.oa old/streams.oa)
 warm.oa fasl.oa: OAKEXTRALOAD = --load old/subprimitive
 warm.oa fasl.oa: $(if $(filter world,$(OAK_COMPILE)),old/subprimitive.oa)
 

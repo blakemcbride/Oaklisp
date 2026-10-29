@@ -53,3 +53,10 @@
 (check "forcible type" (is-a? (delay 1) forcible) #t)
 (check "map over promises" (map (lambda (p) (+ p 1)) (list (delay 1) (delay 2))) '(2 3))
 (check "sort promises" (map force (sort (list (delay 3) (delay 1) (delay 2)) <)) '(1 2 3))
+
+;;; Mutexes: reentrant, held by a process, released by WITH-MUTEX on
+;;; any exit, and only by the holder.
+(check "mutex reentrant" (let ((m (make mutex))) (acquire-mutex m) (acquire-mutex m) (release-mutex m) (release-mutex m) (acquire-mutex m) (release-mutex m) 'ok) 'ok)
+(check "with-mutex value" (let ((m (make mutex))) (with-mutex m (+ 1 2))) 3)
+(check "with-mutex releases on throw" (let ((m (make-named-mutex 'wm))) (catch k (with-mutex m (k 1))) (with-mutex m 'free)) 'free)
+(check "release by non-holder is an error" (let ((m (make mutex))) (catch-errors (general-error (lambda (e) 'caught)) (release-mutex m) 'released)) 'caught)

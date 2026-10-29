@@ -24,8 +24,11 @@
 (define *expression-table-mutex* #f)
 
 (define (reasonable-expression a-locale obj)
-  (if *expression-table-mutex* (acquire-mutex *expression-table-mutex*))
-  (let ((result
+  ;; Evaluates inside the critical section (and printing a value in
+  ;; the course of that can come back here), so the mutex has to be
+  ;; both reentrant and released on any exit, which %GUARD gives.
+  (%guard *expression-table-mutex*
+	  (lambda ()
 	 (let ((ref (present? expression-table obj)))
 	   (cond ((and ref
 		       (let* ((expr (cdr ref))
@@ -38,9 +41,7 @@
 		  (let ((expr (create-accessor-expression a-locale obj)))
 		    (cond (ref (set! (cdr ref) expr))
 			  (else (set! (present? expression-table obj) expr)
-				expr))))))))
-    (if *expression-table-mutex* (release-mutex *expression-table-mutex*))
-    result))
+				expr)))))))))
 
 
 (define-instance create-accessor-expression operation)
@@ -87,10 +88,10 @@
 	   (next (cdr guards)(cdr ops))))))
 
 (define (how-to-get-val ag ao)
-  (if *expression-table-mutex* (acquire-mutex *expression-table-mutex*))
-  (push fancy-accessor-guards ag)
-  (push fancy-accessor-operations ao)
-  (if *expression-table-mutex* (release-mutex *expression-table-mutex*)))
+  (%guard *expression-table-mutex*
+	  (lambda ()
+	    (push fancy-accessor-guards ag)
+	    (push fancy-accessor-operations ao))))
 
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
