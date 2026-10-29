@@ -36,7 +36,6 @@ oak_tls_key_t index_key;
 oak_mutex_t gc_lock = OAK_MUTEX_INITIALIZER;
 oak_mutex_t alloc_lock = OAK_MUTEX_INITIALIZER;
 oak_mutex_t index_lock = OAK_MUTEX_INITIALIZER;
-oak_mutex_t test_and_set_locative_lock = OAK_MUTEX_INITIALIZER;
 /* DUMP-WORLD and LOAD-WORLD, in the interpreter and in native code. */
 oak_mutex_t dump_lock = OAK_MUTEX_INITIALIZER;
 bool gc_pending = false;
@@ -105,7 +104,6 @@ oak_threads_system_init(void)
     oak_mutex_init(&gc_lock);
     oak_mutex_init(&alloc_lock);
     oak_mutex_init(&index_lock);
-    oak_mutex_init(&test_and_set_locative_lock);
     {
       extern oak_mutex_t wp_lock;
       oak_mutex_init(&wp_lock);

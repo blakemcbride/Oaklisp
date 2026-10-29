@@ -91,6 +91,18 @@
 (add-method ((setter process-pending-rewind) (process pending-rewind) self new)
   (set! pending-rewind new))
 
+;;; %PUSH-WINDING and %POP-WINDING (unwind-protect.oak) in one method
+;;; each: the guarded sections and WIND-PROTECT do nothing else as
+;;; often.
+(define-instance %process-push-winding operation)
+(define-instance %process-pop-winding operation)
+(add-method (%process-push-winding (process windings wind-count) self item)
+  (set! windings (cons item windings))
+  (set! wind-count (+ wind-count 1)))
+(add-method (%process-pop-winding (process windings wind-count) self)
+  (set! windings (cdr windings))
+  (set! wind-count (- wind-count 1)))
+
 (define trace-processes #f)
 
 (add-method (initialize (process pid process-fluid-binding-list
@@ -180,7 +192,8 @@
 ;;; processes the scheduler has queued, the holder perhaps among them,
 ;;; or parks the OS thread until RELEASE-MUTEX unparks it.
 
-(define-instance mutex type '(access-cons owner depth name) (list object))
+(define-instance mutex type
+  '(access-cons owner depth name acquire-thunk release-thunk) (list object))
 
 (define-instance acquire-mutex operation)
 (define-instance release-mutex operation)
@@ -188,13 +201,23 @@
 (define-instance %mutex-self operation)
 (define-instance %mutex-owner operation)
 (define-instance %mutex-wait operation)
+(define-instance %mutex-acquire-thunk operation)
+(define-instance %mutex-release-thunk operation)
 
-(add-method (initialize (mutex access-cons owner depth name) self)
+(add-method (initialize (mutex access-cons owner depth name
+			       acquire-thunk release-thunk) self)
   (set! access-cons (cons nil nil))	; (held-flag . parked-waiters)
   (set! owner #f)
   (set! depth 0)
   (set! name #f)
+  ;; The winding a guarded section pushes (%WITH-GUARD, WITH-MUTEX)
+  ;; names these, made once here rather than at every entry.
+  (set! acquire-thunk (lambda () (acquire-mutex self)))
+  (set! release-thunk (lambda () (release-mutex self)))
   self)
+
+(add-method (%mutex-acquire-thunk (mutex acquire-thunk) self) acquire-thunk)
+(add-method (%mutex-release-thunk (mutex release-thunk) self) release-thunk)
 
 (add-method (mutex-name (mutex name) self) name)
 (add-method ((setter mutex-name) (mutex name) self new) (set! name new))
@@ -259,12 +282,20 @@
 	   (dolist (w (%mutex-take-waiters access-cons))
 	     (%thread-unpark w))))))
 
-;;; (WITH-MUTEX m . body): BODY holding M, released however BODY exits.
+;;; (WITH-MUTEX m . body): BODY holding M, released however BODY exits:
+;;; a WIND-PROTECT whose thunks are the mutex's own (no closures made
+;;; at the entry; %WITH-GUARD in unwind-protect.oak is the same).
 
 (define-syntax (with-mutex m . body)
   (let ((v (genvar)))
     `(let ((,v ,m))
-       (wind-protect (acquire-mutex ,v) (block ,@body) (release-mutex ,v)))))
+       (acquire-mutex ,v)
+       (%push-winding (list* (%mutex-release-thunk ,v)
+			     (%mutex-acquire-thunk ,v)
+			     (get-current-fluid-bindings)))
+       (block0 (block ,@body)
+	       (%pop-winding)
+	       (release-mutex ,v)))))
 
 ;;; process2.oak
 

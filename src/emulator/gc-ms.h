@@ -90,19 +90,33 @@ size_t ms_class_max_words(int sc);
 /* Check whether an address is within the managed heap (new_space). */
 bool ms_is_heap_ptr(const ref_t *p);
 
-#ifdef THREADS
 /* Per-thread TLAB (thread-local allocation buffer) state arrays.
    tlab_cursor_array[i] points to the next free word in thread i's TLAB.
    tlab_end_array[i] points one past the last word.  Both are NULL when
-   the TLAB is exhausted or not yet allocated. */
+   the TLAB is exhausted or not yet allocated.  Without threads there
+   is one, at index 0: the allocator's bump cursor. */
+#ifdef THREADS
+#define MS_TLAB_COUNT MAX_THREAD_COUNT
+#define MS_TLAB_INDEX oak_thread_index_var
+#else
+#define MS_TLAB_COUNT 1
+#define MS_TLAB_INDEX 0
+#endif
 extern ref_t *tlab_cursor_array[];
 extern ref_t *tlab_end_array[];
 
-/* Slow-path allocator called with alloc_lock held.  Tries free list,
-   TLAB refill, and global bump pointer.  Returns NULL if GC is needed.
-   Updates *tlab_cursor_p / *tlab_end_p on TLAB refill. */
+/* Slow-path allocator, called with alloc_lock held where there is
+   one: a TLAB out of a free run or the bump region for a small
+   request, the free lists (sweeping lazily) or the bump region
+   otherwise.  Returns NULL if GC is needed.  Updates *tlab_cursor_p /
+   *tlab_end_p on TLAB refill. */
 ref_t *ms_alloc_slow_locked(size_t n_words,
 			    ref_t **tlab_cursor_p, ref_t **tlab_end_p);
+
+/* ALLOCATE's slow path (data.h): the lock where there is one, the
+   slow allocator, collections until the request is met.  The caller
+   has synchronized its state for a collection. */
+ref_t *ms_allocate_slow(size_t words, char *reason);
 
 /* Retire a single TLAB's unused portion so it can be swept. */
 void ms_tlab_retire(ref_t *cursor, ref_t *end);
@@ -110,10 +124,14 @@ void ms_tlab_retire(ref_t *cursor, ref_t *end);
 /* Retire all threads' TLABs.  Must be called with the world stopped:
    the TLAB fast path in ALLOCATE_PROT takes no lock. */
 void ms_tlab_retire_all(void);
-#endif
 
-/* Atomic objstart-bit set for lock-free TLAB allocation. */
-void ms_bump_alloc_notify_atomic(ref_t *p, size_t n_words);
+/* The objstart bit of the TLAB fast path (ALLOCATE_PROT, data.h): a
+   plain store, the bitmap word being the TLAB's own (gc-ms.c,
+   TLAB_ALIGN). */
+extern uint64_t *objstart_bitmap;
+#define MS_TLAB_OBJSTART(p)						\
+  do { size_t _ms_i = (size_t)((p) - new_space.start);			\
+       objstart_bitmap[_ms_i / 64] |= 1ULL << (_ms_i % 64); } while (0)
 
 /* Record a transport destination during copying GC so that ms_reinit
    can rebuild objstart bits for the compacted heap. */

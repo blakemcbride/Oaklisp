@@ -61,8 +61,16 @@ typedef struct {
 extern space_t new_space, old_space, spatic;
 extern ref_t *free_point;
 
-/* Size of first newspace, in K */
+/* Size of first newspace, in K words.  The mark-sweep heap is one
+   region that grows only by a copying collection (gc-ms.c,
+   ms_crowded), and every cycle scans spatic and the roots and marks
+   the live data, so it starts four times bigger: the same program
+   then cycles a quarter as often. */
+#ifdef USE_MARK_SWEEP
+#define DEFAULT_NEWSPACE 512
+#else
 #define DEFAULT_NEWSPACE 128
+#endif
 
 /* The following is for stack debugging */
 #define PATTERN 0x0a0b0c0d
@@ -432,13 +440,15 @@ if ((highcrap != 0x0) && (highcrap != 0x7)) {code;} }
 		  GC_RECALL(v); })
 
 
-#if defined(USE_MARK_SWEEP) && defined(THREADS)
+#if defined(USE_MARK_SWEEP)
 
 /*
- * TLAB-aware allocator for multi-threaded mark-sweep mode.
- *
- * Fast path: bump the thread's TLAB pointer (no lock).
- * Slow path: acquire alloc_lock, try free list / TLAB refill / GC.
+ * Mark-sweep allocator, with a TLAB per thread (one in all without
+ * threads): the fast path bumps the thread's TLAB pointer, no lock;
+ * everything else is ms_allocate_slow (gc-ms.c), out of line, so that
+ * the interpreter's many allocation sites stay small.  BEFORE and
+ * AFTER synchronize the caller's state for a collection, which the
+ * slow path may run.
  */
 
 #include "gc-ms.h"
@@ -459,7 +469,7 @@ extern void ms_verify_log_alloc(ref_t *p, int path, size_t words);
 
 #define ALLOCATE_PROT(p, words, reason, before, after)			\
 {									\
-  int _tlab_idx = *(int *)oak_tls_get(index_key);			\
+  int _tlab_idx = MS_TLAB_INDEX;					\
   VERIFY_STW_ALLOC(_tlab_idx, reason)					\
   if ((words) <= TLAB_SIZE &&						\
       tlab_cursor_array[_tlab_idx] &&					\
@@ -468,103 +478,13 @@ extern void ms_verify_log_alloc(ref_t *p, int path, size_t words);
     /* TLAB fast path — no lock needed. */				\
     (p) = tlab_cursor_array[_tlab_idx];					\
     tlab_cursor_array[_tlab_idx] += (words);				\
-    ms_bump_alloc_notify_atomic((p), (words));				\
-    VERIFY_LOG_ALLOC((p), 1, (words))						\
+    MS_TLAB_OBJSTART(p);						\
+    VERIFY_LOG_ALLOC((p), 1, (words))					\
   } else {								\
-    /* Slow path — acquire global allocator lock. */			\
-    while (oak_mutex_trylock(&alloc_lock) != 0) {			\
-      if (gc_pending) { before; wait_for_gc(); after; }			\
-    }									\
-    (p) = ms_alloc_slow_locked((words),					\
-			       &tlab_cursor_array[_tlab_idx],		\
-			       &tlab_end_array[_tlab_idx]);		\
-    /* ms_collect either runs a cycle as the coordinator -- and when	\
-       that leaves no room for the request, the copying collector,	\
-       growing the heap -- or, when another thread's cycle is under	\
-       way, waits for it; after a wait the retry can still fail, so	\
-       go round again.  The copying collector is never called from	\
-       here: run by a thread that is not the coordinator while a	\
-       cycle is in progress, it would skip its handshake and move	\
-       objects under the marker. */					\
-    while (!(p)) {							\
-      before;								\
-      ms_collect(false, (reason), (words));				\
-      after;								\
-      (p) = ms_alloc_slow_locked((words),				\
-				 &tlab_cursor_array[_tlab_idx],		\
-				 &tlab_end_array[_tlab_idx]);		\
-      if (!(p) && ms_collect_was_coordinator()) {			\
-	/* Our own cycle, and still nothing big enough: the copying	\
-	   collector, which grows the heap.  Safe here, unlike after	\
-	   a wait: a cycle needs alloc_lock to start, and this thread	\
-	   holds it, so none is under way. */				\
-	before;								\
-	gc(false, true, (reason), (words));				\
-	after;								\
-	(p) = free_point;						\
-	free_point += (words);						\
-	ms_bump_alloc_notify((p), (words));				\
-      }									\
-    }									\
-    VERIFY_LOG_ALLOC((p), 2, (words))						\
-    oak_mutex_unlock(&alloc_lock);					\
+    before;								\
+    (p) = ms_allocate_slow((words), (reason));				\
+    after;								\
   }									\
-}
-
-#elif defined(USE_MARK_SWEEP)
-
-/*
- * Single-threaded mark-sweep allocator (no TLABs needed).
- */
-
-#include "gc-ms.h"
-
-#define ALLOCATE_PROT(p, words, reason, before, after)	\
-{							\
-  /* Try free list first, then lazy sweep. */		\
-  (p) = ms_free_list_alloc((words));			\
-  if (!(p)) {						\
-    while (ms_lazy_sweep_one()) {			\
-      (p) = ms_free_list_alloc((words));		\
-      if ((p)) break;					\
-    }							\
-  }							\
-  if (!(p)) {						\
-    if ((size_t)(words) < (size_t)(new_space.end - free_point)) {	\
-      /* Bump pointer has space. */			\
-      (p) = free_point;				\
-      free_point += (words);				\
-      ms_bump_alloc_notify((p), (words));		\
-    } else {						\
-      /* Heap exhausted — collect. */			\
-      before;						\
-      ms_collect(false, (reason), (words));		\
-      after;						\
-      (p) = ms_free_list_alloc((words));		\
-      if (!(p)) {					\
-	while (ms_lazy_sweep_one()) {			\
-	  (p) = ms_free_list_alloc((words));		\
-	  if ((p)) break;				\
-	}						\
-      }							\
-      if (!(p)) {					\
-	if ((size_t)(words) < (size_t)(new_space.end - free_point)) { \
-	  (p) = free_point;				\
-	  free_point += (words);			\
-	  ms_bump_alloc_notify((p), (words));		\
-	} else {					\
-	  /* MS-GC couldn't free enough; copying GC	\
-	     will expand the heap. */			\
-	  before;					\
-	  gc(false, true, (reason), (words));		\
-	  after;					\
-	  (p) = free_point;				\
-	  free_point += (words);			\
-	  ms_bump_alloc_notify((p), (words));		\
-	}						\
-      }							\
-    }							\
-  }							\
 }
 
 #else /* !USE_MARK_SWEEP */

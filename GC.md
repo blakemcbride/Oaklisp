@@ -24,7 +24,7 @@ The four resulting configurations:
 | # | Flags | Primary GC | Allocation | Threading |
 |---|-------|-----------|------------|-----------|
 | 1 | (none) | Copying | Bump pointer | Single |
-| 2 | `USE_MARK_SWEEP` | Mark-sweep (STW) | Free list + bump | Single |
+| 2 | `USE_MARK_SWEEP` | Mark-sweep (STW) | TLAB + free list + bump | Single |
 | 3 | `THREADS` | Copying | Bump pointer + `alloc_lock` | Multi |
 | 4 | `USE_MARK_SWEEP + THREADS` | Mark-sweep (concurrent) | TLABs + free list + bump | Multi |
 
@@ -137,7 +137,8 @@ compacting the heap in the process.
 - Moves all objects — locatives and raw code pointers (`e_pc`) must be
   fixed up, which is complex and incompatible with concurrent operation
 - Requires a contiguous destination space at least as large as live data
-- Under threads, every allocation acquires `alloc_lock`
+- Under threads without mark-sweep, every allocation acquires
+  `alloc_lock`
 
 **When it runs:**
 - Config 1 and 3: Every collection
@@ -146,8 +147,14 @@ compacting the heap in the process.
 
 **Heap expansion:** When live data exceeds 1/3 of the heap after
 collection, the copying GC sets `e_next_newspace_size = 3 * live_data`
-so the next collection allocates a larger new space.  An optional
-`MAX_NEW_SPACE_SIZE` compile-time cap can limit this growth.
+so the next collection allocates a larger new space.  The mark-sweep
+collector applies the same rule after a cycle (`ms_crowded`, from the
+words its mark traced): it grows by a copying collection into the
+bigger space, spatic left alone.  Its heap also starts four times
+bigger (`DEFAULT_NEWSPACE`, 512K words), since every cycle scans
+spatic and the roots and marks the live data whatever the heap size.
+An optional `MAX_NEW_SPACE_SIZE` compile-time cap can limit this
+growth.
 
 
 Multi-Threaded Copying GC (Config 3)
@@ -232,7 +239,9 @@ These bitmaps are allocated by `ms_init()` at startup and rebuilt by
 Allocation
 ----------
 
-Allocation uses a multi-tier strategy:
+Allocation uses a multi-tier strategy.  The fast path, in both
+mark-sweep builds, is a bump pointer into a TLAB (below); the tiers
+are what refills it, or serves a request too big for one.
 
 ### Tier 1: Size-class segregated free lists
 
@@ -247,8 +256,11 @@ Max:   48  64  96  128  192  256  512  1024  inf
 ```
 
 Free list entries occupy the dead object's memory.  `word[0]` is the
-next pointer; the entry size is determined by the objstart bitmap (the
-distance between consecutive objstart bits).
+next pointer, `word[1]` the size (an entry of one word, class 0, has
+none); the sweep makes one entry of every run of adjacent dead
+objects, clearing the objstart bits inside the run, so a heap of dead
+conses yields a few big entries rather than one per cons, and the
+entry's extent in the bitmap (to the next objstart bit) is its size.
 
 When a free-list block is larger than the request, the unused gap is
 zeroed with `memset` to prevent the copying GC's `scavenge()` from
@@ -280,24 +292,36 @@ rebuilds the bitmaps from scratch.
 Thread-Local Allocation Buffers (TLABs)
 ---------------------------------------
 
-Active only under `THREADS + USE_MARK_SWEEP`.
+Each thread has a private bump-pointer region (TLAB); without
+`THREADS` there is one, the allocator's bump cursor, so `ALLOCATE`'s
+fast path is the same few instructions in both mark-sweep builds.
+TLAB size: 4096 words (`TLAB_SIZE`), carved from the bump region or
+out of a free-list entry of at least 257 words (`TLAB_MIN_FREE`,
+`ms_tlab_from_free`) behind the lazy sweep's cursor, trimmed to
+64-word edges (`TLAB_ALIGN`): a TLAB's objstart bits then lie in
+bitmap words no other thread touches, and the fast path sets them
+with a plain store (`MS_TLAB_OBJSTART`); the atomic `OBJSTART_SET` is
+for the shared words the slow paths and the collector write.  The
+words skipped to align a start are zeroed and given an objstart bit, a
+dead filler for the next sweep.
 
-Each thread has a private bump-pointer region (TLAB) carved from the
-global heap.  TLAB size: 4096 words (`TLAB_SIZE`).
-
-**Fast path (no lock):**
+**Fast path (no lock, inline in `ALLOCATE_PROT`):**
 1. Check if the TLAB has enough space
 2. Bump `tlab_cursor_array[thread_index]`
-3. Set objstart bit atomically (`ms_bump_alloc_notify_atomic`)
-4. If a concurrent GC is active, set the mark bit ("born-black")
+3. Set the objstart bit (a plain store)
 
-**Slow path (acquires `alloc_lock`):**
-1. Try free list (`ms_free_list_alloc`; an empty size class splits
-   an entry of a larger one)
-2. Try lazy sweep + free list
-3. Try TLAB refill from global bump pointer
-4. Try global bump pointer (for large allocations)
-5. If all fail: `ms_collect()`, and back to 1 until the request is
+**Slow path (`ms_allocate_slow`, out of line; acquires `alloc_lock`
+with threads):**
+1. A small request (at most `TLAB_SIZE`) wants a TLAB: out of a free
+   entry of `TLAB_MIN_FREE` words or more, sweeping lazily for one
+   (not during a concurrent mark, when what is allocated below
+   `sweep_limit` must be born black, which the fast path does not
+   do), else out of the bump region
+2. Otherwise, or with nothing but scraps free: the free list
+   (`ms_free_list_alloc`; an empty size class splits an entry of a
+   larger one), then lazy sweep + free list
+3. Then the global bump pointer
+4. If all fail: `ms_collect()`, and back to 1 until the request is
    met.  `ms_collect` either runs the cycle as the coordinator (and
    when that leaves nothing big enough for the request, the copying
    collector, growing the heap) or, when another thread's cycle is

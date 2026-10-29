@@ -1323,21 +1323,11 @@ loop(ref_t initial_tos)
 	      CHECKTAG1(x, LOC_TAG, 3);
 	      POPVAL(y);
 #ifdef THREADS
-	      if (oak_mutex_trylock(&test_and_set_locative_lock) != 0) {
-		PEEKVAL() = e_false;	/* Failed to acquire lock. */
-		GOTO_TOP;
-	      }
-	      /* Start Critical Section. */
-	      if (*LOC_TO_PTR(x) != y) {
-		// fail
-		PEEKVAL() = e_false;
-	      } else {
-		// succeed
-		SATB_BARRIER(LOC_TO_PTR(x));
-		*LOC_TO_PTR(x) = PEEKVAL();
-		PEEKVAL() = e_t;
-	      }
-	      oak_mutex_unlock(&test_and_set_locative_lock);
+	      /* One compare-and-swap (the barrier logs the old value
+		 first, whether or not the swap then happens). */
+	      SATB_BARRIER(LOC_TO_PTR(x));
+	      PEEKVAL() = OAK_ATOMIC_CAS_SIZE(LOC_TO_PTR(x), &y, PEEKVAL())
+		? e_t : e_false;
 	      /* End Critical Section. */
 	      GOTO_TOP;
 #else

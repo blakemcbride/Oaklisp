@@ -334,8 +334,10 @@ The test suite exercises the language, the compiler, world images,
 and checks that the world reproduces its own objects, that all cold
 linkers agree, and (when Guile is present) that the Guile-hosted
 compiler reproduces the objects too.  Failures are detailed in
-tests/NAME.log.  "make bench" prints best-of-five CPU times for ten
-small benchmarks; see tests/bench.sh for saving and comparing runs.
+tests/NAME.log.  "make bench" prints best-of-five CPU times for
+eleven small benchmarks; see tests/bench.sh for saving and comparing
+runs, and for "-p N", which runs N copies of tak on N OS threads (an
+emulator with threads) against the same on one, by the wall clock.
 
 Thread Support
 ==============
@@ -345,26 +347,35 @@ Thread Support
 builds the emulator with native (pthread) threads and the concurrent
 mark-sweep collector they require (-DTHREADS -DUSE_MARK_SWEEP), which
 is off by default.  Green threads (DELAY, FUTURE, PROCESS-RUN-FN)
-work without it.  With --pthreads N the interpreter and the bytecode
-compiler run on N OS threads (several compilations can run at once in
-futures); natively compiled code does not run threaded yet; see
-Threads.md.  The option also costs performance when
-threads are not in use, almost all of it from the mark-sweep
-allocator rather than the thread support itself.  Measured with
-"make bench" on the same world (ratio of CPU time to the default
-build):
+work without it.  With --pthreads N the interpreter, the bytecode
+compiler and natively compiled code run on N OS threads (several
+compilations can run at once in futures), and make-thread starts OS
+threads of its own; see Threads.md.  Unused, the option costs little:
+the mark-sweep collector by itself (a bump allocation into a
+thread-local buffer, a sweep that makes one free entry of each run of
+dead objects, a heap four times the default build's) runs the
+benchmarks at the default build's speed or better, and the thread
+support (per-thread registers, the lock-free allocation fast path,
+the guarded sections) costs up to 20% on top.  Measured with "make
+bench" on the same world, FAST builds pinned to one core (ratio of CPU
+time to the default build):
 
 	                  -DTHREADS   -DUSE_MARK_SWEEP   both (--enable-threads)
-	tak                  0.95           1.04              1.11
-	fib                  1.04           0.99              1.06
-	bignum               0.99           1.00              1.15
-	sort                 1.03           1.17              1.63
-	cons                 0.98           1.00              1.30
-	strings              0.98           1.07              1.09
-	hash                 1.09           0.99              1.06
-	dispatch             0.97           0.96              1.00
-	eval                 1.07           1.04              1.16
-	format               1.03           3.39              4.90
+	tak                  1.15           1.04              1.02
+	fib                  1.10           1.00              1.03
+	bignum               1.18           0.88              0.90
+	sort                 1.10           1.01              1.08
+	cons                 1.30           0.91              0.97
+	strings              1.22           0.98              1.20
+	hash                 1.09           1.00              1.12
+	dispatch             1.06           0.96              0.99
+	eval                 1.17           0.99              1.07
+	format               1.15           0.97              1.13
+	compile              1.22           0.96              1.11
+
+With threads in use, "tests/bench.sh -p 4" (four copies of tak, each
+on an OS thread, against the same on one thread, wall clock) runs
+3.7 times faster, in bytecode and natively alike.
 
 Running Oaklisp
 ===============

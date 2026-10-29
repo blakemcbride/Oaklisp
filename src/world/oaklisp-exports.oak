@@ -201,6 +201,7 @@
     %make-cell %crunch
     %allocate %filltag %slot escape-object %escape-object-length
     %windings %wind-count %push-winding %pop-winding
+    %mutex-acquire-thunk %mutex-release-thunk
     current-windings current-wind-count set-current-windings!
     cond-undefined-value
     catch-errors

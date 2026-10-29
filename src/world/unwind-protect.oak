@@ -60,13 +60,25 @@
 	   (set! (process-windings z) windings)
 	   (set! (process-wind-count z) count)))))
 
+;;; Pushing and popping are what every guarded section and
+;;; WIND-PROTECT does, so with a process they go through one method of
+;;; its own (multiproc.oak) rather than four accessors.
+
 (define (%push-winding item)
-  (set-current-windings! (cons item (current-windings))
-			 (+ (current-wind-count) 1)))
+  (let ((z (%load-process)))
+    (cond ((eq? z 0)
+	   (set! %windings (cons item %windings))
+	   (set! %wind-count (+ %wind-count 1)))
+	  (else
+	   (%process-push-winding z item)))))
 
 (define (%pop-winding)
-  (set-current-windings! (cdr (current-windings))
-			 (- (current-wind-count) 1)))
+  (let ((z (%load-process)))
+    (cond ((eq? z 0)
+	   (set! %windings (cdr %windings))
+	   (set! %wind-count (- %wind-count 1)))
+	  (else
+	   (%process-pop-winding z)))))
 
 (define (current-pending-rewind)
   (let ((z (%load-process)))
@@ -158,7 +170,12 @@
 ;;; continuation re-enter.
 
 (define (%with-guard m thunk)
-  (wind-protect (acquire-mutex m) (thunk) (release-mutex m)))
+  (acquire-mutex m)
+  (%push-winding (list* (%mutex-release-thunk m) (%mutex-acquire-thunk m)
+			(get-current-fluid-bindings)))
+  (block0 (thunk)
+	  (%pop-winding)
+	  (release-mutex m)))
 
 ;;; This one does different things depending on whether the entries
 ;;; and exists are normal or abnormal.

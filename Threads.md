@@ -232,11 +232,26 @@ Performance
 
 - **TLABs** (under `USE_MARK_SWEEP + THREADS`): Most allocations use
   a per-thread bump pointer with no lock.  Only TLAB refill and large
-  allocations acquire `alloc_lock`.
+  allocations acquire `alloc_lock`; a TLAB comes out of the bump
+  region or out of a big free-list entry (the sweep makes one entry
+  of each run of dead objects), so a heap of short-lived objects is
+  allocated from without the lock in steady state too.
 - **Concurrent GC** (under `USE_MARK_SWEEP + THREADS`): The mark phase
   runs mostly concurrently (only two brief STW pauses for initial mark
   and remark), and sweep runs lazily during allocation.  The copying GC
-  fallback remains STW but is only triggered for heap expansion.
+  fallback remains STW but is only triggered for heap expansion, which
+  follows the copying collector's rule (live data over a third of the
+  heap) and starts from a heap four times the default build's.
+- **Guards**: a guarded section (`%guard`, `with-mutex`) costs the
+  mutex's compare-and-swap (`%test-and-set-locative` is one CAS
+  instruction with threads) and a winding pushed through one method
+  of the process; the mutex carries its two winding thunks, made
+  once.
+- **Cost**: `make bench` against the default build, same world, CPU
+  time: within 5% on tak, fib, cons, bignum and dispatch; the rest up
+  to 1.2x (`strings`, `format`: interning and output under their
+  guards; BUILD.md has the table).  `bench.sh -p N` runs N copies of
+  tak on N threads: 3.7x on four, bytecode and native alike.
 
 See `GC.md` for full garbage collection documentation.
 

@@ -16,6 +16,11 @@
 # the C-locals lowering, so the modes compare: bytecode, mixed native,
 # separate, whole-program and lowered compilation.
 #
+# BENCHFLAGS='-p N' runs parallel-tak.oak (N copies of tak, each on an
+# OS thread of its own) with 1 thread and with N, timed by the wall
+# clock around the whole run, and reports the speed-up; it needs an
+# emulator with threads.  -n applies to it too.
+#
 # The result also depends on the C compiler and its options; compare
 # builds made the same way, e.g. with and without --enable-threads.
 
@@ -24,9 +29,11 @@
 repeat=5
 outfile=
 compile=--compile
+parallel=
 while test $# -gt 0; do
   case $1 in
     -r) repeat=$2; shift 2;;
+    -p) parallel=$2; shift 2;;
     -n) compile=--compile-native; shift;;
     -x) compile=exe; shift;;
     -w) compile=exe; oakcflags=-w; shift;;
@@ -41,13 +48,38 @@ while test $# -gt 0; do
 	    "$(awk -v a="$ms" -v b="$nms" 'BEGIN {printf "%.2f", (a>0)? b/a : 0}')"
 	done < "$old"
 	exit 0;;
-    *) echo "usage: bench.sh [-n] [-r repeat] [-o outfile] | -c old new" >&2; exit 2;;
+    *) echo "usage: bench.sh [-n] [-r repeat] [-o outfile] | -p threads | -c old new" >&2; exit 2;;
   esac
 done
 
 workdir=${TMPDIR:-/tmp}/oaklisp-bench.$$
 mkdir -p "$workdir" || exit 1
 trap 'rm -rf "$workdir"' 0
+
+if test -n "$parallel"; then
+  # Wall-clock milliseconds of a whole run of parallel-tak.oak.
+  wall() {
+    t0=$(date +%s%N)
+    (cd "$workdir" && oak -- --load parallel-tak \
+       --eval "(set! bench-copies $parallel)" --eval "(set! bench-threads $1)" \
+       --eval '(bench)' --exit >/dev/null 2>&1) \
+      || { echo "parallel-tak: run with $1 threads failed"; exit 1; }
+    t1=$(date +%s%N)
+    echo $(( (t1 - t0) / 1000000 ))
+  }
+  enabled=$(oak -- --eval '(print (%threads-enabled?) standard-output)' --exit 2>&1 | tail -c 3)
+  case $enabled in *T*) ;; *) echo "parallel-tak: the emulator has no threads"; exit 1;; esac
+  cp "$testdir/parallel-tak.oak" "$workdir/"
+  (cd "$workdir" && oak -- $compile parallel-tak --exit > parallel-tak.compile.log 2>&1) \
+    || { echo "parallel-tak: compile failed (see $workdir/parallel-tak.compile.log)"; exit 1; }
+  one=$(wall 1) || exit 1
+  many=$(wall "$parallel") || exit 1
+  echo "parallel-tak ($parallel copies of tak, wall-clock ms of the whole run):"
+  printf '  %d thread%s %6s ms\n' 1 ' ' "$one"
+  printf '  %d threads %6s ms\n' "$parallel" "$many"
+  echo "  speed-up $(awk -v a="$one" -v b="$many" 'BEGIN {printf "%.2f", (b>0)? a/b : 0}')"
+  exit 0
+fi
 
 echo "Oaklisp benchmarks: best of $repeat runs, CPU milliseconds"
 "$OAKLISP" --version

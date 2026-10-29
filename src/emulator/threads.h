@@ -27,7 +27,6 @@ extern int oak_live_thread_count(void);
 extern oak_tls_key_t index_key;
 extern oak_mutex_t index_lock;
 extern oak_mutex_t alloc_lock;
-extern oak_mutex_t test_and_set_locative_lock;
 extern oak_mutex_t wp_lock;
 extern oak_mutex_t dump_lock;
 

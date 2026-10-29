@@ -857,23 +857,14 @@ oak_rt_reset_alarm_counter(ref_t * sp)
   return sp;
 }
 
-/* TEST-AND-SET-LOCATIVE, as loop.c does it: with THREADS under the one
-   lock, and refused (#f) when another thread holds it. */
+/* TEST-AND-SET-LOCATIVE, as loop.c does it: with THREADS one
+   compare-and-swap. */
 ref_t
 oak_rt_test_and_set(ref_t * p, ref_t old, ref_t new)
 {
 #ifdef THREADS
-  if (oak_mutex_trylock(&test_and_set_locative_lock) != 0)
-    return e_false;
-  if (*p != old)
-    {
-      oak_mutex_unlock(&test_and_set_locative_lock);
-      return e_false;
-    }
   SATB_BARRIER(p);
-  *p = new;
-  oak_mutex_unlock(&test_and_set_locative_lock);
-  return e_t;
+  return OAK_ATOMIC_CAS_SIZE(p, &old, new) ? e_t : e_false;
 #else
   if (*p != old)
     return e_false;

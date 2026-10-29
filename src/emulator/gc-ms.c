@@ -49,7 +49,7 @@
 /*  Bitmaps                                                            */
 /* ------------------------------------------------------------------ */
 
-static uint64_t *objstart_bitmap;   /* 1 bit per ref_t word in new_space */
+uint64_t *objstart_bitmap;          /* 1 bit per ref_t word in new_space */
 static uint64_t *mark_bitmap;       /* 1 bit per ref_t word in new_space */
 static size_t bitmap_words;         /* number of uint64_t in each bitmap */
 
@@ -58,10 +58,10 @@ static size_t bitmap_words;         /* number of uint64_t in each bitmap */
 #define BM_CLR(bm, i)   ((bm)[(i)/64] &= ~(1ULL << ((i) % 64)))
 #define BM_TEST(bm, i)  ((bm)[(i)/64] &   (1ULL << ((i) % 64)))
 
-/* Objstart bits are set by the TLAB fast path on every thread with no
-   lock, and by the locked slow path and the collector; with threads
-   they share bitmap words (a TLAB's edge and its neighbours), so every
-   update must be atomic or one thread's bit can be lost. */
+/* Objstart bits are set by the locked slow paths and the collector in
+   words they may share, so those updates are atomic with threads; the
+   TLAB fast path on every thread sets them with no lock, in words
+   that are the TLAB's alone (TLAB_ALIGN), with a plain store. */
 #ifdef THREADS
 #define OBJSTART_SET(i) \
     ((void)OAK_ATOMIC_FETCH_OR_U64(&objstart_bitmap[(i)/64], 1ULL << ((i) % 64)))
@@ -138,9 +138,32 @@ static ref_t *free_list_heads[NUM_SIZE_CLASSES];
 /* Total words on free lists (for statistics / GC triggering). */
 static size_t free_list_total_words;
 
+/* Words of the objects the mark traced this cycle: the live data, less
+   what was born black meanwhile.  The heap grows when they crowd it
+   (ms_crowded, the copying collector's own rule). */
+static size_t marked_words;
+#define MS_RECLAIM_FACTOR 3
+
 /* The lazy sweep's state (defined with it, below). */
 static size_t lazy_sweep_cursor;
 static bool   lazy_sweep_active;
+
+/* A run of dead words onto its free list (the sweeps, below). */
+static void ms_sweep_run_end(ref_t **run_start, size_t *run_len);
+
+/* Words from OBJ to the next objstart bit, or to word LIMIT. */
+static size_t
+ms_objstart_extent_to(ref_t *obj, size_t limit)
+{
+    size_t idx = BM_IDX(obj);
+    size_t next = idx + 1;
+
+    while (next < limit && !BM_TEST(objstart_bitmap, next))
+	next++;
+    return (next > limit ? limit : next) - idx;
+}
+#define TLAB_MIN_FREE 257	/* a free run this big can be a TLAB */
+static bool tlab_free_none;
 
 
 ref_t *
@@ -228,6 +251,8 @@ ms_free_list_alloc(size_t n_words)
 		    rest[1] = (ref_t)rest_size;
 		free_list_heads[rc] = rest;
 		free_list_total_words -= n_words;
+		if (rest_size >= TLAB_MIN_FREE)
+		    tlab_free_none = false;
 
 		if (OAK_UNLIKELY(gc_phase >= GC_PHASE_CONCURRENT_MARK))
 		    ms_mark_alloc(p);
@@ -243,6 +268,32 @@ ms_free_list_alloc(size_t n_words)
     return NULL;
 }
 
+
+/* After a cycle: is the live data crowding the heap?  The copying
+   collector's rule (gc.c, RECLAIM_FACTOR): grow when it takes more
+   than a third.  Without this the heap never grew unless a request
+   went unmet, and a program with a few hundred K words live cycled
+   many times a second, each cycle scanning spatic and sweeping the
+   whole heap.  True sets the next size (a copying collection into it
+   follows, which also compacts). */
+static bool
+ms_crowded(size_t amount)
+{
+    size_t want = MS_RECLAIM_FACTOR * marked_words + amount;
+
+#ifdef MAX_NEW_SPACE_SIZE
+    if (want > MAX_NEW_SPACE_SIZE)
+	want = MAX_NEW_SPACE_SIZE;
+#endif
+    if (want <= new_space.size)
+	return false;
+    if (trace_gc > 1)
+	fprintf(stderr, "; MS-GC: %zu words live in a heap of %zu: "
+		"growing to %zu.\n", marked_words, new_space.size, want);
+    original_newspace_size = want;
+    e_next_newspace_size = want;
+    return true;
+}
 
 /* Whether a request of N words can be met without collecting: from
    the bump region, or by a free-list entry (of its class or a larger
@@ -287,25 +338,47 @@ ms_bump_alloc_notify(ref_t *p, size_t n_words)
 }
 
 
-void
-ms_bump_alloc_notify_atomic(ref_t *p, size_t n_words)
-{
-    size_t idx = BM_IDX(p);
-    OAK_ATOMIC_FETCH_OR_U64(&objstart_bitmap[idx / 64],
-			    1ULL << (idx % 64));
-    (void)n_words;
-}
+/* The TLAB fast path's objstart bit is ms_bump_alloc_notify_tlab in
+   gc-ms.h: a plain store, the bitmap word being the TLAB's own
+   (TLAB_ALIGN). */
 
 
 /* ------------------------------------------------------------------ */
 /*  TLABs (thread-local allocation buffers)                            */
 /* ------------------------------------------------------------------ */
 
-#ifdef THREADS
+/* With threads a TLAB per thread; without, the one at index 0 is the
+   allocator's bump cursor, so that ALLOCATE's fast path is the same
+   few instructions in both builds (data.h). */
 #include "threads.h"
 
-ref_t *tlab_cursor_array[MAX_THREAD_COUNT];
-ref_t *tlab_end_array[MAX_THREAD_COUNT];
+ref_t *tlab_cursor_array[MS_TLAB_COUNT];
+ref_t *tlab_end_array[MS_TLAB_COUNT];
+
+/* A TLAB begins and ends on a bitmap word's boundary (64 words), so
+   its objstart bits are in words no other thread touches, and the
+   fast path sets them with a plain store (ms_bump_alloc_notify) --
+   the atomic OBJSTART_SET is for the shared words the slow paths and
+   the collector write.  The words skipped to align a start are zeroed
+   and given an objstart bit: a dead filler for the next sweep. */
+#define TLAB_ALIGN 64
+
+static ref_t *
+ms_tlab_align_up(ref_t *p)
+{
+    size_t off = (size_t)(p - new_space.start) % TLAB_ALIGN;
+
+    return off == 0 ? p : p + (TLAB_ALIGN - off);
+}
+
+static void
+ms_tlab_filler(ref_t *p, size_t words)
+{
+    if (words == 0)
+	return;
+    memset(p, 0, words * sizeof(ref_t));
+    OBJSTART_SET(BM_IDX(p));
+}
 
 /*
  * Carve a TLAB from the global bump pointer.
@@ -317,16 +390,89 @@ static ref_t *
 ms_tlab_refill(size_t min_words, ref_t **out_end)
 {
     size_t tlab_words = TLAB_SIZE;
-    if (tlab_words < min_words)
-	tlab_words = min_words;
+    ref_t *start = ms_tlab_align_up(free_point);
+    size_t gap = (size_t)(start - free_point);
 
-    if (tlab_words >= (size_t)(new_space.end - free_point))
+    if (tlab_words < min_words)
+	tlab_words = (min_words + TLAB_ALIGN - 1) / TLAB_ALIGN * TLAB_ALIGN;
+
+    if (gap + tlab_words >= (size_t)(new_space.end - free_point))
 	return NULL;
 
-    ref_t *start = free_point;
-    free_point += tlab_words;
-    *out_end = start + tlab_words;
+    ms_tlab_filler(free_point, gap);
+    free_point = start + tlab_words;
+    *out_end = free_point;
     return start;
+}
+
+/* A TLAB out of a free-list entry: the biggest-class entry of at
+   least TLAB_MIN_FREE words behind the lazy sweep's cursor (an entry
+   can run on into an unswept block, whose objects the sweep would
+   then free), trimmed to aligned edges, the trimmings going back on
+   the lists.  Not during a concurrent mark: objects allocated below
+   sweep_limit then must be born black, which the fast path does not
+   do (and the cycle began by retiring every TLAB; refills come from
+   the bump region, above sweep_limit, until it ends). */
+/* No free run served last time, and none has been added since: the
+   search would find nothing again (cleared by the sweeps and the
+   split).  TLAB_MIN_FREE is the least size of every entry in the
+   classes searched. */
+static bool tlab_free_none = true;
+
+static ref_t *
+ms_tlab_from_free(size_t min_words, ref_t **out_end)
+{
+    size_t need = min_words + 2 * TLAB_ALIGN;
+
+    if (need < TLAB_MIN_FREE)
+	need = TLAB_MIN_FREE;
+    if (gc_phase >= GC_PHASE_CONCURRENT_MARK || tlab_free_none)
+	return NULL;
+    for (int c = NUM_SIZE_CLASSES - 1; c >= 0 && class_max[c] >= need; c--) {
+	ref_t **prev = &free_list_heads[c];
+	ref_t *p = *prev;
+
+	while (p) {
+	    size_t actual_size = (size_t)p[1];
+
+	    if (actual_size == 0 || actual_size > new_space.size ||
+		p + actual_size > new_space.end) {
+		prev = (ref_t **)p;
+		p = (ref_t *)(*p);
+		continue;
+	    }
+	    if (actual_size >= need
+		&& (!lazy_sweep_active
+		    || BM_IDX(p + actual_size) <= lazy_sweep_cursor)) {
+		ref_t *start = ms_tlab_align_up(p);
+		ref_t *end = p + actual_size;
+		size_t tail = (size_t)(end - new_space.start) % TLAB_ALIGN;
+		size_t head = (size_t)(start - p);
+
+		*prev = (ref_t *)(*p);
+		free_list_total_words -= actual_size;
+		end -= tail;
+		if (head != 0) {
+		    size_t len = head;
+		    ms_sweep_run_end(&p, &len);	/* keeps p's objstart bit */
+		}
+		if (tail != 0) {
+		    ref_t *t = end;
+		    size_t len = tail;
+
+		    ms_tlab_filler(t, 0);
+		    OBJSTART_SET(BM_IDX(t));
+		    ms_sweep_run_end(&t, &len);
+		}
+		*out_end = end;
+		return start;
+	    }
+	    prev = (ref_t **)p;
+	    p = (ref_t *)(*p);
+	}
+    }
+    tlab_free_none = true;
+    return NULL;
 }
 
 
@@ -336,28 +482,37 @@ ms_alloc_slow_locked(size_t n_words,
 {
     ref_t *p;
 
-    /* 1. Try free list. */
-    p = ms_free_list_alloc(n_words);
-    if (p)
-	return p;
-
-    /* 1b. Try lazy sweep to populate free lists. */
-    while (ms_lazy_sweep_one()) {
-	p = ms_free_list_alloc(n_words);
-	if (p)
-	    return p;
-    }
-
-    /* 2. Try TLAB refill for small allocations. */
+    /* 1. A small request wants a TLAB, so that the ones after it take
+       no lock: out of a big free entry, sweeping for one if need be,
+       else out of the bump region. */
     if (n_words <= TLAB_SIZE) {
-	ref_t *new_end;
-	ref_t *new_start = ms_tlab_refill(n_words, &new_end);
+	ref_t *new_end, *new_start;
+
+	for (;;) {
+	    new_start = ms_tlab_from_free(n_words, &new_end);
+	    if (new_start || !ms_lazy_sweep_one())
+		break;
+	}
+	if (!new_start)
+	    new_start = ms_tlab_refill(n_words, &new_end);
 	if (new_start) {
 	    *tlab_cursor_p = new_start + n_words;
 	    *tlab_end_p = new_end;
 	    ms_bump_alloc_notify(new_start, n_words);
 	    return new_start;
 	}
+    }
+
+    /* 2. Try free list: a large request, or scraps only. */
+    p = ms_free_list_alloc(n_words);
+    if (p)
+	return p;
+
+    /* 2b. Try lazy sweep to populate free lists. */
+    while (ms_lazy_sweep_one()) {
+	p = ms_free_list_alloc(n_words);
+	if (p)
+	    return p;
     }
 
     /* 3. Try global bump pointer (large allocs or TLAB refill failed). */
@@ -371,6 +526,57 @@ ms_alloc_slow_locked(size_t n_words,
     return NULL;  /* GC needed */
 }
 
+
+/* ALLOCATE's slow path, out of line (data.h). */
+ref_t *
+ms_allocate_slow(size_t words, char *reason)
+{
+    int idx = MS_TLAB_INDEX;
+    ref_t *p;
+
+#ifdef THREADS
+    while (oak_mutex_trylock(&alloc_lock) != 0) {
+	if (gc_pending)
+	    wait_for_gc();
+    }
+#endif
+    p = ms_alloc_slow_locked(words, &tlab_cursor_array[idx],
+			     &tlab_end_array[idx]);
+    /* ms_collect either runs a cycle as the coordinator -- and when
+       that leaves no room for the request, the copying collector,
+       growing the heap -- or, with threads, when another thread's
+       cycle is under way, waits for it; after a wait the retry can
+       still fail, so go round again.  The copying collector is never
+       called from here after a wait: run by a thread that is not the
+       coordinator while a cycle is in progress, it would skip its
+       handshake and move objects under the marker. */
+    while (!p) {
+	ms_collect(false, reason, words);
+	p = ms_alloc_slow_locked(words, &tlab_cursor_array[idx],
+				 &tlab_end_array[idx]);
+#ifdef THREADS
+	if (!p && ms_collect_was_coordinator()) {
+#else
+	if (!p) {
+#endif
+	    /* Our own cycle, and still nothing big enough: the copying
+	       collector, which grows the heap.  Safe here, unlike after
+	       a wait: a cycle needs alloc_lock to start, and this thread
+	       holds it, so none is under way. */
+	    gc(false, true, reason, words);
+	    p = free_point;
+	    free_point += words;
+	    ms_bump_alloc_notify(p, words);
+	}
+    }
+#if defined(THREADS) && defined(OAK_GC_VERIFY)
+    ms_verify_log_alloc(p, 2, words);
+#endif
+#ifdef THREADS
+    oak_mutex_unlock(&alloc_lock);
+#endif
+    return p;
+}
 
 void
 ms_tlab_retire(ref_t *cursor, ref_t *end)
@@ -392,8 +598,12 @@ ms_tlab_retire(ref_t *cursor, ref_t *end)
 void
 ms_tlab_retire_all(void)
 {
+#ifdef THREADS
     extern int next_index;
     int n = next_index;   /* snapshot under alloc_lock */
+#else
+    int n = 1;
+#endif
 
     for (int i = 0; i < n; i++) {
 	/* A dead thread's TLAB is still worth retiring so the sweep can
@@ -403,7 +613,6 @@ ms_tlab_retire_all(void)
 	tlab_end_array[i] = NULL;
     }
 }
-#endif /* THREADS */
 
 
 /* ------------------------------------------------------------------ */
@@ -790,6 +999,7 @@ ms_trace(void)
 	/* Sanity: clamp length so we don't read past the heap. */
 	if (obj + len > new_space.end)
 	    len = (size_t)(new_space.end - obj);
+	marked_words += len;
 
 	for (size_t i = 0; i < len; i++) {
 	    ref_t val = obj[i];
@@ -852,6 +1062,7 @@ ms_trace_concurrent(void)
 
 	if (obj + len > new_space.end)
 	    len = (size_t)(new_space.end - obj);
+	marked_words += len;
 
 	for (size_t i = 0; i < len; i++) {
 	    ref_t val = obj[i];
@@ -1100,6 +1311,14 @@ ms_mark_roots(void)
 {
     ref_t *p;
 
+/* A root is worth a call only if it points into new space: nearly
+   every word of spatic and of the stacks is a fixnum or points into
+   spatic, and this is the collector's one pass over them. */
+#define MS_ROOT(r)							\
+    do { ref_t _r = (r);						\
+	 if ((_r & PTR_MASK) && NEW_PTR(ANY_TO_PTR(_r)))		\
+	     ms_mark_ref(_r); } while (0)
+
 #ifdef THREADS
     int my_index;
     int gc_thread_count = next_index;
@@ -1142,15 +1361,15 @@ ms_mark_roots(void)
 
 	/* GC examine buffer */
 	for (p = gc_examine_buffer; p < gc_examine_ptr; p++)
-	    ms_mark_ref(*p);
+	    MS_ROOT(*p);
 
 	/* Value stack */
 	for (p = value_stack.bp; p <= value_stack.sp; p++)
-	    ms_mark_ref(*p);
+	    MS_ROOT(*p);
 
 	/* Context stack */
 	for (p = context_stack.bp; p <= context_stack.sp; p++)
-	    ms_mark_ref(*p);
+	    MS_ROOT(*p);
 
 	/* Stack segments (linked lists in the heap) */
 	ms_mark_ref(value_stack.segment);
@@ -1159,15 +1378,48 @@ ms_mark_roots(void)
 
     /* Scan spatic space: any pointer from spatic into new_space is a root. */
     for (p = spatic.start; p < spatic.end; p++)
-	ms_mark_ref(*p);
+	MS_ROOT(*p);
 
 #undef FORTHREADS
+#undef MS_ROOT
 }
 
 
 /* ------------------------------------------------------------------ */
 /*  Sweep phase                                                        */
 /* ------------------------------------------------------------------ */
+
+/* A sweep puts each run of adjacent dead objects on a free list as
+   one entry (rather than each object on its own): a heap of dead
+   conses then yields blocks big enough to serve as TLABs, allocated
+   from without the lock, instead of a lock per cons.  1-word entries
+   go to class 0 (no room for a size field); all others store their
+   size in word[1] so the allocator can check an entry is big enough.
+   The entry keeps its first object's objstart bit, by which
+   find_object_start still finds it; it is re-used if the entry is
+   allocated, and stays set for the next sweep if not. */
+static void
+ms_sweep_run_end(ref_t **run_start, size_t *run_len)
+{
+    ref_t *p = *run_start;
+    size_t len = *run_len;
+
+    if (len == 0)
+	return;
+    {
+	int sc = ms_size_class(len);
+
+	p[0] = (ref_t)free_list_heads[sc];
+	if (len >= 2)
+	    p[1] = (ref_t)len;
+	free_list_heads[sc] = p;
+	free_list_total_words += len;
+	if (len >= TLAB_MIN_FREE)
+	    tlab_free_none = false;
+    }
+    *run_start = NULL;
+    *run_len = 0;
+}
 
 #ifndef THREADS
 static size_t
@@ -1186,6 +1438,8 @@ ms_sweep(void)
     ref_t *limit = sweep_limit ? sweep_limit : free_point;
     size_t heap_words = (size_t)(limit - new_space.start);
     size_t bm_words = (heap_words + 63) / 64;
+    ref_t *run_start = NULL;
+    size_t run_len = 0;
 
     for (size_t w = 0; w < bm_words; w++) {
 	uint64_t os_word = objstart_bitmap[w];
@@ -1200,43 +1454,29 @@ ms_sweep(void)
 
 	    ref_t *obj = new_space.start + idx;
 
-	    /* Determine object extent by scanning to the next objstart
-	       bit.  We cannot use ms_get_length() here because naked
-	       cells (from MAKE-CELL) store arbitrary values in word[0]
-	       which may coincidentally look like type pointers, giving
-	       incorrect lengths.  The objstart bitmap is the
-	       authoritative source of allocation boundaries. */
-	    size_t next_idx = idx + 1;
-	    while (next_idx < heap_words &&
-		   !BM_TEST(objstart_bitmap, next_idx))
-		next_idx++;
-	    size_t len = next_idx - idx;
-
+	    /* An object extends to the next objstart bit (not to what
+	       its type says: a naked cell's word[0] can look like a
+	       type).  So a run of dead objects extends from its first
+	       to the next live one, and only that end is looked for. */
 	    if (BM_TEST(mark_bitmap, idx)) {
 		/* Live: clear mark for next cycle. */
 		BM_CLR(mark_bitmap, idx);
+		if (run_start) {
+		    run_len = (size_t)(obj - run_start);
+		    reclaimed += run_len;
+		    ms_sweep_run_end(&run_start, &run_len);
+		}
+	    } else if (run_start) {
+		BM_CLR(objstart_bitmap, idx);	/* into the run */
 	    } else {
-		/* Dead: add to free list.  1-word objects go to
-		   class 0 (no room for a size field); all others
-		   store their actual size in word[1] so the
-		   allocator can verify the entry is big enough. */
-		if (len < 1) len = 1;
-		int sc = ms_size_class(len);
-
-		obj[0] = (ref_t)free_list_heads[sc];
-		if (len >= 2)
-		    obj[1] = (ref_t)len;
-		free_list_heads[sc] = obj;
-		free_list_total_words += len;
-		reclaimed += len;
-
-		/* Note: we leave the objstart bit set so that the
-		   free list entry is still findable by
-		   find_object_start.  It will be re-used if this
-		   entry is allocated.  If the object stays dead,
-		   the bit remains set for the next sweep. */
+		run_start = obj;
 	    }
 	}
+    }
+    if (run_start) {
+	run_len = ms_objstart_extent_to(run_start, heap_words);
+	reclaimed += run_len;
+	ms_sweep_run_end(&run_start, &run_len);
     }
 
     return reclaimed;
@@ -1295,6 +1535,8 @@ ms_lazy_sweep_one(void)
     /* Walk objstart bits in [start, end). */
     size_t start_w = start / 64;
     size_t end_w = (end + 63) / 64;
+    ref_t *run_start = NULL;
+    size_t run_len = 0;
 
     for (size_t w = start_w; w < end_w; w++) {
 	uint64_t os_word = objstart_bitmap[w];
@@ -1309,30 +1551,29 @@ ms_lazy_sweep_one(void)
 
 	    ref_t *obj = new_space.start + idx;
 
-	    /* Determine object extent by finding next objstart.
-	       This may cross block boundaries — that's fine. */
-	    size_t next_idx = idx + 1;
-	    while (next_idx < heap_words &&
-		   !BM_TEST(objstart_bitmap, next_idx))
-		next_idx++;
-	    size_t len = next_idx - idx;
-
+	    /* As in ms_sweep: a run of dead objects, from its first to
+	       the next live one.  The last run's end may lie past this
+	       block, in one not yet swept: the entry is made anyway
+	       (the allocator keeps off such an entry until the sweep
+	       has passed it). */
 	    if (BM_TEST(mark_bitmap, idx)) {
-		/* Live: clear mark for next cycle. */
 		BM_CLR(mark_bitmap, idx);
+		if (run_start) {
+		    run_len = (size_t)(obj - run_start);
+		    ms_sweep_run_end(&run_start, &run_len);
+		}
+	    } else if (run_start) {
+		BM_CLR(objstart_bitmap, idx);
 	    } else {
-		/* Dead: add to free list. */
-		if (len < 1) len = 1;
-		int sc = ms_size_class(len);
-
-		obj[0] = (ref_t)free_list_heads[sc];
-		if (len >= 2)
-		    obj[1] = (ref_t)len;
-		free_list_heads[sc] = obj;
-		free_list_total_words += len;
+		run_start = obj;
 	    }
 	}
     }
+    if (run_start) {
+	run_len = ms_objstart_extent_to(run_start, heap_words);
+	ms_sweep_run_end(&run_start, &run_len);
+    }
+    tlab_free_none = false;	/* an entry that straddled the cursor may not now */
 
     return true;
 }
@@ -1468,6 +1709,7 @@ ms_collect(bool pre_dump, char *reason, size_t amount)
        has handed out an object in it, leaving a live object whose type
        slot reads as zero. */
 #ifndef THREADS
+    ms_tlab_retire_all();
     sweep_limit = free_point;
 #endif
 
@@ -1481,6 +1723,7 @@ ms_collect(bool pre_dump, char *reason, size_t amount)
 
     memset(mark_bitmap, 0, bitmap_words * sizeof(uint64_t));
     mark_stack_init();
+    marked_words = 0;
 #if defined(THREADS) && defined(OAK_GC_VERIFY)
     if (!ms_vlog)
 	ms_vlog = calloc(VLOG_SIZE, sizeof(*ms_vlog));
@@ -1721,6 +1964,14 @@ ms_collect(bool pre_dump, char *reason, size_t amount)
 		gc(false, true, "mark-sweep fallback", amount);
 		gc_concurrent_in_progress = 1;
 	    }
+	    else if (ms_crowded(amount)) {
+		/* As above, into the bigger space; spatic stays. */
+		ms_lazy_sweep_finish();
+		sweep_limit = NULL;
+		gc_concurrent_in_progress = 0;
+		gc(false, false, "mark-sweep growth", amount);
+		gc_concurrent_in_progress = 1;
+	    }
 	}
 
 	sweep_limit = NULL;
@@ -1781,6 +2032,8 @@ ms_collect(bool pre_dump, char *reason, size_t amount)
 
 	    gc(false, true, "mark-sweep fallback", amount);
 	}
+	else if (ms_crowded(amount))
+	    gc(false, false, "mark-sweep growth", amount);
 
 	if (trace_gc == 1)
 	    fprintf(stderr, "\n");
@@ -1844,14 +2097,12 @@ ms_reinit(void)
     ms_destroy();
     ms_init();
 
-#ifdef THREADS
     /* The heap has been replaced, so every thread-local allocation
        buffer points into the freed one. */
-    for (int i = 0; i < MAX_THREAD_COUNT; i++) {
+    for (int i = 0; i < MS_TLAB_COUNT; i++) {
 	tlab_cursor_array[i] = NULL;
 	tlab_end_array[i] = NULL;
     }
-#endif
 
     /* Likewise any sweep that was still in progress. */
     lazy_sweep_active = false;
