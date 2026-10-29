@@ -170,8 +170,7 @@ reference size can also be used on a 64-bit system.
 .TP
 .B \-\-locale x
 Switch to locale x, eg user-locale (default),
-system-locale, compiler-locale, scheme-locale (for RnRS
-compatibility).
+system-locale, compiler-locale.
 
 .TP
 .B \-\-exit
@@ -179,10 +178,10 @@ Exit upon processing this option.
 
 .SH EXAMPLES
 
-This will compile the file myfile.oak in the scheme locale and then
-leave the user in a read-eval-print loop in the scheme locale.
+This will compile the file myfile.oak in the system locale and then
+leave the user in a read-eval-print loop in the system locale.
 
-.B oaklisp \-\- \-\-locale scheme\-locale \-\-compile myfile
+.B oaklisp \-\- \-\-locale system\-locale \-\-compile myfile
 
 .SH EXIT STATUS
 0 if everything asked for on the command line succeeded, and 1 if a

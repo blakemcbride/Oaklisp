@@ -260,7 +260,7 @@
     self))
 
 (define (strip-locales keep)
-  (dolist (loc (list system-locale compiler-locale scheme-locale
+  (dolist (loc (list system-locale compiler-locale
 		     user-locale oaklisp-locale))
     (%strip-locale loc keep)))
 

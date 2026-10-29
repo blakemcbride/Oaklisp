@@ -1,7 +1,7 @@
 Portability (Mac/Linux/Windows)
 ================================
 
-All platform-specific code has been abstracted behind portable
+All platform-specific code is abstracted behind portable
 headers.  See `Windows.md` for Windows-specific build details.
 
 
@@ -97,19 +97,18 @@ platforms; no effect on Windows, conventional on POSIX.
 configurations.  configure.ac provides a fallback definition in
 `config.h` based on `sizeof(void *)`.
 
-**BSD types** — `u_int16_t`, `u_int32_t`, `u_int8_t` have been
-replaced with standard `uint16_t`, `uint32_t`, `uint8_t` throughout.
+**Integer types** — the standard `uint8_t`, `uint16_t`, `uint32_t`
+are used throughout, never the BSD `u_int*_t` names.
 
-**No direct pthread calls** remain outside `oak-thread.h`.  No direct
-GCC atomic builtins or `__builtin_expect` remain outside
-`oak-atomic.h`.
+**No direct pthread calls** outside `oak-thread.h`, and no direct GCC
+atomic builtins or `__builtin_expect` outside `oak-atomic.h`.
 
 
 Design Decisions
 =================
 
-**C11 stdatomic as the primary target.**  C11 `<stdatomic.h>` is now
-universally supported by GCC 4.9+, Clang 3.1+, and MSVC 17.5+
+**C11 stdatomic as the primary target.**  C11 `<stdatomic.h>` is
+supported by GCC 4.9+, Clang 3.1+, and MSVC 17.5+
 (VS 2022 17.5).  GCC builtins serve as a fallback for older
 GCC/Clang, and MSVC intrinsics cover older MSVC.
 
@@ -121,16 +120,16 @@ header-only (inline functions and macros).  This avoids adding new
 MinGW builds use the POSIX path.  Only MSVC builds need the native
 Windows thread path.
 
-**No CMake migration.**  The project uses autotools.  Windows builds
-with MSVC could use a separate `Makefile.msvc` or rely on CMake in
-the future, but the focus is on making the C code compilable on all
-platforms, not migrating the build system.
+**Autotools only.**  The project builds with autotools.  Windows
+builds with MSVC could use a separate `Makefile.msvc` or CMake, but
+the portability layer aims at C code that compiles on all platforms,
+not at a second build system.
 
 
-Files Changed
-==============
+Where the Portable Code Lives
+=============================
 
-New files:
+Portability headers:
 - `src/emulator/oak-atomic.h` — portable atomics, bit intrinsics,
   branch hints
 - `src/emulator/oak-getopt.h` — portable getopt_long_only (system
@@ -138,26 +137,23 @@ New files:
 - `src/emulator/oak-thread.h` — portable thread primitives (POSIX +
   Windows)
 
-Modified files:
+Their users:
 - `configure.ac` — `__WORDSIZE` fallback, stdatomic.h/windows.h
   detection, graceful pthread handling
-- `src/emulator/Makefile.am` — new headers in source list,
-  USE_MARK_SWEEP auto-enabled with THREADS
-- `src/emulator/data.h` — removed `<pthread.h>`, fixed BSD types,
-  guarded `<unistd.h>`, ported ALLOCATE_PROT macros
-- `src/emulator/threads.h` — ported types and includes
-- `src/emulator/threads.c` — ported all pthread calls, added
-  `oak_threads_system_init()`
-- `src/emulator/gc-ms.c` — ported all pthread/sched/atomic calls
-- `src/emulator/gc-ms.h` — ported SATB_BARRIER macro
-- `src/emulator/gc.c` — ported pthread_getspecific calls
-- `src/emulator/gc.h` — ported gc_lock type
-- `src/emulator/loop.c` — ported pthread/sched/atomic/signal calls
-- `src/emulator/oaklisp.c` — removed `<pthread.h>` and unused
-  `<sys/wait.h>`, ported TLS calls
-- `src/emulator/stacks.c` — ported pthread_getspecific
-- `src/emulator/cmdline.c` — ported pthread_getspecific, switched to
-  oak-getopt.h
+- `src/emulator/Makefile.am` — the headers in the source list;
+  USE_MARK_SWEEP turned on with THREADS
+- `src/emulator/data.h` — no `<pthread.h>`, standard integer types,
+  guarded `<unistd.h>`, ALLOCATE_PROT macros on the portable layer
+- `src/emulator/threads.h`, `threads.c` — thread types and calls
+  through oak-thread.h, `oak_threads_system_init()`
+- `src/emulator/gc-ms.c`, `gc-ms.h` — thread, scheduling and atomic
+  calls, the SATB_BARRIER macro
+- `src/emulator/gc.c`, `gc.h` — thread-local lookups, the gc_lock type
+- `src/emulator/loop.c` — thread, scheduling, atomic and signal calls
+- `src/emulator/oaklisp.c` — TLS calls; no `<pthread.h>` or
+  `<sys/wait.h>`
+- `src/emulator/stacks.c` — thread-local lookups
+- `src/emulator/cmdline.c` — thread-local lookups, oak-getopt.h
 - `src/emulator/signals.c` — full Windows signal path
 - `src/emulator/signals.h` — oak_jmp_buf/oak_setjmp/oak_longjmp
   abstraction

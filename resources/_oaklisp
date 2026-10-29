@@ -50,7 +50,7 @@ _oaklisp() {
     '*--compile-native[compile file.oak to file.oa and C in file.so]:file:_oaklisp_oak_file'
     '*--outdir[directory for the objects of later --compile switches]:directory:_files -/'
     '*--target[architecture to compile for]:architecture:(bc2-32 bc2-64 bc4-64)'
-    '*--locale[switch to a locale]:locale:(system-locale compiler-locale scheme-locale user-locale oaklisp-locale)'
+    '*--locale[switch to a locale]:locale:(system-locale compiler-locale user-locale oaklisp-locale)'
     '--pthreads[spawn N native threads]:count'
     '--exit[exit after processing this option]'
   )

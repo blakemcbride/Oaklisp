@@ -33,7 +33,6 @@
 ;;;
 ;;; This file is loaded once, at the end of world building, after
 ;;; the compiler has exported its entry points to SYSTEM-LOCALE.
-;;; (SCHEME-LOCALE, made later still, is exported by the Makefile.)
 ;;;
 ;;; Special forms known to the compiler (QUOTE, %IF, %LABELS, ...)
 ;;; need no entry: they are not looked up in any locale.
@@ -105,6 +104,7 @@
     sequence simple-vector vector-type vector vector?
     string string? make-string upcase downcase
     character char? digit? graphic? digit-value digit->char
+    string->number
     symbol symbol? intern gensym generate-symbol genvar genvar/1
     subsequence?
 

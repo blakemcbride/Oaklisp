@@ -52,12 +52,35 @@ there are none.}
 
 \section{Comparison}
 
-\op{=}{n1 n2}
+\op{=}{n1 n2 \dt ns}
+\op{<}{n1 n2 \dt ns}
+\op{>}{n1 n2 \dt ns}
+\op{<=}{n1 n2 \dt ns}
+\op{>=}{n1 n2 \dt ns}
+\doc{These take two or more arguments and are true when each adjacent
+pair is in the given relation, so \texttt{(< a b c)} means
+\texttt{(and (< a b) (< b c))}.  A call with two arguments is open
+coded; a longer direct call is open coded as a chain of two-argument
+comparisons, and the operations can also be called as values, for
+instance through \df{apply}, with any number of arguments from two
+up.  Methods added to \df{=} or \df{<} for new types take exactly two
+arguments.}
+
 \op{{\protect\bang}=}{n1 n2}
-\op{<}{n1 n2}
-\op{>}{n1 n2}
-\op{<=}{n1 n2}
-\op{>=}{n1 n2}
+\doc{True when \emph{n1} and \emph{n2} are not equal.  Takes exactly
+two arguments.}
+
+
+\section{Conversion}
+
+\op{string->number}{string $[$radix$]$}
+\doc{Parses \emph{string} as a number in \emph{radix}, which defaults
+to 10, and returns it, or \df{\#f} if \emph{string} is not a number in
+that radix.  The syntax accepted is an optional radix prefix
+(\texttt{\#b}, \texttt{\#o}, \texttt{\#d}, \texttt{\#x}), an optional
+exactness prefix (\texttt{\#e} or \texttt{\#i}, which is ignored since
+all numbers are exact), an optional sign, and an integer or a ratio
+such as \texttt{-3/4}.}
 
 
 \section{Predicates}

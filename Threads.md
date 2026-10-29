@@ -1,7 +1,7 @@
 Thread Support in Oaklisp
 ==========================
 
-Status: STABLE (disabled by default, enable with `--enable-threads`)
+Status: EXPERIMENTAL (disabled by default; with `--pthreads N` the compiler deadlocks, see Initialization)
 
 Enable with: `./configure --enable-threads`
 
@@ -108,9 +108,8 @@ Synchronization primitives (all in `multiproc.oak`):
 Initialization
 ===============
 
-Thread infrastructure is **not** auto-initialized at warm boot.
-Auto-initialization was removed because it causes the compiler to
-deadlock: when mutex guards are active, compiling expressions that
+Thread infrastructure is **not** initialized at warm boot, because
+that would make the compiler deadlock: when mutex guards are active, compiling expressions that
 contain branch instructions (if/cond/or) re-enters mutex-protected
 code in the method-installation path.
 
@@ -133,7 +132,8 @@ all guard-variable mutexes remain `#f` — zero overhead.
 Thread Safety
 ==============
 
-All known shared data structures are protected:
+The runtime's known shared data structures are protected as follows
+(general hash tables are not; see below):
 
 **C emulator (protected by mutex or volatile):**
 - `signal_poll_flag` — `volatile sig_atomic_t` for signal safety
@@ -158,23 +158,17 @@ All guard variables are `#f` during cold/warm boot (no mutex overhead)
 and initialized to `(make mutex)` in `init-thread-infrastructure`
 (`multiproc.oak`) when `--pthreads` is used.
 
-**Bootstrap constraint:** The `.oak` source files for cold-world files
-(symbols, kernel1-install, locales, fluid, anonymous, streams) contain
-mutex guard code using `if`-guarded patterns (not `when`, which is
-unavailable during cold compilation).  However, freshly compiled cold
-`.oa` files are bootstrap-incompatible — the installed compiler may
-generate different bytecode for rest-arguments and format strings,
-causing warm-boot hangs.  Therefore all cold files always use prebuilt
-`.oa` from `prebuilt/src/world/`.  To update the prebuilt copies after
-modifying cold `.oak` sources, first build a working world, use it to
-recompile the modified files, and copy the results back to `prebuilt/`.
+**Cold-world files:** the guards in cold-world files (symbols,
+kernel1-install, locales, fluid, anonymous, streams) are plain
+`if` tests of the guard variable around the mutex calls, since those
+files run long before `multiproc.oak` makes any mutex.
 
 **User responsibility:** General user-created hash tables used
 concurrently need application-level locking.
 
 **Method cache:** `OP_TYPE_METH_CACHE` is always enabled.  Cache writes
 use a seqlock pattern with `OAK_ATOMIC_STORE_REF` (release) /
-`OAK_ATOMIC_LOAD_REF` (acquire).  `OP_METH_ALIST_MTF` remains disabled
+`OAK_ATOMIC_LOAD_REF` (acquire).  `OP_METH_ALIST_MTF` is disabled
 under threads since it mutates the shared alist structure.
 
 
@@ -195,18 +189,20 @@ See `GC.md` for full garbage collection documentation.
 Testing
 =======
 
-Tested with the full system world (`oakworld.bin`) across all four
-build configurations:
+`make check`'s bytecode tests (all of `tests/*.test` except the native,
+stand-alone and consistency tests, which need the build tree's own
+emulator) against the standard world, with the emulator built each
+way:
 
-| Config | Flags | 20-test suite | GC stress | Compile | Dump/reload |
-|--------|-------|---------------|-----------|---------|-------------|
-| 1 | Default (copying GC) | 20/20 PASS | PASS | PASS | PASS |
-| 2 | `USE_MARK_SWEEP` | 20/20 PASS | PASS | PASS | PASS |
-| 3 | `THREADS` | 20/20 PASS | PASS | PASS | PASS |
-| 4 | `THREADS + USE_MARK_SWEEP` | 20/20 PASS | PASS | PASS | PASS |
+| Config | Flags | Result |
+|--------|-------|--------|
+| 1 | Default (copying GC) | all pass (`threads.test` skips) |
+| 2 | `USE_MARK_SWEEP` | `promises.test` fails: "Illegal parametric instruction 48" on its user-locale run, every time; the rest pass (`threads.test` skips) |
+| 3 | `THREADS` | segfaults in `control.test`, `data.test`, `promises.test` and `threads.test`, every time |
+| 4 | `THREADS + USE_MARK_SWEEP` (`--enable-threads`) | all pass |
 
-Additionally tested with `-O0` debug build (config 4) and 5 repeated
-runs — all 20/20 PASS with no non-deterministic failures.
+Only configurations 1 and 4 can be configured; 2 and 3 need the flags
+passed by hand.
 
 
 Future Enhancements

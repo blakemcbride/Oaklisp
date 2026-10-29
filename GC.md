@@ -36,20 +36,20 @@ How to build each:
 # Config 1: Default (copying GC, single-threaded)
 make
 
-# Config 2: Mark-sweep, single-threaded
+# Config 2: Mark-sweep, single-threaded (fails promises.test)
 make CPPFLAGS="-DUSE_MARK_SWEEP"
 
-# Config 3: Copying GC, multi-threaded
+# Config 3: Copying GC, multi-threaded (segfaults; see Threads.md)
+make CPPFLAGS="-DTHREADS"
+
+# Config 4: Concurrent mark-sweep, multi-threaded
 ./configure --enable-threads
 make
-
-# Config 4: Concurrent mark-sweep, multi-threaded (recommended for threads)
-./configure --enable-threads
-make CPPFLAGS="-DUSE_MARK_SWEEP"
 ```
 
-Note: `USE_MARK_SWEEP` is not yet integrated into `configure.ac`.  It
-must be passed manually via `CPPFLAGS`.
+`--enable-threads` gives config 4; configs 2 and 3 have no configure
+option and need the flags passed by hand.  Only configs 1 and 4 pass
+the test suite (see Threads.md, Testing).
 
 
 Runtime Options
@@ -599,17 +599,14 @@ make CPPFLAGS="-DUSE_MARK_SWEEP -DMAX_NEW_SPACE_SIZE=16000000"
 Recommendations
 ===============
 
-**For single-threaded use:**  The default build (Config 1, copying GC)
-is simple and well-tested.  Config 2 (`USE_MARK_SWEEP` alone) offers
-comparable performance and is useful for testing the mark-sweep code
-without threading complexity.
+**For single-threaded use:**  The default build (Config 1, copying GC).
+Config 2 (`USE_MARK_SWEEP` alone) fails `promises.test`.
 
 **For multi-threaded use:**  Config 4 (`THREADS + USE_MARK_SWEEP`) is
 strongly recommended.  The concurrent mark-sweep collector minimizes
 STW pause times (only initial mark and remark are STW; sweep is lazy),
 and TLABs eliminate allocation lock contention for the common case.
-Config 3 (`THREADS` alone) works but has longer STW pauses (full
-copying GC) and all allocations contend on `alloc_lock`.
+Config 3 (`THREADS` alone) segfaults in the test suite.
 
 **Heap sizing:**  The default 128K refs (1 MB) is adequate for
 interactive use.  For compiling large files or running allocation-heavy

@@ -125,8 +125,8 @@ Troubleshooting
 ===============
 
 "use of undeclared identifier 'rl_catch_signals'"
-    Your configure was generated before libedit was handled.  Rerun
-    autoreconf --install and ./configure.
+    Your configure script is stale and does not detect libedit.
+    Rerun autoreconf --install and ./configure.
 
 "no way to build the world"
     Make found neither prebuilt/ nor Guile.  Install Guile

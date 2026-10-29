@@ -16,8 +16,8 @@ doc/summary/        Concise programmer reference (LaTeX); the three PDFs are tra
 doc/examples/       Example Oaklisp programs
 man/man1/           Man page template (oaklisp.1.in)
 resources/          Desktop entry, icon, shell completions (bash, zsh, fish)
-prebuilt/           Prebuilt bootstrap artifacts, on the "master" branch only
-m4/                 Cached AX_* autoconf macros, on the "master" branch only
+prebuilt/           Prebuilt bootstrap artifacts, on the "prebuilt" branch only
+m4/                 Cached AX_* autoconf macros, on the "prebuilt" branch only
 debian/             Debian packaging
 ```
 
@@ -65,7 +65,7 @@ make install
 - `--with-guile[=GUILE]` — Guile 3 for the Guile-hosted Oaklisp in `src/cold-compiler/` (default: search)
 - `--with-readline` — line editing and history on an interactive standard input with GNU readline (default: if found; `src/emulator/lineedit.c`, `--no-line-editing` at run time)
 
-How the world is bootstrapepd is not a configuration decision, so configure.ac does not case off on it. That decision is made at built-time by make (see Bootstrap methods).
+How the world is bootstrapped is not a configuration decision, so configure.ac does not case off on it. That decision is made at build time by make (see Bootstrap methods).
 
 ### Architectures
 
@@ -94,7 +94,7 @@ Targets: `build-from-old-world` (compile and `tool.oak`-link with `$(OAKLISP)` =
 
 - **Compile with a world** (normal dev build): `.oak` → `.oa` with `$(OAK) --world $(OLD_WORLD) -- --locale compiler-locale --load assembler --locale system-locale --target ARCH --outdir . --compile $(srcdir)/NAME` (`--outdir` sets the fluid `#*compiler-output-directory`; `compile-file` also takes an optional output name; a world older than `--outdir` can't be `OLD_WORLD`, and `build-from-old-world` says so). The freshly compiled assembler is preloaded so an older bootstrap world can compile sources using new instructions; `multiproc.oa` also preloads `multi-em`, `file-io.oa` preloads `streams` (for `(%stream-primitive 14)`). A new open-coded primitive used from another file needs the same treatment, otherwise the first-pass world calls it generically and fails.
 - **Prebuilt bytecode**: `.oa` copied from `prebuilt/`, `system-version.oa` included, so the world reports the version the bytecode was compiled with until rebuilt with itself (the copy warns).
-- **Guile**: `src/cold-compiler/oak-bootstrap.scm` compiles everything in one run (`guile.stamp`); it hosts the world's own compiler, so output is byte-identical. It has `--target`, `--load`, `--eval`, and a `scheme-locale` with scheme-macros and scheme loaded (scheme.oak is compiled in scheme-locale, against its own definitions). It cannot run `instruction-table.oak`'s `dump-instruction-table`, so `src/emulator/instr-data.c` (debugging builds only) comes from the world just built, an old world, or `prebuilt/`; `make dist` ships it.
+- **Guile**: `src/cold-compiler/oak-bootstrap.scm` compiles everything in one run (`guile.stamp`); it hosts the world's own compiler, so output is byte-identical. It has `--target`, `--load`, `--eval`. It cannot run `instruction-table.oak`'s `dump-instruction-table`, so `src/emulator/instr-data.c` (debugging builds only) comes from the world just built, an old world, or `prebuilt/`; `make dist` ships it.
 - **Cold link**: `tool.oak`, in the old world or under Guile; both produce byte-identical `.cold` files (symbols laid out in first-seen order).
 
 The compiler reaches a fixpoint: `make check` runs `check-fixpoint`, `check-cold-linkers`, `check-guile-compile` in `src/world`.
@@ -111,8 +111,9 @@ The compiler reaches a fixpoint: `make check` runs `check-fixpoint`, `check-cold
 - **Big-endian works** for both word sizes, native code included (tested under qemu-user; zig makes a no-install cross compiler: `./configure --host=s390x-linux-gnu CC="zig cc -target s390x-linux-musl -std=gnu23 -D_GNU_SOURCE" LDFLAGS=-static`, world built from the host's `.oa` files, and `tests/qemu-native.sh` runs natively compiled programs statically linked into an emulator-carrying executable, since a static binary cannot dlopen). On 64-bit big-endian, instructions live in the *high* 32 bits of each code ref (first in memory order); see `code-vector.oak`, `fasl.oak`, and `read_ref()` in `worldio.c`.
 - **Cold-world files can't contain bignums:** the linkers range-check integer constants against the target fixnum size. Don't write literals ≥ 2^29 in files listed in `COLDFILES`.
 - **Shifts are not constant-folded:** `ash-left`/`ash-right`/`rot-*` wrap modulo the fixnum size, so folding them would make compiled code depend on the compiling host's word size. They deliberately lack `foldable-mixin` (numbers.oak).
-- **Rest args become lists when used as lists:** the expander (`idiosyncratically-grovel` in `expand.oak`, mirrored in `src/cold-compiler/host/translate.scm` so the Guile host stays byte-identical) checks each expanded `%add-method` with a rest name.  If the body uses it only the native way -- passed on at the end of a tail call `(f a . rest)` of the method itself (bodies of LET/LABELS lambdas count as the method itself) or in `(rest-length rest)` -- nothing changes.  Any other use (ordinary variable, non-tail pass-on, inside an inner lambda) wraps the body as `(listify-args (lambda (rest) BODY') . rest)`, with `(f a . rest)` → `(apply f a rest)` and `(rest-length rest)` → `(length rest)` in BODY'.  No system source triggers it, so every world object is unchanged.  A rest name starting with `%` opts out (`dump-stack.oak`).  A `lambda`/`define` body that never passes its rest args on gets the list too; an `add-method` one keeps the compiler's warning (`^super`, the cold `error`, `%push` do that on purpose).  Earlier attempts that listified every rest `lambda` were dropped because they broke `^super`, `exit`, etc. Exception: `scheme.oak`/`scheme-macros.oak` are compiled in `scheme-locale`, whose `add-method` gives dotted lists their R3RS meaning, so code there must be written R3RS-style.
-- **Threads:** `--enable-threads` = `-DTHREADS -DUSE_MARK_SWEEP` (they can't be separated: THREADS without mark-sweep hangs). Experimental: with `--pthreads N` the compiler deadlocks. Costs up to 5× on allocation-heavy code (`format`) even unused; numbers in BUILD.md.
+- **Comparisons are n-ary:** `comparisons.oak` (in MISCFILES, after every file that adds methods to the binary `=`/`<`) replaces `=` `<` `>` `<=` `>=` in their frozen cells with open-coded operations taking two or more arguments: two compile exactly as the binary instructions, more to a chain, and a call as a value (e.g. through `apply`) works too.  `!=` stays binary; methods added to `=`/`<` for new types are binary.
+- **Rest args become lists when used as lists:** the expander (`idiosyncratically-grovel` in `expand.oak`, mirrored in `src/cold-compiler/host/translate.scm` so the Guile host stays byte-identical) checks each expanded `%add-method` with a rest name.  If the body uses it only the native way -- passed on at the end of a tail call `(f a . rest)` of the method itself (bodies of LET/LABELS lambdas count as the method itself) or in `(rest-length rest)` -- nothing changes.  Any other use (ordinary variable, non-tail pass-on, inside an inner lambda) wraps the body as `(listify-args (lambda (rest) BODY') . rest)`, with `(f a . rest)` → `(apply f a rest)` and `(rest-length rest)` → `(length rest)` in BODY'.  No system source triggers it, so no world object is affected.  A rest name starting with `%` opts out (`dump-stack.oak`).  A `lambda`/`define` body that never passes its rest args on gets the list too; an `add-method` one keeps the compiler's warning (`^super`, the cold `error`, `%push` do that on purpose).  Listifying every rest `lambda` regardless of use would break `^super`, `exit`, etc.
+- **Threads:** `--enable-threads` = `-DTHREADS -DUSE_MARK_SWEEP` (they can't be separated: THREADS without mark-sweep segfaults in `control`, `data`, `promises` and `threads.test`; mark-sweep without THREADS fails `promises.test`). Experimental: with `--pthreads N` the compiler deadlocks. Costs up to 5× on allocation-heavy code (`format`) even unused; numbers in BUILD.md.
 
 ## Architecture
 
@@ -151,9 +152,9 @@ The world is built in stages from `.oak` source files:
 
 1. **Cold world** (`new.cold`) — Core runtime linked from COLDFILESD `.oa` files (kernel, types, reader, evaluator, REPL). Linked by `tool.oak`, in the old world or under Guile.
 2. **oakworld-1.bin** — Boot cold world into warm world
-3. **oakworld-2.bin** — Load MISCFILES (macros, bignums, rationals, dev tools)
+3. **oakworld-2.bin** — Load MISCFILES (macros, bignums, rationals, `string->number`, n-ary comparisons, dev tools)
 4. **oakworld-3.bin** — Load COMPFILES (compiler) into `compiler-locale`, then EXPORTFILES (`oaklisp-exports.oak`) into `system-locale`
-5. **oakworld.bin** — Load RNRSFILES (Scheme compatibility) into `scheme-locale`
+5. **oakworld.bin** — oakworld-3.bin set to start in `user-locale`
 
 ### Locales (namespaces)
 
@@ -161,7 +162,6 @@ The world is built in stages from `.oak` source files:
 - `compiler-locale` — Compiler internals; inherits `system-locale`
 - `oaklisp-locale` — No superiors; the user-level subset of `system-locale`, populated by the explicit list in `src/world/oaklisp-exports.oak` (variables share cells and frozen status, macros share expanders). Since macros aren't hygienic, anything an exported macro expands into must be exported too — the file has a section for that.
 - `user-locale` — Inherits `oaklisp-locale` only; the world starts here (the last `--locale` of the `oakworld.bin` stage), so every build and test command that runs a world passes `--locale system-locale` (`tests/testlib.sh`'s `oak` does it for the tests)
-- `scheme-locale` — RnRS Scheme compatibility; inherits `system-locale`
 
 ## File Extensions
 
@@ -401,8 +401,7 @@ files (top-level blocks stay bytecode for the cold linker's
 return-to-noop chaining), a world image built by the normal
 cold-link/boot stages run with `--native-module` for every `.so`, and
 `liboaknat.a` + `oak-runtime-modules.h` for oakc.  Compiler files
-compile in compiler-locale, scheme files in scheme-locale, like
-`COMPILE_ALL`.  The emulator can run that world too, given the
+compile in compiler-locale, like `COMPILE_ALL`.  The emulator can run that world too, given the
 `--native-module` flags (mixed mode, used by the build itself).
 
 Debugging aids: `OAK_RT_TRACE=1` logs the control helpers (throw,
@@ -411,19 +410,18 @@ traps (`NTRAP ...`) in non-FAST builds; `#*native-exclusions` (a list
 of instruction names, or `(all)`) makes the translator escape those
 instructions to the emulator - a bisection aid for mixed mode only.
 
-One multiproc fix came out of this (`force` in multiproc.oak): a
-waiter left in the scheduler queue and resumed later runs the next
-fresh thunk on its own dead stack extent, so a throw out of a forced
-promise body unwinds into garbage; `force` now drains the queue before
-suspending.  Stock bytecode almost never hit it because alarm
-preemption drained the queue first.
+`force` in multiproc.oak drains the scheduler queue before
+suspending: a waiter left in the queue and resumed later would run the
+next fresh thunk on its own dead stack extent, so a throw out of a
+forced promise body would unwind into garbage.  Bytecode rarely meets
+this because alarm preemption tends to drain the queue first.
 
 ## Key Technical Constraints
 
 - **No floating point** — Rationals are used instead
 - **No FFI** — No foreign function interface for calling C from Oaklisp
 - **2 or 4 instructions per ref** — 16-bit bytecodes packed `instructions-per-ref` per ref cell, in memory order (instruction k at bits 16k on little-endian, at the top of the word on big-endian); with bc2 on 64-bit the other 32 bits are unused. The assembler pads inline refs to a ref boundary per `#*target-architecture`; `code-vector.oak` (`%pack-instructions`/`%unpack-instruction`, `nth`, `remap-your-ivars`), `fasl.oak` and `tool.oak` use `%%instructions-per-ref`/`target-instructions-per-ref`; the emulator uses `INSTRS_PER_REF` (config.h) and `INSTR_STRIDE` (slots per ref). Code that runs in the *host* during compilation (`compiler-eval`, macro expanders, the preloaded `old/*.oa`) is always assembled for the host.
-- **`Makefile-vars`** in `src/world/` is auto-generated by `make-makefile.oak` from `files.oak`; regenerate with `make Makefile-vars` after changing `files.oak`. Contains `COLDFILESD` (with interleaved marker files `st`, `da`, `pl`, `do`, `em`), `MISCFILES`, `COMPFILES`, `RNRSFILES`.
+- **`Makefile-vars`** in `src/world/` is auto-generated by `make-makefile.oak` from `files.oak`; regenerate with `make Makefile-vars` after changing `files.oak`. Contains `COLDFILESD` (with interleaved marker files `st`, `da`, `pl`, `do`, `em`), `MISCFILES`, `COMPFILES`, `EXPORTFILES`.
 - **`system-version.oak`** is generated from `system-version.oak.in` by configure (a bytecode bootstrap cannot compile it and uses the prebuilt `system-version.oa` as it is)
 
 ## Running Oaklisp

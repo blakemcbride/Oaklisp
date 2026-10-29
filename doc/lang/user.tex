@@ -65,14 +65,15 @@ The Oaklisp options are
   for \emph{architecture} rather than for the running system (it sets
   \dffl{target-architecture});
 \item[\dfsw{{-}{-}locale} \emph{locale}] evaluate, load and compile the
-  following in \emph{locale}, e.g.\ \df{scheme-locale} or
-  \df{compiler-locale}, rather than \df{system-locale};
+  following in \emph{locale}, e.g.\ \df{system-locale} or
+  \df{compiler-locale}, rather than the current locale (initially
+  \df{user-locale});
 \item[\dfsw{{-}{-}exit}] exit, with a nonzero status if any earlier switch
   failed.
 \end{description}
-For example, to compile a file for Scheme and leave:
+For example, to compile a file in the system locale and leave:
 \begin{verbatim}
-oaklisp -- --locale scheme-locale --compile myfile --exit
+oaklisp -- --locale system-locale --compile myfile --exit
 \end{verbatim}
 
 \op{exit}{[status]}
@@ -143,8 +144,7 @@ All expressions must be evaluated with respect to a particular naming
 environment.  The read-eval-print loop uses the locale specified by
 the fluid variable \df{current-locale}.  The Oaklisp system boots up
 with this variable bound to \df{user-locale}.  Other useful name
-spaces are \df{scheme-locale}, \df{system-locale}, and
-\df{compiler-locale}.
+spaces are \df{system-locale} and \df{compiler-locale}.
 
 Several fluid variables are used to keep a short history of the
 dialogue conducted by the top level evaluator.  The most useful of

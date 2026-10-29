@@ -66,11 +66,9 @@ specify a subtype.
  reserved & font & ascii code & 0 0 0 0 0 0 & 1 0 & character\\ \cline{1-5}
 \end{tabular}
 \end{center}
-Character is currently the only ``other immediate type.''  More may be
-added later, in particular Macintosh handles.  (At one time weak
-pointers were represented as their own immediate type, but they are
-now represented using integers for compatibility with the Scheme
-standard \citep{R3RS}.)
+Character is the only ``other immediate type.''  Weak pointers are
+not immediates; they are represented as integers
+(section~\ref{sec:weak}).
 
 
 \section{Memory Structure}
@@ -235,13 +233,11 @@ means that the assembler must sometimes emit a padding instuction,
 which will be ignored, between instructions that require inline
 arguments and their arguments.
 
-An alternative that was used earlier in the design process was to
-mandate that all instructions requiring inline arguments occur in a
+The alternative would be to mandate that all instructions requiring inline arguments occur in a
 position where the following reference can be fetched without
 realigning the pc.  This requires sometimes inserting a padding
 \texttt{noop} before an instruction that requires an inline argument,
-and
-analysis showed that the time required to process a \df{noop}
+and analysis shows that the time required to process a \df{noop}
 instruction is much greater than the time required to check if the low
 bit of a register is on and increment that register if so.
 
@@ -338,22 +334,10 @@ any flushed stack segment.  When flushing the stack, if the buffer has
 more than that number of references then it is flushed into a number
 of segments.  This provides some hysteresis, speeding \df{call/cc} by
 taking advantage of coherence in its usage patterns.  A possibility
-opened by our stack buffer scheme, which we do not currently exploit,
+opened by our stack buffer scheme, which is not exploited,
 is that of using virtual memory faults to detect stack buffer
 overflows, thus eliminating the overhead of explicitly checking for
 stack overflow and underflow.
-
-As a historical note, an early version did not use a stack buffer but
-instead implemented stacks as linked lists of segments which always
-lived in the heap.  When pushing over the top of a segment, a couple
-references were copied from the top of that segment onto a newly
-allocated segment, providing sufficient hysteresis to prevent repeated
-pushing and poping along a segment boundary from incurring inordinate
-overhead.  Regretably, substantial storage is wasted by the hysteresis
-and the overflow and underflow limits vary dynamically wereas in the
-new system these limits are C link-time constants.  Presumably due to
-these factors, in spite of its old world charm, timing experiments
-between the old system and the new system were definitive.
 
 
 \subsection{Escape Objects} \label{sec:ctagform}

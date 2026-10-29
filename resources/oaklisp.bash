@@ -46,7 +46,7 @@ _oaklisp()
             return ;;
         --locale)
             COMPREPLY=($(compgen -W "system-locale compiler-locale
-                scheme-locale user-locale oaklisp-locale" -- "$cur"))
+                user-locale oaklisp-locale" -- "$cur"))
             return ;;
         --dump-base|--predump-gc|--size-heap|--size-val-stk|--size-cxt-stk|\
         --size-seg-max|--trace-gc|--verbose-gc|--pthreads|--eval)

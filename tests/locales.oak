@@ -33,10 +33,14 @@
 (check "load visible" (not (not (variable? user-locale 'load))) #t)
 (check "eval in user-locale" (eval '(+ 1 2) user-locale) 3)
 
-;;; scheme-locale: R3RS dotted arguments are lists.
-(check "scheme rest args are lists" (eval '(let ((f (lambda (a . rest) (list a rest)))) (f 1 2 3)) scheme-locale) '(1 (2 3)))
-(check "scheme define rest" (block (eval '(define (scheme-test-g . xs) (length xs)) scheme-locale) (eval '(scheme-test-g 1 2 3 4) scheme-locale)) 4)
-(check "scheme inherits system" (eval '(car (list 1)) scheme-locale) 1)
-(check "scheme make-vector" (eval '(vector-length (make-vector 3 'x)) scheme-locale) 3)
-(check "scheme string->number" (eval '(string->number "1234") scheme-locale) 1234)
-(check "scheme n-ary >" (eval '(list (> 3 2 1) (> 3 1 2)) scheme-locale) '(#t ()))
+;;; n-ary comparisons: open coded (direct calls) and as values (apply).
+(check "n-ary < direct" (list (< 1 2 3) (< 1 3 2) (< 1 2)) '(#t () #t))
+(check "n-ary > direct" (list (> 3 2 1) (> 3 1 2) (> 2 1)) '(#t () #t))
+(check "n-ary <= >= =" (list (<= 1 1 2) (<= 1 2 1) (>= 3 3 1) (>= 1 3 3) (= 2 2 2) (= 2 2 3)) '(#t () #t () #t ()))
+(check "n-ary by apply" (list (apply < '(1 2 3 4)) (apply > '(4 3 5)) (apply <= '(1 1)) (apply = '(5 5 5))) '(#t () #t #t))
+(check "n-ary mixed types" (list (< 1 3/2 2 (expt 10 30)) (= #\a #\a #\a) (< "a" "b" "c")) '(#t #t #t))
+(check "n-ary as argument" (sort '(3 1 2) <) '(1 2 3))
+
+;;; string->number
+(check "string->number" (map string->number '("1234" "-17" "+5" "3/4" "#x1F" "#b101" "#e10" "zz" "" "1/0" "-")) '(1234 -17 5 3/4 31 5 10 () () () ()))
+(check "string->number radix" (list (string->number "ff" 16) (string->number "777" 8) (string->number "2" 2)) '(255 511 ()))

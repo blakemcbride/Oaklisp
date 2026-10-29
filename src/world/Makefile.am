@@ -33,7 +33,6 @@ ALLOAFILES += $(COLDFILES)
 ALLOAFILES += $(MISCFILES)
 ALLOAFILES += $(COMPFILES)
 ALLOAFILES += $(EXPORTFILES)
-ALLOAFILES += $(RNRSFILES)
 
 ALLOAFILESNONGEN =
 ALLOAFILESNONGEN += $(TOOLFILES)
@@ -43,7 +42,6 @@ ALLOAFILESNONGEN += $(COLDFILESNONGEN)
 ALLOAFILESNONGEN += $(MISCFILES)
 ALLOAFILESNONGEN += $(COMPFILES)
 ALLOAFILESNONGEN += $(EXPORTFILES)
-ALLOAFILESNONGEN += $(RNRSFILES)
 
 # Bootstrapping.  Oaklisp is written in Oaklisp, so compiling the
 # sources to bytecode and linking the cold world (tool.oak, the
@@ -164,8 +162,7 @@ GUILEHOST = $(top_srcdir)/src/cold-compiler/oak-bootstrap.scm	\
 GUILEOBJS = $(ALLOAFILES)
 GUILESRCS = $(COLDFILESNONGEN:.oa=) ./system-version $(MISCFILES:.oa=)	\
   $(EXPORTFILES:.oa=) $(TOOLFILES:.oa=) $(FILESFILES:.oa=)		\
-  $(MAKEMAKEFILES:.oa=) --locale compiler-locale $(COMPFILES:.oa=)	\
-  --locale scheme-locale $(RNRSFILES:.oa=)
+  $(MAKEMAKEFILES:.oa=) --locale compiler-locale $(COMPFILES:.oa=)
 
 ##### Compiling
 
@@ -312,14 +309,9 @@ oakworld-3.bin: oakworld-2.bin $(COMPFILES) $(EXPORTFILES)
 
 # The world starts in user-locale; everything above and below that
 # runs a world names the locale it needs.
-oakworld.bin: oakworld-3.bin $(RNRSFILES)
+oakworld.bin: oakworld-3.bin
 	$(OAKBOOT) $(OAKFLAGS) --world oakworld-3.bin --dump $@ \
-	  -- \
-	  --eval '(define-instance scheme-locale locale (list system-locale))'\
-	  --eval "(export-symbol system-locale oaklisp-locale 'scheme-locale)" \
-	  --locale scheme-locale \
-	  $(foreach f, $(RNRSFILES:.oa=),--load $(f)) \
-	  --locale user-locale --exit
+	  -- --locale user-locale --exit
 
 ##### Rebuilding the world with itself
 
@@ -366,12 +358,10 @@ clean-world:
 # native-compiler.oak), so a file's code proper is all native.
 
 NATDIR = native
-NATWORLDFILES = $(COLDFILES) $(MISCFILES) $(COMPFILES) $(EXPORTFILES) \
- $(RNRSFILES)
+NATWORLDFILES = $(COLDFILES) $(MISCFILES) $(COMPFILES) $(EXPORTFILES)
 # Each file compiles in its own locale, as COMPILE_ALL does below.
 NATLOCALE = system-locale
 $(addprefix $(NATDIR)/,$(COMPFILES)): NATLOCALE = compiler-locale
-$(NATDIR)/scheme.oa $(NATDIR)/scheme-macros.oa: NATLOCALE = scheme-locale
 
 # Every module built so far (a file all of whose code is top level has
 # none); registering more than a world uses is harmless.
@@ -420,15 +410,10 @@ $(NATDIR)/oakworld-3.bin: $(NATDIR)/oakworld-2.bin $(addprefix $(NATDIR)/,$(COMP
 	   $(foreach f, $(EXPORTFILES:.oa=),--load $(f)) \
 	   --exit
 
-$(NATDIR)/oakworld.bin: $(NATDIR)/oakworld-3.bin $(addprefix $(NATDIR)/,$(RNRSFILES))
+$(NATDIR)/oakworld.bin: $(NATDIR)/oakworld-3.bin
 	cd $(NATDIR) && \
 	$(OAKBOOT) $(OAKFLAGS) $(NATMODS) --world oakworld-3.bin --dump oakworld.bin \
-	  -- \
-	  --eval '(define-instance scheme-locale locale (list system-locale))'\
-	  --eval "(export-symbol system-locale oaklisp-locale 'scheme-locale)" \
-	  --locale scheme-locale \
-	  $(foreach f, $(RNRSFILES:.oa=),--load $(f)) \
-	  --locale user-locale --exit
+	  -- --locale user-locale --exit
 
 RANLIB = @RANLIB@
 
@@ -473,7 +458,6 @@ clean-native-world:
 COMPILE_ALL = for f in $$files; do \
 	  loc="--locale system-locale"; \
 	  case " $(COMPFILES:.oa=) " in *" $$f "*) loc="--locale compiler-locale";; esac; \
-	  case " $(RNRSFILES:.oa=) " in *" $$f "*) loc="--locale scheme-locale";; esac; \
 	  case $$f in system-version) src=$(abs_builddir)/$$f;; *) src=$(abs_srcdir)/$$f;; esac; \
 	  $(OAKBOOT) $(OAKFLAGS) $$mods --world $$world \
 	    -- $$loc --target $$target --outdir . --compile $$src --exit > $$f.log 2>&1 \

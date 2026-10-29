@@ -175,6 +175,8 @@
     rounding
     lazy-cons
     math
+    comparisons
+    string-number
     trace
     apropos
     time
@@ -210,9 +212,6 @@
     ))
 
 (define batch-compiler-files '(batch-compiler))
-
-(define scheme-files '(;;scheme-upgrade
-		       scheme scheme-macros))
 
 ;; On machines that make programs handle backspace, load "streams-bs"
 ;; into the world.  It depends on continuations, so don't put it into

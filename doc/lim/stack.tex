@@ -118,12 +118,10 @@ frames, which each have four values, as shown below.  The \df{push-cxt}
 instruction pushes a context frame onto the context stack.  It takes
 an inline argument, which is the relative address of the desired
 return point.  This allows a context to be pushed whenever convenient,
-perhaps before the assembly of arguments begins.  Earlier in the
-implementation process there was only one variant of the \df{funcall}
-instruction, which was tail recursive.  Non tail recursive calls were
-compiled as a \df{push-cxt} followed by a \df{funcall-tail}, but
-because this sequence occured so frequently a combined instruction was
-implemented to improve code density.
+perhaps before the assembly of arguments begins.  A non tail
+recursive call could be compiled as a \df{push-cxt} followed by a
+\df{funcall-tail}, but because this sequence occurs so frequently there
+is a combined instruction, \df{funcall-cxt}, to improve code density.
 
 \begin{stackphoto}\hline
   \tt \df{pc}  \\ \hline

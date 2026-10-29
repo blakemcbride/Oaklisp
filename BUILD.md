@@ -26,9 +26,9 @@ fixnums.  Oaklisp is self-hosting, so the build has to bootstrap
 somehow (see Bootstrapping below); make picks the first of these
 that it finds:
 
-- a world image in prebuilt/ (the "master" branch has it), or
+- a world image in prebuilt/ (the "prebuilt" branch has it), or
   prebuilt bytecode there: nothing beyond a C compiler is needed;
-- Guile 3: builds from source alone, which is how the "devel" branch
+- Guile 3: builds from source alone, which is how the "main" branch
   and release tarballs -- neither of which carries prebuilt/ -- are
   built.  Takes a quarter of a minute longer.
 
@@ -78,9 +78,9 @@ The world is built in stages from .oak source files:
 
 	new.cold        Cold world (core runtime)
 	oakworld-1.bin  Warm boot
-	oakworld-2.bin  + macros, bignums, rationals, I/O
-	oakworld-3.bin  + compiler (in compiler-locale)
-	oakworld.bin    + Scheme compatibility (in scheme-locale)
+	oakworld-2.bin  + macros, bignums, rationals, I/O, development tools
+	oakworld-3.bin  + compiler (in compiler-locale), oaklisp-locale exports
+	oakworld.bin    the same, set to start in user-locale
 
 Architectures
 =============
@@ -91,7 +91,7 @@ From Oaklisp's point of view a machine is characterized by
   determines the fixnum range (30 or 62 bits);
 * the number of 16-bit instructions packed into each reference in a
   code vector: 2 with 32-bit references, and by default 4 with 64-bit
-  ones (--with-instructions-per-ref=2 gives the older packing, in
+  ones (--with-instructions-per-ref=2 gives the 32-bit packing, in
   which the other half of each 64-bit reference is unused; it is
   slower, see below, but its bytecode is usable on 32-bit machines).
 * the byte order, which matters only for binary world images and the
@@ -134,9 +134,9 @@ World headers also record how many characters are packed into each
 word of a string: 7 with 64-bit references, 3 with 32-bit ones
 (a header without the field means 3).
 
-Files without a header (from before this scheme) are accepted and
-assumed to be bc2 bytecode, or, for binary worlds, are identified by
-their old magic bytes.
+Files without a header are accepted and assumed to be bc2 bytecode,
+or, for binary worlds, are identified by their magic bytes (four
+\002 or \004 bytes, giving the reference size).
 
 An emulator built for one packing can compile bytecode for the
 other, and can link and boot a world for it; only running it needs an
@@ -187,13 +187,13 @@ From source alone, with Guile 3: the Guile-hosted Oaklisp in
 src/cold-compiler/ loads the world's own macros and compiler from the
 .oak sources and runs them, so the .oa objects, and the cold world
 (via tool.oak), come straight from the sources.  This is what the
-"devel" branch and the release tarballs made by "make dist" rely on,
+"main" branch and the release tarballs made by "make dist" rely on,
 since neither carries prebuilt/; it is also how the Debian package is
 built.  Nothing is lost by it: the compiler is deterministic, so the
 objects are byte for byte what a native Oaklisp produces.
 
-With prebuilt material: the prebuilt/ directory, kept on the "master"
-branch of the git repository (not on "devel", and not in tarballs),
+With prebuilt material: the prebuilt/ directory, kept on the "prebuilt"
+branch of the git repository (not on "main", and not in tarballs),
 holds two kinds of bootstrap material, arranged by architecture:
 
 	prebuilt/src/world/bc2-32/*.oa          compiled bytecode, for bc2 systems
@@ -412,7 +412,7 @@ Troubleshooting
     Make found neither an old world, nor prebuilt bytecode, nor
     Guile 3.  Install Guile 3 (guile-3.0; or point configure at one
     with --with-guile=PATH) to build from source alone, or get the
-    prebuilt/ directory from the "master" branch, or name an
+    prebuilt/ directory from the "prebuilt" branch, or name an
     installed world: make OLD_WORLD=/usr/lib/oaklisp/oakworld.bin
     (with OAKLISP=PATH if the emulator being built cannot run it).
 

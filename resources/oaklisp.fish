@@ -51,6 +51,6 @@ complete -c oaklisp -n $after -l compile -x -a '(__oaklisp_oak_files)' -d 'compi
 complete -c oaklisp -n $after -l compile-native -x -a '(__oaklisp_oak_files)' -d 'compile file.oak to file.oa and C in file.so'
 complete -c oaklisp -n $after -l outdir -x -a '(__fish_complete_directories)' -d 'directory for later --compile output'
 complete -c oaklisp -n $after -l target -x -a 'bc2-32 bc2-64 bc4-64' -d 'architecture to compile for'
-complete -c oaklisp -n $after -l locale -x -a 'system-locale compiler-locale scheme-locale user-locale oaklisp-locale' -d 'switch to a locale'
+complete -c oaklisp -n $after -l locale -x -a 'system-locale compiler-locale user-locale oaklisp-locale' -d 'switch to a locale'
 complete -c oaklisp -n $after -l pthreads -x -d 'spawn N native threads'
 complete -c oaklisp -n $after -l exit -d 'exit after processing this option'

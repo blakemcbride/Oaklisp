@@ -1,0 +1,84 @@
+;;; This file is part of Oaklisp.
+;;;
+;;; This program is free software; you can redistribute it and/or modify
+;;; it under the terms of the GNU General Public License as published by
+;;; the Free Software Foundation; either version 2 of the License, or
+;;; (at your option) any later version.
+;;;
+;;; This program is distributed in the hope that it will be useful,
+;;; but WITHOUT ANY WARRANTY; without even the implied warranty of
+;;; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+;;; GNU General Public License for more details.
+;;;
+;;; The GNU GPL is available at http://www.gnu.org/licenses/gpl.html
+;;; or from the Free Software Foundation, 59 Temple Place - Suite 330,
+;;; Boston, MA 02111-1307, USA
+
+
+;;; Copyright (C) 1988 Barak A. Pearlmutter & Kevin J. Lang
+
+;;; The numeric comparisons = < > <= >= take two or more arguments:
+;;; (< x1 x2 x3 ...) is true when each adjacent pair is in order.
+;;;
+;;; Each replaces the binary operation of its name, defined in
+;;; numbers.oak, which it calls on each pair.  It is open coded: two
+;;; arguments compile to the instructions the binary operation's do,
+;;; and more to a chain.  Arguments arrive on the stack with the first
+;;; one on top (the last one, for > and <=, whose arguments are pushed
+;;; backwards), so each step copies the top two, compares them and
+;;; drops one; a comparison that fails branches into a chain of pops
+;;; that unwinds whatever is left, so every exit leaves exactly one
+;;; value where the n arguments were.  Comparing adjacent pairs from
+;;; either end gives the same answer, so the chain needs no change for
+;;; backwards arguments.
+;;;
+;;; This file must be loaded after every file that adds methods to the
+;;; binary = and <.
+
+(define (%n-ary-comparison name binary-op binary-code mixins)
+  (let ((op
+	 (make-fancy-open-coded-operation
+	  mixins
+	  (lambda (n)
+	    (cond
+	     ((< n 2)
+	      (error "~A requires at least two arguments." name))
+	     ((= n 2) (copy binary-code))
+	     (else
+	      (let ((fails (map (lambda (i) (generate-symbol 'cmp-fail))
+				(iota (- n 1))))
+		    (done (generate-symbol 'cmp-done)))
+		(append
+		 (splice (map (lambda (lab)
+				`((load-stk 1)
+				  (load-stk 1)
+				  ,@(copy binary-code)
+				  (branch-nil ,lab)
+				  (pop 1)))
+			      fails))
+		 `((pop 1) (load-imm #t) (branch ,done))
+		 (splice (map (lambda (lab) `((label ,lab) (pop 1)))
+			      fails))
+		 `((pop 1) (load-imm ()) (label ,done)))))))
+	  nil 1)))
+    (add-method (op (object) x y . args)
+      (cond ((zero? (rest-length args)) (binary-op x y))
+	    ((op x y) (op y . args))
+	    (else (consume-args #f . args))))
+    op))
+
+;;; The new operation goes into the existing cell, which oaklisp-locale
+;;; shares, and the cell stays frozen, so the compiler open codes it.
+
+(let ((install
+       (lambda (sym op)
+	 (set! (contents (variable-here? #*current-locale sym)) op))))
+  (install '=  (%n-ary-comparison "="  =  '((=)) (list foldable-mixin)))
+  (install '<  (%n-ary-comparison "<"  <  '((<)) (list foldable-mixin)))
+  (install '>  (%n-ary-comparison ">"  >  '((<))
+				  (list foldable-mixin backwards-args-mixin)))
+  (install '>= (%n-ary-comparison ">=" >= '((<) (not)) (list foldable-mixin)))
+  (install '<= (%n-ary-comparison "<=" <= '((<) (not))
+				  (list foldable-mixin backwards-args-mixin))))
+
+;;; eof

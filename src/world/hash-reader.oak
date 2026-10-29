@@ -114,7 +114,6 @@
 	(read stream))))
 
 (set! (feature? 'oaklisp) #t)
-(set! (feature? 'scheme) #t)
 
 
 (define-hash-macro-char #\C

@@ -44,9 +44,10 @@ to be loaded.  At this point the world is dumped, and then it is
 booted and has the remaining files loaded into it using the normal
 file loading mechanisms, in stages: first the rest of the runtime
 (macros, bignums, rationals, development tools), then the compiler
-into \df{compiler-locale}, then the Scheme compatibility files into
-\df{scheme-locale}, until the full Oaklisp world, \df{oakworld.bin},
-is built.
+into \df{compiler-locale} together with the exports that populate
+\df{oaklisp-locale}, and finally the starting locale is set to
+\df{user-locale} and the full Oaklisp world, \df{oakworld.bin}, is
+dumped.
 
 The two steps that need a running Oaklisp can each be done in three
 ways, and the build system (see \df{BUILD.md}) picks the first that
@@ -54,13 +55,13 @@ is possible from what is at hand:
 \begin{itemize}
 \item with an \emph{old world}: an existing world image, run by the
   emulator just built, compiles the sources and runs \df{tool.oak}.
-  The old world may be older than the sources: the freshly compiled
+  The old world need not match the sources: the freshly compiled
   assembler, and anything else the sources need that it lacks, is
   loaded into it first.  It may also be for another architecture,
   since a system can generate code for any architecture
   (section~\ref{sec:architectures}), although what is loaded into it
   is compiled for it.
-\item from \emph{prebuilt bytecode}: object files compiled earlier,
+\item from \emph{prebuilt bytecode}: object files compiled beforehand,
   which are portable between architectures of the same instruction
   packing, linked by \df{tool.oak} running in the host below;
 \item from source alone, with a \emph{Guile-hosted} Oaklisp: enough

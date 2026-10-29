@@ -371,12 +371,12 @@ Function & Description \\\hline
 (even? n) & \\
 (negative? n) & \\
 (positive? n) & \\
-(= a b) & \\
-(!= a b) & \\
-(\verb+<+ a b) & \\
-(\verb+>+ a b) & \\
-(\verb+<+= a b) & \\
-(\verb+>+= a b) & \\
+(= a b c ...) & true when each adjacent pair is in order \\
+(!= a b) & exactly two arguments \\
+(\verb+<+ a b c ...) & \\
+(\verb+>+ a b c ...) & \\
+(\verb+<+= a b c ...) & \\
+(\verb+>+= a b c ...) & \\
 \hline
 \end{tabular}}
 
@@ -404,6 +404,7 @@ Function & Description \\\hline
 (min a b c ...) & \\
 (numerator f) & \\
 (denominator f) & \\
+(string->number s [radix]) & number spelled by \emph{s}, or \#f \\
 \hline
 \end{tabular}}
 
@@ -417,13 +418,13 @@ Function & Description \\\hline
 \hbox{\begin{tabular}{|l|l|}\hline
 Function & Description \\\hline
 (string? s) & is \emph{s} a string \\
-(= a b) & \\
+(= a b c ...) & \\
 (equal? a b) & \\
 (!= a b) & \\
-(\verb+<+ a b) & \\
-(\verb+>+ a b) & \\
-(\verb+<+= a b) & \\
-(\verb+>+= a b) & \\
+(\verb+<+ a b c ...) & \\
+(\verb+>+ a b c ...) & \\
+(\verb+<+= a b c ...) & \\
+(\verb+>+= a b c ...) & \\
 \hline
 \end{tabular}}
 
@@ -514,7 +515,6 @@ system-locale & everything: the language and its implementation \\
 oaklisp-locale & the user-level subset of system-locale; no superiors \\
 user-locale & inherits oaklisp-locale only (the default) \\
 compiler-locale & compiler internals; inherits system-locale \\
-scheme-locale & RnRS Scheme compatibility; inherits system-locale \\
 \hline
 \end{tabular}}
 
@@ -528,7 +528,7 @@ scheme-locale & RnRS Scheme compatibility; inherits system-locale \\
     (compile-file my-locale "myfile") ; compile relative to a locale
     (set! #*current-locale my-locale) ; switch the top-level locale
 
-    oaklisp -- --locale scheme-locale ; start in a locale
+    oaklisp -- --locale system-locale ; start in a locale
 \end{alltt}
 
 \hbox{\begin{tabular}{|l|l|}\hline

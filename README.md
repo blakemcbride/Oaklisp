@@ -42,21 +42,24 @@ is described in the included documentation, and also in
 
 See BUILD.md for instructions on how to build the system.
 
-Recent Changes
---------------
+Features of this implementation
+-------------------------------
 
-These made extensive use of claude code. The hard ones were done by
+Much of this was developed with extensive use of Claude Code; the
+hard parts were done by
 [Blake McBride]( https://blakemcbride.com ) <blake@mcbridemail.com>
 and then reworked/extended by BAP.
 
-1. Port from 32-bit to 64-bit
-2. Bug fixes
-3. Added the ability to dump a world without exiting
-4. Added the ability to load a world at runtime (see Dump.md)
-5. Added full support for native threads (green threads were already supported)
-6. Added a concurrent GC
-7. (Optional) bootstrap from source and Guile scheme: no preexisting
-    oaklisp or prebuilt world or precompiled .oa files.
+1. Native 64-bit as well as 32-bit builds, either byte order
+2. Dumping a world without exiting, and loading a world at runtime
+   (see Dump.md)
+3. Native threads alongside green threads (see Threads.md,
+   Native-Threads.md), with a concurrent mark-sweep GC (see GC.md)
+4. A native compiler from Oaklisp to C: mixed-mode native code in the
+   running world, and stand-alone executables with oakc (see
+   Compiler.md)
+5. (Optional) bootstrap from source with Guile Scheme: no preexisting
+   oaklisp, prebuilt world or precompiled .oa files needed.
 
 This repo is located at:  https://github.com/barak/oaklisp
 
