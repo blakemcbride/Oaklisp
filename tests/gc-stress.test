@@ -1,0 +1,58 @@
+#!/bin/sh
+# The collectors under load (GC.md): gc-stress.oak allocates lists,
+# vectors, bignums, closures, continuations, weak pointers and hash
+# tables and writes old objects, on four OS threads at once when the
+# emulator has threads, under a heap small enough (--size-heap 256)
+# that it collects all the time, and verifies the data afterwards.
+# It runs as bytecode, compiled natively (mixed mode), and as
+# stand-alone executables in every mode oakc has, when the native
+# runtime exists; every run reports its pauses and stalls
+# (--gc-stats), kept in the log.
+. "$(dirname "$0")/testlib.sh"
+heap=256
+want=33
+status=0
+rm -rf gc-stress && mkdir gc-stress && cd gc-stress || exit 99
+cp "$testdir/gc-stress.oak" .
+
+# report NAME OUTPUT-FILE EXIT-STATUS
+report() {
+  passes=$(grep -c '^PASS' "$2")
+  fails=$(grep -c '^FAIL' "$2")
+  errors=$(grep -c "An error occurred\|^Error:\|^\*\*\* " "$2")
+  echo "$1: exit $3, $passes passed, $fails failed, $errors errors"
+  grep '^; GC: ' "$2" | tail -n 1 | sed 's/^; /    /'
+  test "$3" = 0 && test "$fails" = 0 && test "$errors" = 0 && test "$passes" = $want \
+    || { tail -5 "$2"; status=1; }
+}
+
+timeout 900 "$OAKLISP" --batch --size-heap $heap --gc-stats --world "$OAKWORLD" -- \
+  --locale system-locale --load gc-stress --exit > bytecode.out 2>&1
+report bytecode bytecode.out $?
+
+oak -- --compile-native gc-stress --exit > compile.log 2>&1
+if test -f gc-stress.so; then
+  timeout 900 "$OAKLISP" --batch --size-heap $heap --gc-stats --world "$OAKWORLD" -- \
+    --locale system-locale --load gc-stress --exit > native.out 2>&1
+  report "mixed native" native.out $?
+else
+  echo "no native module built; the mixed-mode run is skipped"
+fi
+
+OAKC=$top_builddir/oakc
+if test -x "$OAKC" && test -f "$top_builddir/src/world/native/liboaknat.a"; then
+  for mode in plain -w --ir --interpreter; do
+    case $mode in plain) flags=;; *) flags=$mode;; esac
+    exe=gc-stress$mode-x
+    if "$OAKC" $flags gc-stress.oak -o "$exe" > "oakc$mode.log" 2>&1; then
+      OAKLISP_OPTIONS="--size-heap $heap --gc-stats" OAKWORLD=/nonexistent \
+	timeout 900 "./$exe" > "$exe.out" 2>&1
+      report "oakc $mode" "$exe.out" $?
+    else
+      cat "oakc$mode.log"; echo "oakc $flags failed"; status=1
+    fi
+  done
+else
+  echo "no native runtime (make -C src/world native-world); the executables are skipped"
+fi
+exit $status

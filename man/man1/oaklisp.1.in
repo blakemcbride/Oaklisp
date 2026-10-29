@@ -85,6 +85,11 @@ maximum flushed segment len, n is in refs
 .B \-\-verbose-gc v
 synonym for \-\-trace-gc
 .TP
+.B \-\-gc-stats
+report the garbage collector's pauses and stalls at exit (count,
+total, mean, maximum, percentiles and a histogram per kind; also at
+\-\-trace-gc 3)
+.TP
 .B \-\-trace-traps
 .TP
 .B \-\-batch
@@ -199,6 +204,12 @@ from 0 to 255.
 .SH ENVIRONMENT
 The environment variable OAKWORLD will override the default compiled
 into the executable, but itself can be overridden on the command line.
+
+The environment variable OAKLISP_OPTIONS holds emulator options, as
+they would be written on the command line before the "\-\-", for a
+program whose command line is not the user's to write, a stand-alone
+executable above all: OAKLISP_OPTIONS='\-\-size-heap 4096 \-\-gc-stats'.
+They go in front of the command line's own.
 
 .SH FILES
 @pkglibdir@/oakworld.bin holds the world image.  It is portable

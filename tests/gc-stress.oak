@@ -1,0 +1,247 @@
+;;; GC stress (GC.md, GCEnhancements.md Phase 0): the kinds of object
+;;; the collectors treat specially -- lists, vectors, bignums,
+;;; closures, continuations, weak pointers, hash tables -- allocated
+;;; and verified by several OS threads at once (one thread without
+;;; threads), while old objects made before the work are written to
+;;; point at new ones, under a heap small enough that collections are
+;;; frequent: gc-stress.test runs it with --size-heap 256 as bytecode,
+;;; compiled natively, and as stand-alone executables in every mode
+;;; oakc has, each run reporting its pauses (--gc-stats).  Each worker
+;;; prints PASS or FAIL per kind of work; what it checks is what a
+;;; collector that freed a live object, moved one without fixing a
+;;; reference, or missed a store would get wrong.
+
+(define (check name got expected)
+  (if (equal? got expected)
+      (format #t "PASS ~A~%" name)
+      (format #t "FAIL ~A: got ~S expected ~S~%" name got expected))
+  (flush standard-output))
+
+(set! #*print-length #f)
+(set! #*print-level #f)
+
+(define gc-workers 4)
+(define gc-rounds 5)
+
+(define (gc-iota n)
+  (let loop ((i (- n 1)) (l '()))
+    (if (< i 0) l (loop (- i 1) (cons i l)))))
+
+;; Allocate N conses, keeping almost none.
+(define (churn n)
+  (let loop ((i 0) (l '()))
+    (if (= i n)
+	(length l)
+	(loop (+ i 1) (cons i (if (= (remainder i 100) 0) '() l))))))
+
+;; Old objects: made before any worker starts, so by the time they
+;; are written they have survived collections, or are part of the
+;; baked image.  Each worker owns a region of the vector and of the
+;; cells; the table is shared, under its mutex.
+(define old-size 4096)
+(define old-vector (make simple-vector old-size))
+(define old-cells (make simple-vector old-size))
+(dotimes (i old-size)
+  (set! (nth old-vector i) i)
+  (set! (nth old-cells i) (cons i i)))
+(define old-table (make-equal-hash-table))
+(define old-lock (make mutex))
+
+;; Lists: build, reverse, append, then count and sum.
+(define (work-lists k)
+  (let* ((n 20000)
+	 (l (map (lambda (i) (cons i (* i k))) (gc-iota n)))
+	 (a (append l (reverse l))))
+    (let loop ((x a) (s 0) (c 0))
+      (if (null? x)
+	  (and (= c (* 2 n)) (= s (* k n (- n 1))))
+	  (loop (cdr x) (+ s (cdr (car x))) (+ c 1))))))
+
+;; Vectors: a vector of vectors holding conses and fixnums, checked
+;; slot by slot, several times over.
+(define (work-vectors k)
+  (let ((n 64))
+    (let rep ((r 0) (ok #t))
+      (if (= r 10)
+	  ok
+	  (let ((outer (make simple-vector n)))
+	    (dotimes (i n)
+	      (let ((inner (make simple-vector n)))
+		(dotimes (j n)
+		  (set! (nth inner j) (if (odd? j) (cons i j) (+ i j k))))
+		(set! (nth outer i) inner)))
+	    (churn 3000)
+	    (rep (+ r 1)
+		 (and ok
+		      (let loop ((i 0) (ok #t))
+			(if (= i n)
+			    ok
+			    (loop (+ i 1)
+				  (and ok
+				       (let ((inner (nth outer i)))
+					 (let inner-loop ((j 0) (ok #t))
+					   (if (= j n)
+					       ok
+					       (inner-loop
+						(+ j 1)
+						(and ok
+						     (let ((x (nth inner j)))
+						       (if (odd? j)
+							   (and (pair? x) (= (car x) i) (= (cdr x) j))
+							   (= x (+ i j k))))))))))))))))))))
+
+;; Bignums: a geometric sum, computed term by term and in closed form.
+(define (pow b n)
+  (let loop ((i 0) (acc 1))
+    (if (= i n) acc (loop (+ i 1) (* acc b)))))
+
+(define (geometric b n)
+  (let loop ((i 1) (sum 0))
+    (if (> i n) sum (loop (+ i 1) (+ sum (pow b i))))))
+
+(define (work-bignums k)
+  (let* ((b (+ k 2))
+	 (n 300)
+	 (sum (geometric b n))
+	 (closed (quotient (* b (- (pow b n) 1)) (- b 1))))
+    (and (= sum closed) (> sum (pow b n)))))
+
+;; Closures: each captures its index, and is called after all were made.
+(define (work-closures k)
+  (let* ((n 5000)
+	 (fs (map (lambda (i) (lambda (x) (+ x i k))) (gc-iota n))))
+    (churn 5000)
+    (let loop ((fs fs) (s 0))
+      (if (null? fs)
+	  (= s (+ (quotient (* n (- n 1)) 2) (* n k)))
+	  (loop (cdr fs) (+ s ((car fs) 0)))))))
+
+;; Continuations: an escape out of a deep allocating loop, and
+;; re-entry into a continuation taken before much allocation.
+(define (work-continuations k)
+  (let ((escaped
+	 (call/cc (lambda (out)
+		    (let loop ((i 0) (l '()))
+		      (if (= i 5000)
+			  (out (length l))
+			  (loop (+ i 1) (cons (list i k) l)))))))
+	(n 0)
+	(sum 0)
+	(back #f))
+    (call/cc (lambda (c) (set! back c)))
+    (set! n (+ n 1))
+    (set! sum (+ sum (length (map (lambda (i) (cons i n)) (gc-iota 3000)))))
+    (if (< n 4) (back #f))
+    (and (= escaped 5000) (= n 4) (= sum 12000))))
+
+;; Weak pointers: the handles of objects that stay alive still
+;; dereference to them after collections; those of garbage are
+;; dereferenced too, for the table's sake.
+(define (work-weak k)
+  (let* ((kept (map (lambda (i) (list 'kept k i)) (gc-iota 50)))
+	 (handles (map object-hash kept))
+	 (temps (map (lambda (i) (object-hash (list 'temp i))) (gc-iota 500))))
+    (churn 20000)
+    (dolist (h temps) (object-unhash h))
+    (let loop ((ks kept) (hs handles) (ok #t))
+      (if (null? ks)
+	  ok
+	  (loop (cdr ks) (cdr hs)
+		(and ok (eq? (object-unhash (car hs)) (car ks))))))))
+
+;; Hash tables: one of the worker's own with string keys, and the
+;; shared old table, written under its mutex.
+(define (work-tables k)
+  (let ((t (make-equal-hash-table))
+	(n 2000))
+    (dotimes (i n)
+      (set! (table-entry t (format #f "key-~D-~D" k i)) (list i k)))
+    (dotimes (i 200)
+      (with-mutex old-lock
+	(set! (table-entry old-table (format #f "shared-~D-~D" k i)) (cons k i))))
+    (churn 5000)
+    (let loop ((i 0) (ok #t))
+      (if (= i n)
+	  ok
+	  (loop (+ i 1)
+		(and ok (equal? (table-entry t (format #f "key-~D-~D" k i))
+				(list i k))))))))
+
+;; Old objects: the worker's region of the old vector and cells gets
+;; fresh objects, over and over, with allocation between; then every
+;; slot must hold what was stored last.
+(define (work-mutation k)
+  (let* ((per (quotient old-size gc-workers))
+	 (from (* k per))
+	 (to (+ from per))
+	 (reps 10))
+    (dotimes (rep reps)
+      (let loop ((i from))
+	(if (< i to)
+	    (block
+	      (set! (nth old-vector i) (list rep i k))
+	      (let ((cell (nth old-cells i)))
+		(set! (car cell) (list rep i))
+		(set! (cdr cell) (cons k rep)))
+	      (loop (+ i 1)))))
+      (churn 5000))
+    (let loop ((i from) (ok #t))
+      (if (= i to)
+	  ok
+	  (loop (+ i 1)
+		(and ok
+		     (equal? (nth old-vector i) (list (- reps 1) i k))
+		     (let ((cell (nth old-cells i)))
+		       (and (equal? (car cell) (list (- reps 1) i))
+			    (equal? (cdr cell) (cons k (- reps 1)))))))))))
+
+(define work-kinds
+  (list (cons 'lists work-lists)
+	(cons 'vectors work-vectors)
+	(cons 'bignums work-bignums)
+	(cons 'closures work-closures)
+	(cons 'continuations work-continuations)
+	(cons 'weak work-weak)
+	(cons 'tables work-tables)
+	(cons 'mutation work-mutation)))
+
+;; Every kind, GC-ROUNDS times: per kind, whether every round was right.
+(define (worker k)
+  (map (lambda (kind)
+	 (cons (car kind)
+	       (let loop ((r 0) (ok #t))
+		 (if (= r gc-rounds)
+		     ok
+		     (loop (+ r 1) (and ((cdr kind) k) ok))))))
+       work-kinds))
+
+(define (run-workers)
+  (let ((ks (gc-iota gc-workers)))
+    (if (and (%threads-enabled?) (> gc-workers 1))
+	(map thread-join
+	     (map (lambda (k) (make-thread (lambda () (worker k)))) ks))
+	(map worker ks))))
+
+(let loop ((rs (run-workers)) (k 0))
+  (if (not (null? rs))
+      (block
+	(dolist (r (car rs))
+	  (check (format #f "~A ~D" (car r) k) (cdr r) #t))
+	(loop (cdr rs) (+ k 1)))))
+
+(check "shared table"
+       (let loop ((k 0) (ok #t))
+	 (if (= k gc-workers)
+	     ok
+	     (loop (+ k 1)
+		   (and ok
+			(let inner ((i 0) (ok #t))
+			  (if (= i 200)
+			      ok
+			      (inner (+ i 1)
+				     (and ok
+					  (equal? (table-entry
+						   old-table
+						   (format #f "shared-~D-~D" k i))
+						  (cons k i))))))))))
+       #t)

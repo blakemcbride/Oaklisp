@@ -31,6 +31,7 @@
 #include "xmalloc.h"
 #include "stacks.h"
 #include "gc.h"
+#include "gc-stats.h"
 #include "native.h"
 #ifdef USE_MARK_SWEEP
 #include "gc-ms.h"
@@ -468,12 +469,14 @@ gc(bool pre_dump, bool full_gc, char *reason, size_t amount)
   long old_taken;
   long old_spatic_taken;
   ref_t *p;
+  gc_timer_t pause;
 #ifdef THREADS
   bool ready=false;
   int my_index;
   int gc_thread_count;
   int i;
   int *my_index_p;
+  gc_timer_t handshake;
 
 #ifdef USE_MARK_SWEEP
   /* When called from ms_collect during a concurrent GC cycle,
@@ -482,12 +485,15 @@ gc(bool pre_dump, bool full_gc, char *reason, size_t amount)
     my_index_p = oak_tls_get(index_key);
     my_index = *my_index_p;
     gc_thread_count = next_index;
+    gc_stats_begin(&pause, GC_EV_COPY);
   } else {
 #endif
     my_index_p = oak_tls_get(index_key);
     my_index = *my_index_p;
     gc_ready[my_index] = 1;
     set_gc_flag (true);
+    gc_stats_begin(&pause, GC_EV_COPY);
+    gc_stats_begin(&handshake, GC_EV_HANDSHAKE);
     /* Snapshot next_index so thread creation during GC cannot cause
        us to read uninitialized gc_ready[] slots. */
     gc_thread_count = next_index;
@@ -505,9 +511,12 @@ gc(bool pre_dump, bool full_gc, char *reason, size_t amount)
 	}
       }
     }
+    gc_stats_end(&handshake, GC_EV_HANDSHAKE, reason);
 #ifdef USE_MARK_SWEEP
   }
 #endif
+#else
+  gc_stats_begin(&pause, GC_EV_COPY);
 #endif
 
   /* The full_gc flag is also a global to avoid ugly parameter passing. */
@@ -899,6 +908,11 @@ gc_top:
     }
 #endif
 #endif
+  {
+    double ms = gc_stats_end(&pause, GC_EV_COPY, reason);
+    if (trace_gc > 1)
+      fprintf(stderr, "; GC pause %.3f ms.\n", ms);
+  }
 }
 
 

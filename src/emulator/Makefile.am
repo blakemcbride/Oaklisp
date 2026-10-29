@@ -33,9 +33,11 @@ EXTRA_PROGRAMS = oak-cold-linker
 # generated main (see oak-embed.h and oakc.in at the top level).
 noinst_LIBRARIES = liboakrt.a
 liboakrt_a_SOURCES = cmdline.c data.c dispatch.c embed-native.c gc.c	\
- gc-ms.c instr.c lineedit.c loop.c native.c native-ops.c oaklisp.c	\
- signals.c stacks.c threads.c timers.c weak.c worldio.c xmalloc.c	\
- cmdline.h config.h data.h dispatch.h gc.h gc-ms.h instr.h lineedit.h	\
+ gc-ms.c gc-stats.c instr.c lineedit.c loop.c native.c native-ops.c	\
+ oaklisp.c signals.c stacks.c threads.c timers.c weak.c worldio.c	\
+ xmalloc.c								\
+ cmdline.h config.h data.h dispatch.h gc.h gc-ms.h gc-stats.h instr.h	\
+ lineedit.h								\
  loop.h native.h native-ops.h oak-atomic.h oak-embed.h oak-getopt.h	\
  oak-header.h oak-native.h oak-thread.h signals.h stacks.h		\
  stacks-loop.h threads.h timers.h weak.h worldio.h xmalloc.h

@@ -38,6 +38,7 @@
 #include "data.h"
 #include "gc-ms.h"
 #include "gc.h"
+#include "gc-stats.h"
 #include "weak.h"
 #include "xmalloc.h"
 #include "stacks.h"
@@ -755,9 +756,11 @@ static int
 stw_request_pause(int my_index_val)
 {
     int gc_thread_count;
+    gc_timer_t handshake;
 
     gc_ready[my_index_val] = 1;
     set_gc_flag(true);   /* locks gc_lock, sets gc_pending */
+    gc_stats_begin(&handshake, GC_EV_HANDSHAKE);
     gc_thread_count = next_index;
 
     /* Busy-wait for all threads to reach a safepoint. */
@@ -774,6 +777,7 @@ stw_request_pause(int my_index_val)
 	    }
 	}
     }
+    gc_stats_end(&handshake, GC_EV_HANDSHAKE, NULL);
 
     return gc_thread_count;
 }
@@ -1633,6 +1637,10 @@ void
 ms_collect(bool pre_dump, char *reason, size_t amount)
 {
     long old_used;
+    gc_timer_t cycle;
+#ifdef THREADS
+    gc_timer_t pause;
+#endif
 
 #ifdef THREADS
     /* If a concurrent GC is already running (another thread triggered
@@ -1641,7 +1649,9 @@ ms_collect(bool pre_dump, char *reason, size_t amount)
     ms_collect_coordinated[*(int *)oak_tls_get(index_key)] = false;
     if (gc_concurrent_in_progress) {
 	int parked_index = *(int *)oak_tls_get(index_key);
+	gc_timer_t wait;
 
+	gc_stats_begin(&wait, GC_EV_ALLOC_WAIT);
 	oak_mutex_unlock(&alloc_lock);
 	/* Advertise that we are parked for the whole time we are out of
 	   action, including while re-acquiring the allocator lock.  The
@@ -1665,6 +1675,7 @@ ms_collect(bool pre_dump, char *reason, size_t amount)
 	    else
 		oak_thread_yield();
 	}
+	gc_stats_end(&wait, GC_EV_ALLOC_WAIT, reason);
 	return;
     }
 #endif
@@ -1687,6 +1698,9 @@ ms_collect(bool pre_dump, char *reason, size_t amount)
     /* We are the GC coordinator for this cycle. */
     gc_concurrent_in_progress = 1;
     ms_collect_coordinated[*(int *)oak_tls_get(index_key)] = true;
+    gc_stats_begin(&cycle, GC_EV_CYCLE);
+#else
+    gc_stats_begin(&cycle, GC_EV_MARK_SWEEP);
 #endif
 
     old_used = (long)(free_point - new_space.start) -
@@ -1751,6 +1765,7 @@ ms_collect(bool pre_dump, char *reason, size_t amount)
 	   in their spin loops and park via wait_for_gc(). */
 	oak_mutex_unlock(&alloc_lock);
 
+	gc_stats_begin(&pause, GC_EV_INITIAL_MARK);
 	(void)stw_request_pause(my_index_val);
 #ifdef OAK_GC_VERIFY
 	ms_verify_stw_owner = my_index_val;
@@ -1789,10 +1804,12 @@ ms_collect(bool pre_dump, char *reason, size_t amount)
 	ms_verify_stw_owner = -1;
 #endif
 	stw_release(my_index_val);
-
-	if (trace_gc > 1) {
-	    fprintf(stderr, "\n; Concurrent tracing...");
-	    fflush(stderr);
+	{
+	    double ms = gc_stats_end(&pause, GC_EV_INITIAL_MARK, reason);
+	    if (trace_gc > 1) {
+		fprintf(stderr, " %.3f ms.\n; Concurrent tracing...", ms);
+		fflush(stderr);
+	    }
 	}
 
 	/* === CONCURRENT MARK === */
@@ -1805,6 +1822,7 @@ ms_collect(bool pre_dump, char *reason, size_t amount)
 
 	/* === STW PAUSE 2: Remark === */
 	gc_phase = GC_PHASE_REMARK;
+	gc_stats_begin(&pause, GC_EV_REMARK);
 	(void)stw_request_pause(my_index_val);
 #ifdef OAK_GC_VERIFY
 	ms_verify_stw_owner = my_index_val;
@@ -1914,6 +1932,11 @@ ms_collect(bool pre_dump, char *reason, size_t amount)
 	ms_verify_stw_owner = -1;
 #endif
 	stw_release(my_index_val);
+	{
+	    double ms = gc_stats_end(&pause, GC_EV_REMARK, reason);
+	    if (trace_gc > 1)
+		fprintf(stderr, "; Remark pause %.3f ms.\n", ms);
+	}
 
 	/* Re-acquire alloc_lock — ALLOCATE_PROT expects us to hold it. */
 	oak_mutex_lock(&alloc_lock);
@@ -1984,6 +2007,7 @@ ms_collect(bool pre_dump, char *reason, size_t amount)
 	gc_concurrent_in_progress = 0;
 	oak_cond_broadcast(&gc_concurrent_done_cv);
 	oak_mutex_unlock(&gc_concurrent_lock);
+	gc_stats_end(&cycle, GC_EV_CYCLE, reason);
     }
 #else
     /* Single-threaded: full STW sweep. */
@@ -2037,6 +2061,11 @@ ms_collect(bool pre_dump, char *reason, size_t amount)
 
 	if (trace_gc == 1)
 	    fprintf(stderr, "\n");
+    }
+    {
+	double ms = gc_stats_end(&cycle, GC_EV_MARK_SWEEP, reason);
+	if (trace_gc > 1)
+	    fprintf(stderr, "; MS-GC pause %.3f ms.\n", ms);
     }
 #endif
 }

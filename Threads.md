@@ -350,6 +350,7 @@ safe (ThreadUpdate.md Phase 3):
 | Thread objects (`*threads*`), a thread's state and joiners | multiproc.oak | `*threads-mutex*`; each thread's own mutex |
 | Process ids | multiproc.oak | lock-free compare-and-swap |
 | `load` | load-file.oak | a mutex per file name: the same file loads serially, different files in parallel |
+| Bignum division's caches (the last divisor reversed; the last quotient and remainder) | bignum.oak | each cache is one immutable pair or list, replaced whole: a reader sees a divisor with its own reversed form, arguments with their own result. Written one variable at a time, as they were, two threads dividing at once swapped each other's (a wrong quotient one run in thirty of `gc-stress.test`) |
 | The bytecode compiler | compiler-locale | per-compilation state in fluids and the AST; `crunch-class-alist`, the opcode tables and `nichevo` are read-only after load; concurrent `compile-file`s give byte-identical objects (`threads-stress.test`), and so does compiling with threads live (`check-threaded-fixpoint`) |
 | The native compiler | native-compiler.oak | its per-file state is global, so a native compile holds `*native-compiler-mutex*` throughout; `.ois` summaries are written whole then renamed into place; oakc is a single-threaded build step |
 | Native modules, call-site caches | native.c | `native_lock` around registration and resolution, `site_lock` and a per-site sequence count around fills |
@@ -376,8 +377,14 @@ source with three threads live).  `threads-stress.test` runs
 three defining globals while others look them up; all compiled at
 load) three times under `--pthreads 3`, once more compiled natively,
 then compiles six files at once in futures and requires the objects
-to match a single-threaded compile.  The stress program, bytecode and
-native, passes under `-DOAK_GC_VERIFY` (GC.md), which checks every
+to match a single-threaded compile.  `gc-stress.test` (GC.md) runs
+`gc-stress.oak` -- lists, vectors, bignums, closures, continuations,
+weak pointers and hash tables made and verified by four OS threads at
+once while they rewrite old objects, under `--size-heap 256` so that
+collections never stop -- as bytecode, compiled natively, and as
+stand-alone executables in every mode oakc has, each run reporting its
+pauses and stalls (`--gc-stats`).  Both stress programs, bytecode and
+native, pass under `-DOAK_GC_VERIFY` (GC.md), which checks every
 concurrent cycle for a missed object.
 
 | Config | Flags | Result |

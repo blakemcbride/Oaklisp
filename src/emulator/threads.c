@@ -26,6 +26,7 @@
 #include "stacks.h"
 #include "loop.h"
 #include "gc.h"
+#include "gc-stats.h"
 #ifdef USE_MARK_SWEEP
 #include "gc-ms.h"
 #endif
@@ -573,11 +574,14 @@ void wait_for_gc()
 #ifdef THREADS
   int *my_index_p;
   int  my_index;
+  gc_timer_t stall;
   my_index_p = oak_tls_get(index_key);
   my_index = *(my_index_p);
+  gc_stats_begin(&stall, GC_EV_SAFEPOINT);
   gc_ready[my_index] = 1;
   oak_mutex_lock(&gc_lock);
   gc_ready[my_index] = 0;
   oak_mutex_unlock(&gc_lock);
+  gc_stats_end(&stall, GC_EV_SAFEPOINT, NULL);
 #endif
 }

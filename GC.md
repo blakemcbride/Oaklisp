@@ -89,7 +89,8 @@ These emulator command-line flags affect GC behavior:
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--size-heap N` | 128 | Heap size in kilo-refs (1 ref = 8 bytes on 64-bit) |
-| `--trace-gc V` | 0 | GC verbosity: 0=quiet, 1=summary, 2=detailed, 3=very detailed |
+| `--trace-gc V` | 0 | GC verbosity: 0=quiet, 1=summary, 2=detailed (each pause with its length), 3=very detailed (plus every pause and stall as it ends, and the report below) |
+| `--gc-stats` | off | report the pauses and stalls at exit (Pause Statistics, below) |
 | `--predump-gc B` | 1 | Run GC before world dump: 0=no, 1=yes |
 
 The default heap is 128 kilo-refs = 128K × 8 bytes = 1 MB on 64-bit
@@ -97,6 +98,10 @@ systems.  This is sufficient for most interactive use and compilation
 of individual `.oak` files.
 
 The `OAKWORLD` environment variable sets the default world file path.
+`OAKLISP_OPTIONS` holds emulator options as they would be written
+before the `--`, for a program whose command line is not the user's
+to write, a stand-alone executable above all:
+`OAKLISP_OPTIONS='--size-heap 4096 --gc-stats' ./prog`.
 
 Example:
 ```sh
@@ -578,14 +583,115 @@ Under `THREADS + USE_MARK_SWEEP` with `--trace-gc 2`:
 ```
 ; Mark-sweep GC due to space crunch in CONS instruction.
 ; Marking... [heap=262144, used=260000, free_list=0]
-; STW initial mark... roots
+; STW initial mark... roots 0.226 ms.
 ; Concurrent tracing... done.
 ; STW remark... done.
 ; Mark complete.
 ; Lazy sweep prepared (260000 words to sweep).
 ; Eagerly swept 3576 words.
+; Remark pause 0.248 ms.
 ; MS-GC complete.  3576 free (3575 list + 1 bump).
 ```
+
+At `--trace-gc 2` every pause ends with its length: `; GC pause
+0.694 ms.` after a copying collection, `; MS-GC pause 2.1 ms.` after
+a single-threaded mark-sweep one, and in the concurrent collector the
+initial-mark line ends with its pause and `; Remark pause ...`
+follows the sweep preparation, when the mutators are released.
+
+
+Pause Statistics
+================
+
+`--gc-stats` (or `--trace-gc 3`; `gc-stats.c`) times every pause and
+stall by the monotonic clock and prints a report at exit, in ms:
+
+```
+; GC pauses and stalls, ms: count, total, mean, max, p50, p90, p99, and how many under 0.1, 1, 10, 100 ms and over
+; copying collection                   8     25.32    3.165    6.276    2.315    6.276    6.276       0     0     8     0     0
+; initial-mark pause                  24      5.74    0.239    0.345    0.228    0.318    0.345       0    24     0     0     0
+; remark pause                        24     10.29    0.429    1.749    0.241    1.033    1.749       0    21     3     0     0
+;   threads stopping                  56      0.02    0.000    0.002    0.000    0.001    0.002      56     0     0     0     0
+; concurrent cycle, its thread        24     55.81    2.325    9.800    0.751    5.611    9.800       0    14    10     0     0
+; safepoint wait                      65     62.94    0.968    4.293    0.350    3.445    4.293       0    53    12     0     0
+; allocation wait                     46     97.23    2.114    9.869    0.566    8.218    9.869       0    32    14     0     0
+; all global pauses                   56     41.35    0.738    6.276    0.244    2.246    6.276       0    45    11     0     0
+; GC: 56 global pauses, total 41.35 ms, max 6.276 ms, p99 6.276 ms, 7.2% of 573 ms
+```
+
+The kinds:
+
+- **Global pauses**, every thread stopped: a *copying collection*
+  (configs 1 and 3; in 2 and 4 the fallback, the growth and the
+  pre-dump compaction), a *mark-sweep collection* with one thread
+  (config 2: mark and sweep together, a fallback copy nested inside
+  it counted under its own kind only), and the concurrent collector's
+  *initial-mark* and *remark* pauses (config 4).  *All global pauses*
+  is their union, less the nested ones, and the `; GC:` line sums it
+  up against the run's wall-clock time.
+- **Threads stopping**: inside a pause with threads, from the request
+  until the last thread has reached a safepoint -- the handshake
+  latency Phase 5 of GCEnhancements.md cares about.
+- **Stalls of one thread**: the *concurrent cycle* as seen by the
+  thread that ran it (it was out of action for the whole cycle,
+  concurrent mark included: the collector has no thread of its own),
+  a *safepoint wait* (a thread parked while another held a pause),
+  and an *allocation wait* (a thread out of memory during a cycle,
+  waiting for its sweep; its safepoint waits meanwhile count under
+  both).
+
+The percentiles come from up to 4096 samples per kind, a uniform
+reservoir beyond that; count, total and max are exact.  The report
+goes to stderr; a stand-alone executable gets the option through
+`OAKLISP_OPTIONS`.  `make bench` runs every benchmark with it and
+prints the longest and the 99th-percentile pause of each run beside
+the time (tests/bench.sh, `-o` saves them too), and `-p N` prints
+the `; GC:` line of its one-thread and N-thread runs.
+
+`tests/gc-stress.test` is the collectors' load test: `gc-stress.oak`
+makes and verifies lists, vectors, bignums, closures, continuations,
+weak pointers and hash tables on four OS threads at once (one thread
+without threads) while they rewrite old objects, under `--size-heap
+256` so that collections never stop, run as bytecode, compiled
+natively, and as stand-alone executables in every mode oakc has
+(plain, `-w`, `--ir`, `--interpreter`); each run's report is in the
+log.  Its first run found bignum division's caches shared between
+threads (Threads.md, "Shared state"), not a collector bug: verify mode
+is clean on it in every mode.
+
+Baseline, 2026-10-29 (i9-14900KF, `make bench` pinned to one P core,
+FAST builds of the same sources): the longest pause and the p99 pause
+in ms of each benchmark's run (compile plus five repetitions), in the
+four configurations.  Few collections happen per run, so the two are
+mostly equal; dispatch, fib and tak collect nothing.
+
+| Benchmark | 1 copying | 2 mark-sweep | 3 threads, copying | 4 threads, mark-sweep |
+|-----------|-----------|--------------|--------------------|-----------------------|
+| bignum | 0.31 / 0.31 | 0.62 / 0.62 | 0.30 / 0.29 | 0.24 / 0.24 |
+| compile | 0.37 / 0.37 | 1.56 / 1.56 | 0.35 / 0.35 | 1.25 / 1.25 |
+| cons | 0.31 / 0.30 | 0.47 / 0.45 | 0.31 / 0.29 | 0.20 / 0.20 |
+| eval | 0.81 / 0.80 | 2.25 / 2.25 | 0.86 / 0.81 | 1.52 / 1.52 |
+| format | 0.34 / 0.34 | 0.55 / 0.55 | 0.33 / 0.33 | 0.19 / 0.19 |
+| hash | 6.73 / 6.73 | 28.34 / 28.34 | 6.19 / 6.19 | 20.64 / 20.64 |
+| sort | 4.97 / 4.97 | 8.38 / 8.38 | 7.17 / 7.17 | 6.50 / 6.50 |
+| strings | 0.81 / 0.66 | 0.57 / 0.57 | 0.31 / 0.29 | 0.21 / 0.21 |
+
+In the mark-sweep configurations the long pauses (hash, sort, eval,
+compile) are not the mark-sweep's own: they are the copying collector
+growing the heap (`mark-sweep growth`, Tier 5), a whole-heap copy
+each time, which is what Phase 2 of GCEnhancements.md removes.  The
+concurrent collector's own pauses stay small: in `gc-stress.oak` on
+four threads (config 4, `--size-heap 256`, 32 cycles in 0.83 s),
+initial mark took at most 0.33 ms, remark 3.3 ms (p50 0.2), the
+threads stopped within 5 us, and the seven copying collections that
+grew the heap took up to 6.2 ms -- 71 global pauses, 5.1% of the run.
+The stalls are the larger cost: the thread that ran a cycle lost up to
+9.4 ms to it (p50 0.9), a thread out of memory during a cycle waited
+up to 9.4 ms (47 times), and safepoint waits reached 5.7 ms (98 times,
+p50 0.3) -- Phases 3, 5 and 6.  The same program in the default build
+(90 copying collections) paused at most 1.3 ms, p50 0.45, 2.7% of the
+run.  Four copies of tak on four OS threads (`tests/bench.sh -p 4`,
+config 4) ran 3.85 times faster than on one, with no collection.
 
 
 Key Design Decisions
@@ -640,6 +746,7 @@ Source Files
 | `loop.c` | SATB barrier insertion sites, allocation instruction handlers |
 | `oaklisp.c` | GC initialization (`ms_init`, `gc_safepoint_init`) |
 | `weak.c` | Weak pointer table processing (used by both collectors) |
+| `gc-stats.c`, `gc-stats.h` | Pause and stall timing and the `--gc-stats` report |
 
 
 Tuning Constants

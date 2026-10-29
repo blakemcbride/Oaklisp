@@ -593,16 +593,18 @@
    ; Returns (list quotient remainder)
 
 
-(let ((last-inlist #t)
-      (last-divisor #t)
-      (last-quorem #t))    ;cache for last values computed
+;; The cache of the last values computed, (inlist divisor . quorem):
+;; one immutable list replaced whole, so that a thread never meets
+;; another's result behind its own arguments (Threads.md).
+(let ((quorem-cache (list #t #t)))
 
   (define (quorem-digitlists inlist divisor)
 
-    (if (and (eq? inlist last-inlist)
-	     (eq? divisor last-divisor))
+    (let ((c quorem-cache))
+    (if (and (eq? inlist (car c))
+	     (eq? divisor (cadr c)))
 
-	last-quorem
+	(cdr (cdr c))
 
 	(let ((lenin (length inlist))
 	      (lendiv (length divisor)))
@@ -632,9 +634,9 @@
 			   divisor))
 
 		    (block
-		     (set last-inlist inlist)
-		     (set last-divisor divisor)
-		     (set last-quorem quotient-remainder)))))))))
+		     (set! quorem-cache
+			   (cons inlist (cons divisor quotient-remainder)))
+		     quotient-remainder)))))))))
 
 
 
@@ -661,10 +663,11 @@
   ;returns (digit . remainder)
 
 
-(let ((last-short-divisor #t)		;cache some internal info
-      (fix-divisor #t)
-      (last-long-divisor #t)
-      (rev-divisor #t))
+;; The caches: the last divisor seen and what was made of it, one
+;; immutable pair each, replaced whole, so that a thread dividing
+;; while others do reads a pair that belongs together (Threads.md).
+(let ((short-cache (cons #t #t))
+      (long-cache (cons #t #t)))
 
   (define (quorem-digitlists-to-get-digit inlist divisor)
 
@@ -680,11 +683,15 @@
 
 	    ((< (+ lenin lendiv) 5)	; special cases for short digitlists
 
-	     (when (not (eq? last-short-divisor divisor))
-	       (set! last-short-divisor divisor)
-	       (set! fix-divisor (if (= lendiv 2)
-				     (fx-plus (fx-times bignum-base (cadr divisor)) (car divisor))
-				     (car divisor))))
+	     (let ((fix-divisor
+		    (let ((c short-cache))
+		      (if (eq? (car c) divisor)
+			  (cdr c)
+			  (let ((f (if (= lendiv 2)
+				       (fx-plus (fx-times bignum-base (cadr divisor)) (car divisor))
+				       (car divisor))))
+			    (set! short-cache (cons divisor f))
+			    f)))))
 
 	     (cond ((= lendiv 2)
 		    (let ((fix-dividend (fx-plus (fx-times bignum-base (cadr inlist)) (car inlist))))
@@ -699,17 +706,20 @@
 		   (else
 		    (let ((fix-dividend (car inlist)))
 		      (cons (quotient fix-dividend fix-divisor)
-			    (bignum-digits (remainder fix-dividend fix-divisor)))))))
+			    (bignum-digits (remainder fix-dividend fix-divisor))))))))
 
 
 	    (else
 	     ;; general case: 3+ digits in inlist, and 2+ or 3+ digits in divisor
 
-	     (when (not (eq? last-long-divisor divisor))
-	       (set! last-long-divisor divisor)
-	       (set! rev-divisor (reverse divisor)))
-
-	     (let* ((rev-inlist (reverse inlist))
+	     (let* ((rev-divisor
+		     (let ((c long-cache))
+		       (if (eq? (car c) divisor)
+			   (cdr c)
+			   (let ((r (reverse divisor)))
+			     (set! long-cache (cons divisor r))
+			     r))))
+		    (rev-inlist (reverse inlist))
 		    (inlist-hi  (car rev-inlist))
 		    (divisor-hi (car rev-divisor))
 		    ;; Estimate the digit from the leading digits of

@@ -335,9 +335,11 @@ and checks that the world reproduces its own objects, that all cold
 linkers agree, and (when Guile is present) that the Guile-hosted
 compiler reproduces the objects too.  Failures are detailed in
 tests/NAME.log.  "make bench" prints best-of-five CPU times for
-eleven small benchmarks; see tests/bench.sh for saving and comparing
-runs, and for "-p N", which runs N copies of tak on N OS threads (an
-emulator with threads) against the same on one, by the wall clock.
+eleven small benchmarks, with the longest and the 99th-percentile
+garbage-collection pause of each run (--gc-stats; GC.md); see
+tests/bench.sh for saving and comparing runs, and for "-p N", which
+runs N copies of tak on N OS threads (an emulator with threads)
+against the same on one, by the wall clock.
 
 Thread Support
 ==============

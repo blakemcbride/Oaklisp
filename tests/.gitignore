@@ -12,3 +12,4 @@ restargs-check/
 stress-*.out
 stress-seq/
 stress-par/
+gc-stress/

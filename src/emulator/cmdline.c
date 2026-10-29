@@ -32,6 +32,8 @@
 #include "oak-getopt.h"
 #include "config.h"
 #include "data.h"
+#include "gc-stats.h"
+#include "xmalloc.h"
 #include "cmdline.h"
 #include "native.h"
 #include "xmalloc.h"
@@ -128,6 +130,7 @@ usage(char *prog)
 	  "\n"
 	  "\t--trace-gc v         0=quiet, 3=very detailed; default=0\n"
 	  "\t--verbose-gc v       synonym for --trace-gc\n"
+	  "\t--gc-stats           report GC pauses and stalls at exit\n"
 	  "\t--trace-traps\n"
 	  "\t--batch              disable trapping of SIGINT\n"
 	  "\t--native-module file load a natively compiled module\n"
@@ -215,6 +218,36 @@ parse_cmd_line(int argc, char **argv)
    if (w) world_file_name = w;
  }
 
+  /* OAKLISP_OPTIONS in the environment: emulator options, as written
+     on the command line before the "--", for a program whose command
+     line is not the user's to write, a stand-alone executable above
+     all.  They go in front of the command line's own. */
+  {
+    char *env = getenv("OAKLISP_OPTIONS");
+
+    if (env != NULL && *env != '\0')
+      {
+	char *copy = xmalloc(strlen(env) + 1);
+	char **nargv;
+	char *s;
+	int n = 0, i, j = 0;
+
+	strcpy(copy, env);
+	for (s = strtok(copy, " \t\n"); s != NULL; s = strtok(NULL, " \t\n"))
+	  n++;
+	strcpy(copy, env);
+	nargv = xmalloc((size_t)(argc + n + 1) * sizeof(char *));
+	nargv[j++] = argv[0];
+	for (s = strtok(copy, " \t\n"); s != NULL; s = strtok(NULL, " \t\n"))
+	  nargv[j++] = s;
+	for (i = 1; i < argc; i++)
+	  nargv[j++] = argv[i];
+	nargv[j] = NULL;
+	argc = j;
+	argv = nargv;
+      }
+  }
+
   /* parse command line arguments */
   while (1)
     {
@@ -232,6 +265,7 @@ parse_cmd_line(int argc, char **argv)
 	{"size-cxt-stk", required_argument, 0, CXTSIZ_ARG},
 	{"size-seg-max", required_argument, 0, MAX_SEG_ARG},
 	{"trace-gc", required_argument, 0, VERBOSE_GC_ARG},
+	{"gc-stats", no_argument, &gc_stats_on, true},
 	{"trace-traps", no_argument, &trace_traps, true},
 	{"batch", no_argument, &batch_mode, true},
 	{"no-line-editing", no_argument, &no_line_editing, true},
@@ -396,6 +430,8 @@ parse_cmd_line(int argc, char **argv)
 
   program_argc = argc - optind;
   program_argv = argv + optind;
+
+  gc_stats_init();
 
   return;
 }
