@@ -196,14 +196,14 @@ OAKEXTRALOAD =
 
 OA_PREREQ_world = old/assembler.oa old/file-compiler.oa
 OA_COMPILE_world = $(OAK) $(OAKFLAGS) --world $(OLD_WORLD) -- \
-	   --load $(srcdir)/architecture.oak \
+	   --locale system-locale --load $(srcdir)/architecture.oak \
 	   $(OAKPRELOAD) $(OAKEXTRALOAD) $(OAKLOCALE) \
 	   --target $(OAK_BYTECODE_ARCH) --outdir . --compile $(<:.oak=) --exit
 
 old/%.oa: %.oak
 	$(MKDIR_P) old
 	$(OAK) $(OAKFLAGS) --world $(OLD_WORLD) -- \
-	   --load $(srcdir)/architecture.oak $(OAKLOCALE) \
+	   --locale system-locale --load $(srcdir)/architecture.oak $(OAKLOCALE) \
 	   --outdir old --compile $(<:.oak=) --exit
 old/assembler.oa old/file-compiler.oa: OAKLOCALE = --locale compiler-locale
 
@@ -269,6 +269,7 @@ guile.stamp: $(ALLOAFILESNONGEN:.oa=.oak) system-version.oak $(GUILEHOST)
 LINK_PREREQ_world = old/tool.oa
 LINK_COLD_world = $(OAK) $(OAKFLAGS) --world $(OLD_WORLD) \
 	   -- \
+	   --locale system-locale \
 	   --load $(srcdir)/architecture.oak \
 	   --load old/tool \
 	   --eval "(tool-files '($(COLDFILESD:.oa=)) 'new \"$(OAK_BYTECODE_ARCH)\")" \
@@ -309,6 +310,8 @@ oakworld-3.bin: oakworld-2.bin $(COMPFILES) $(EXPORTFILES)
 	   $(foreach f, $(EXPORTFILES:.oa=),--load $(f)) \
 	   --exit
 
+# The world starts in user-locale; everything above and below that
+# runs a world names the locale it needs.
 oakworld.bin: oakworld-3.bin $(RNRSFILES)
 	$(OAKBOOT) $(OAKFLAGS) --world oakworld-3.bin --dump $@ \
 	  -- \
@@ -316,7 +319,7 @@ oakworld.bin: oakworld-3.bin $(RNRSFILES)
 	  --eval "(export-symbol system-locale oaklisp-locale 'scheme-locale)" \
 	  --locale scheme-locale \
 	  $(foreach f, $(RNRSFILES:.oa=),--load $(f)) \
-	  --locale system-locale --exit
+	  --locale user-locale --exit
 
 ##### Rebuilding the world with itself
 
@@ -382,14 +385,14 @@ NATIVEHDRS = $(top_srcdir)/src/emulator/oak-native.h \
 $(NATDIR)/%.oa: %.oak oakworld.bin $(NATIVEHDRS)
 	@$(MKDIR_P) $(NATDIR)
 	$(OAK) $(OAKFLAGS) --world $(abs_builddir)/oakworld.bin -- \
-	   --outdir $(NATDIR) \
+	   --locale system-locale --outdir $(NATDIR) \
 	   --eval '(bind ((#*compiler-noisiness 0) (#*native-strict? #t) (#*native-exclusions (quote ($(NATEXCL))))) (native-compile-file $(NATLOCALE) "$(basename $<)" #f))' \
 	   --exit
 
 $(NATDIR)/new.cold: $(addprefix $(NATDIR)/,$(COLDFILES)) tool.oa
 	cd $(NATDIR) && rm -f new.cold new.sym && \
 	$(OAKBOOT) $(OAKFLAGS) --world $(abs_builddir)/oakworld.bin -- \
-	   --load ../tool \
+	   --locale system-locale --load ../tool \
 	   --eval "(tool-files '($(COLDFILESD:.oa=)) 'new \"$(OAK_BYTECODE_ARCH)\")" \
 	   --exit
 
@@ -425,7 +428,7 @@ $(NATDIR)/oakworld.bin: $(NATDIR)/oakworld-3.bin $(addprefix $(NATDIR)/,$(RNRSFI
 	  --eval "(export-symbol system-locale oaklisp-locale 'scheme-locale)" \
 	  --locale scheme-locale \
 	  $(foreach f, $(RNRSFILES:.oa=),--load $(f)) \
-	  --locale system-locale --exit
+	  --locale user-locale --exit
 
 RANLIB = @RANLIB@
 
@@ -468,7 +471,7 @@ clean-native-world:
 # each to NAME.log.  This is how the fixpoint checks and the prebuilt
 # refresh compile; a finished world needs none of the preloading above.
 COMPILE_ALL = for f in $$files; do \
-	  loc=""; \
+	  loc="--locale system-locale"; \
 	  case " $(COMPFILES:.oa=) " in *" $$f "*) loc="--locale compiler-locale";; esac; \
 	  case " $(RNRSFILES:.oa=) " in *" $$f "*) loc="--locale scheme-locale";; esac; \
 	  case $$f in system-version) src=$(abs_builddir)/$$f;; *) src=$(abs_srcdir)/$$f;; esac; \
@@ -509,7 +512,7 @@ prebuilt-world: oakworld.bin
 Makefile-vars:
 	$(OAK) $(OAKFLAGS) --world $(OLD_WORLD) \
 	   -- \
-	   --load files --load make-makefile --eval '(make-makefile "$@")' \
+	   --locale system-locale --load files --load make-makefile --eval '(make-makefile "$@")' \
 	   --exit
 
 ##### Consistency checks (run by "make check" at the top level)
@@ -578,7 +581,7 @@ check-guile-compile: oakworld.bin $(ALLOAFILES)
 # new.cold, however that was linked.
 check-cold-linkers: oakworld.bin new.cold $(TOOLFILES)
 	@rm -f linkcheck-*.cold linkcheck-*.sym
-	@$(OAKBOOT) $(OAKFLAGS) --world oakworld.bin -- --load tool \
+	@$(OAKBOOT) $(OAKFLAGS) --world oakworld.bin -- --locale system-locale --load tool \
 	  --eval "(tool-files '($(COLDFILESD:.oa=)) 'linkcheck-oak \"$(OAK_BYTECODE_ARCH)\")" \
 	  --exit > /dev/null 2>&1 \
 	  || { echo "tool.oak cold link failed"; exit 1; }

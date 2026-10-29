@@ -408,12 +408,14 @@ preceded by \texttt{$\backslash$}.}
 
 The formal parameter list of a method is permitted to be improper,
 with the terminal atom being a magic token representing the rest of
-the arguments.  The only legal use for this magic token is as the
-terminal member of an improper argument list of a tail recursive call,
-and as an argument to the special form \df{rest-length}.  Methods that
-accept a variable number of arguments must exit tail recursively and
-must pass along their magic token in their tail recursive call, unless
-they know that they actually received no extra arguments.
+the arguments.  Natively, the only legal use for this magic token is
+as the terminal member of an improper argument list of a tail
+recursive call, and as an argument to the special form
+\df{rest-length}.  Methods that accept a variable number of arguments
+must exit tail recursively and must pass along their magic token in
+their tail recursive call, unless they know that they actually
+received no extra arguments.  A method whose body uses the token any
+other way gets a list instead; see below.
 
 \sform{rest-length}{varargs-token}
 \doc{Returns the number of trailing arguments represented by
@@ -426,19 +428,38 @@ For example, this is legal,
       'nanu-nanu
       (list 'you x y 'sucker . rest)))
 \end{verbatim}
-while the following are not, the first because it has an exit when
-there might be extra arguments which does not pass the extra arguments
-along tail recursively, and the second because it tries to pass along
-the extra arguments in a non tail recursive position.
+while this is not, because it has an exit when there might be extra
+arguments which does not pass the extra arguments along tail
+recursively (the compiler warns about it).
 \begin{verbatim}
 (define (not-okay x y . rest)
   (if (eq? x y)
       'nanu-nanu
       (list 'you x y 'sucker . rest)))
+\end{verbatim}
 
-(define (also-bad x y . rest)
+A method whose body uses the token in any other way---as an ordinary
+variable, at the end of a call that is not in tail position, or inside
+an inner \df{lambda}---has it bound to a list of the extra arguments.
+The expander (\df{idiosyncratically-grovel} in \texttt{expand.oak})
+rewrites such a body \emph{body} with rest name \emph{rest} as
+\texttt{(listify-args (lambda (\emph{rest}) \emph{body\/$'$}) .\
+\emph{rest})}, where in \emph{body\/$'$} each
+\texttt{(f a .\ \emph{rest})} becomes \texttt{(apply f a \emph{rest})}
+and each \texttt{(rest-length \emph{rest})} becomes \texttt{(length
+\emph{rest})}.  So this works, and returns a list:
+\begin{verbatim}
+(define (now-okay x y . rest)
   (append (list 'you x 'sucker . rest) y))
 \end{verbatim}
+Bodies of \df{let} and \df{labels} lambdas count as the method itself
+when deciding whether a use is native.  A rest name beginning with
+\texttt{\%} is never rewritten, for code that manipulates the stack
+directly.  A \df{lambda} or \df{define} body that never passes its rest
+args on is rewritten too, since returning would leave them on the
+stack; a method written with \df{add-method} keeps them, and only draws
+the compiler's warning (\df{{\protect\upar}super} and \df{\%push} rely on
+that).
 
 The implementation behind this is very simple: extra arguments are
 ignored by the compiler, except that it emits a \df{check-nargs-gte}
@@ -462,4 +483,5 @@ numbers of arguments easier.
 There is also a macro package that implements optional and keyword
 arguments using these facilities, and the Scheme compatiblity package
 redefines \df{add-method} so that, as required by the Scheme standard
-\citep{R3RS}, extra arguments are made into a list.
+\citep{R3RS}, extra arguments are always made into a list, however
+the rest name is used.

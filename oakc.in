@@ -196,7 +196,7 @@ fi
 # 2. Bake: link the program into the world without running it, and
 #    dump the image the executable will carry.
 echo "oakc: baking the world"
-cmd="'$OAKLISP' --batch $RUNTIME_MODS --world '$WORLD' --dump '$work/baked.bin' --"
+cmd="'$OAKLISP' --batch $RUNTIME_MODS --world '$WORLD' --dump '$work/baked.bin' -- --locale system-locale"
 for src in $sources; do
   base=$(basename "$src" .oak)
   cmd="$cmd --eval '(bake-file $locale \"$work/$base\")'"
@@ -207,8 +207,12 @@ if test $strip = yes; then
   keepsyms="run-baked-program $(printf '%s\n' "$evals" \
     | tr -c 'A-Za-z0-9%*/+<>=!?^._~-' '\n' \
     | grep -E '^[A-Za-z%*/+<>=!?^._~-]' | sort -u | tr '\n' ' ')"
-  cmd="$cmd --eval '(strip-locales (quote ($keepsyms)))'"
+  # The locale names go too, so the program's locale is taken first.
+  cmd="$cmd --eval '(let ((l $locale)) (strip-locales (quote ($keepsyms))) (set! #*current-locale l))'"
+else
+  cmd="$cmd --locale $locale"
 fi
+# The executable starts in the program's locale.
 cmd="$cmd --exit"
 eval "$cmd" > "$work/bake.log" 2>&1 || { cat "$work/bake.log" >&2
 					 fail "baking failed"; }

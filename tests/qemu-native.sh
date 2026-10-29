@@ -52,7 +52,7 @@ for prog in $progs; do
   # OAK_QEMU_IR=1 compiles with the C-locals lowering on.
   irbind=
   test "${OAK_QEMU_IR-}" = 1 && irbind="(#*native-ir? #t) "
-  (cd "$work" && $OAK -- --target "$target" --outdir . \
+  (cd "$work" && $OAK -- --locale system-locale --target "$target" --outdir . \
     --eval "(bind ((#*compiler-noisiness 0) (#*native-strict? #t) (#*native-emit-only? #t) $irbind) (native-compile-file system-locale \"$prog\"))" \
     --exit > compile.log 2>&1) \
     || { cat "$work/compile.log"; exit 1; }
@@ -106,7 +106,7 @@ $crosscc -static -o "$work/prog-x" "$work/main.o" $objs \
   "$cross/src/emulator/liboakrt.a" -lm
 
 echo "qemu-native: the host's run"
-$OAK -- $loads --exit 2>&1 \
+$OAK -- --locale system-locale $loads --exit 2>&1 \
   | grep -E '^(PASS|FAIL)' > "$work/want"
 grep -q '^FAIL' "$work/want" && { echo "the host itself fails $name"; exit 1; }
 

@@ -115,7 +115,9 @@ arguments, collected with \df{listify-args}; in such a body
 \texttt{(f a .\ \emph{rest})} means \texttt{(apply f a \emph{rest})}
 and \texttt{(rest-length \emph{rest})} means \texttt{(length
 \emph{rest})}.  This holds for every method, whether written with
-\df{lambda}, \df{define} or \df{add-method}.  A rest name that begins
+\df{lambda}, \df{define} or \df{add-method}.  A \df{lambda} or
+\df{define} body that never passes its rest args on gets the list as
+well, since it could not otherwise return.  A rest name that begins
 with \texttt{\%} is always bound the native way, for code that plays
 tricks with the stack.
 
@@ -172,8 +174,8 @@ as a list instead; see \df{lambda} above.)
 \doc{Yields the number of extra values that were received by the
 method in which \df{rest-name} is declared.}
 
-Rest args can never be accessed directly, but must be passed tail
-recursively to other functions.  In fact, a function is not permitted
+Used the native way, rest args can never be accessed directly, but
+must be passed tail recursively to other functions.  In fact, a function is not permitted
 to return without disposing of its rest args.  Usually a function that
 takes a variable number of arguments will recurse on itself or on a
 helper function, consuming its arguments one by one until they are all

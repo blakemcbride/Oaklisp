@@ -16,8 +16,20 @@
 : ${MAKE:=make}
 testdir=$(cd "$(dirname "$0")" && pwd)
 
-# Run Oaklisp non-interactively: oak [emulator options --] oaklisp options
-oak() { "$OAKLISP" --batch --world "$OAKWORLD" "$@"; }
+# Run Oaklisp non-interactively: oak [emulator options --] oaklisp options.
+# The world starts in user-locale; the tests start in system-locale.
+oak() {
+  seen=
+  for a; do
+    shift
+    if test -z "$seen" && test "x$a" = x--; then
+      seen=y; set -- "$@" -- --locale system-locale
+    else
+      set -- "$@" "$a"
+    fi
+  done
+  "$OAKLISP" --batch --world "$OAKWORLD" "$@"
+}
 
 # Run a test program and count its PASS and FAIL lines.  Any error
 # report from Oaklisp counts as a failure too.  Extra arguments go

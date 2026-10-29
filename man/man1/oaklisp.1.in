@@ -169,8 +169,8 @@ reference size can also be used on a 64-bit system.
 
 .TP
 .B \-\-locale x
-Switch to locale x, eg system-locale (default),
-compiler-locale, scheme-locale (for RnRS
+Switch to locale x, eg user-locale (default),
+system-locale, compiler-locale, scheme-locale (for RnRS
 compatibility).
 
 .TP

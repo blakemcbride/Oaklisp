@@ -317,6 +317,14 @@ is the same as
 
 \bigskip
 
+\parbox[t]{3.4in}{
+(define (f a b . rest) ...)
+}\parbox[t]{3.5in}{
+ \emph{REST ARGS:}\ \ Extra arguments.  Passed on at the end of a tail call, \emph{(g a . rest)}, or counted with \emph{(rest-length rest)}, they stay on the stack; any other use binds \emph{rest} to a list of them.
+}
+
+\bigskip
+
 {\Large \bfseries Conditionals}
 
 \smallskip
@@ -503,9 +511,8 @@ the locale given to \emph{load}.
 \hbox{\begin{tabular}{|l|l|}\hline
 Locale & Contents \\\hline
 system-locale & everything: the language and its implementation \\
-& (the default) \\
 oaklisp-locale & the user-level subset of system-locale; no superiors \\
-user-locale & inherits oaklisp-locale only \\
+user-locale & inherits oaklisp-locale only (the default) \\
 compiler-locale & compiler internals; inherits system-locale \\
 scheme-locale & RnRS Scheme compatibility; inherits system-locale \\
 \hline
