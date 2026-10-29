@@ -69,7 +69,10 @@ and must release it as many times.
 anonymous one.}
 
 \op{acquire-mutex}{mutex}
-\doc{Waits until \emph{mutex} is free and takes it.}
+\doc{Waits until \emph{mutex} is free and takes it.  While it waits
+the thread runs other processes or sleeps; it does not spin.  A wait
+that goes on for seconds is reported on standard error, naming the
+mutex and its holder.}
 
 \op{release-mutex}{mutex}
 \doc{Releases \emph{mutex}; an error if the caller does not hold it.}

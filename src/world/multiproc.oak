@@ -158,9 +158,6 @@
 ;;; tasks, which is important in a future system with no reasonable
 ;;; bounds on the number of processes.
 
-;;; %TEST-AND-SET-LOCATIVE is used to create a spin-lock, so mutexes
-;;; spin lock too.  Hence semaphores should be used when possible.
-
 ;;; A mutex is held by a process and is reentrant: ACQUIRE-MUTEX by the
 ;;; holder counts, and RELEASE-MUTEX by anyone else is an error.  The
 ;;; holder is the process rather than the OS thread because a
@@ -169,10 +166,19 @@
 ;;; on the first thread must not be taken for the holder.  The
 ;;; scheduler's own lock is the exception (%THREAD-MUTEX): its section
 ;;; switches processes, but runs with alarms off, so it never leaves
-;;; its thread.  A mutex may have a name, and a process that has spun
-;;; MUTEX-REPORT-SPINS times waiting says so on standard error, naming
-;;; the mutex and its holder, which is how a deadlock shows itself.
-;;; WITH-MUTEX (below) releases on any exit.
+;;; its thread.  A mutex may have a name, and a process that has waited
+;;; MUTEX-REPORT-SPINS steps, or MUTEX-REPORT-MS milliseconds parked,
+;;; says so on standard error, naming the mutex and its holder, which
+;;; is how a deadlock shows itself.  WITH-MUTEX (below) releases on any
+;;; exit.
+;;;
+;;; The access-cons is the lock word: its car the held flag, taken with
+;;; %TEST-AND-SET-LOCATIVE, its cdr the OS threads (by %THREAD-INDEX)
+;;; parked waiting for the mutex, kept with the same primitive.  A
+;;; process that finds the mutex held does not spin: each step of its
+;;; wait is a %MUTEX-WAIT (after the scheduler, below), which runs the
+;;; processes the scheduler has queued, the holder perhaps among them,
+;;; or parks the OS thread until RELEASE-MUTEX unparks it.
 
 (define-instance mutex type '(access-cons owner depth name) (list object))
 
@@ -180,9 +186,11 @@
 (define-instance release-mutex operation)
 (define-instance mutex-name settable-operation)
 (define-instance %mutex-self operation)
+(define-instance %mutex-owner operation)
+(define-instance %mutex-wait operation)
 
 (add-method (initialize (mutex access-cons owner depth name) self)
-  (set! access-cons (cons nil nil))
+  (set! access-cons (cons nil nil))	; (held-flag . parked-waiters)
   (set! owner #f)
   (set! depth 0)
   (set! name #f)
@@ -190,6 +198,7 @@
 
 (add-method (mutex-name (mutex name) self) name)
 (add-method ((setter mutex-name) (mutex name) self new) (set! name new))
+(add-method (%mutex-owner (mutex owner) self) owner)
 
 ;;; Who holds it: the current process (the fixnum 0 before there is
 ;;; one), or for a %THREAD-MUTEX the OS thread.
@@ -207,24 +216,29 @@
 
 (define (make-named-mutex name) (%make-named-mutex mutex name))
 
-(define mutex-report-spins 1000000)
+(define mutex-report-spins 1000000)	; wait steps before a report,
+(define mutex-report-ms 5000)		; or milliseconds parked
 
 (add-method (acquire-mutex (mutex access-cons owner depth name) self)
   (let ((me (%mutex-self self)))
     (if (eq? owner me)
 	(set! depth (+ depth 1))
-	(iterate spin ((n 0))
+	(iterate wait ((n 0) (parked 0) (reported #f))
 	  (cond ((%test-and-set-locative (make-locative (car access-cons))
 					 #f #t)
 		 (set! owner me)
 		 (set! depth 1))
 		(else
-		 (when (= n mutex-report-spins)
-		   (format standard-error
-			   "~&;; ~S waiting for mutex ~S, held by ~S~%"
-			   me (or name self) owner))
-		 (%thread-yield)
-		 (spin (+ n 1))))))))
+		 (let ((report? (and (not reported)
+				     (or (>= n mutex-report-spins)
+					 (>= parked mutex-report-ms)))))
+		   (when report?
+		     (format standard-error
+			     "~&;; ~S waiting for mutex ~S, held by ~S~%"
+			     me (or name self) owner))
+		   (wait (+ n 1)
+			 (+ parked (%mutex-wait self))
+			 (or reported report?)))))))))
 
 (add-method (release-mutex (mutex access-cons owner depth name) self)
   (cond ((not (eq? owner (%mutex-self self)))
@@ -235,7 +249,15 @@
 	(else
 	 (set! depth 0)
 	 (set! owner #f)
-	 (set! (car access-cons) nil))))
+	 ;; Free it, then wake the parked: a waiter registers before it
+	 ;; looks at the flag, so it either finds the mutex free or is on
+	 ;; the list by the time the list is taken (or, the two plain
+	 ;; accesses here reordered by the machine, sleeps out its short
+	 ;; timeout, which is why the park has one).
+	 (set! (car access-cons) nil)
+	 (unless (null? (cdr access-cons))
+	   (dolist (w (%mutex-take-waiters access-cons))
+	     (%thread-unpark w))))))
 
 ;;; (WITH-MUTEX m . body): BODY holding M, released however BODY exits.
 
@@ -524,6 +546,78 @@
   (%store-process (make process))
   (%thread-register (make thread 'scheduler))
   (busy-work))
+
+;;; --------------------------------------------------
+;;; One step of waiting for a held mutex (ACQUIRE-MUTEX's slow path);
+;;; the value is the milliseconds spent parked.
+;;;
+;;; The scheduler's lock is held for a few instructions with alarms
+;;; off, so for it, and inside the scheduler's section (SIGNAL takes
+;;; a semaphore's mutex there), the step is a yield.  Otherwise, with
+;;; processes queued, run them (PAUSE): the holder may be among them,
+;;; and it is what the alarm would do.  With nothing queued and
+;;; another OS thread to release the mutex, park, registered in the
+;;; mutex's waiter list, for at most %MUTEX-PARK-MS: RELEASE-MUTEX
+;;; unparks the list.  The timeout covers a wakeup lost in the
+;;; register/look/park window (the permit model makes an unpark that
+;;; comes first count, so the window is only a reordered pair of
+;;; plain accesses), and lets a parked thread notice processes queued
+;;; meanwhile.  Alone on the only OS thread with nothing queued, the
+;;; holder cannot run at all; the loop spins on to the report.
+;;; --------------------------------------------------
+
+(define %mutex-park-ms 10)
+
+(define (%in-scheduler?)
+  (eq? (%mutex-owner *scheduleQ-mutex*) (%thread-index)))
+
+;;; The waiter list in the cdr of the access-cons, lock-free with
+;;; %TEST-AND-SET-LOCATIVE, which can fail spuriously under threads:
+;;; every loop rereads.
+
+(define (%mutex-add-waiter cell me)
+  (iterate retry ()
+    (let ((old (cdr cell)))
+      (unless (%test-and-set-locative (make-locative (cdr cell))
+				      old (cons me old))
+	(retry)))))
+
+(define (%mutex-drop-waiter cell me)
+  (iterate retry ()
+    (let ((old (cdr cell)))
+      (when (and (memq me old)
+		 (not (%test-and-set-locative (make-locative (cdr cell))
+					      old (delq me old))))
+	(retry)))))
+
+(define (%mutex-take-waiters cell)
+  (iterate retry ()
+    (let ((old (cdr cell)))
+      (cond ((null? old) '())
+	    ((%test-and-set-locative (make-locative (cdr cell)) old '()) old)
+	    (else (retry))))))
+
+(add-method (%mutex-wait (%thread-mutex) self)
+  (%thread-yield)
+  0)
+
+(add-method (%mutex-wait (mutex access-cons) self)
+  (cond ((%in-scheduler?)
+	 (%thread-yield)
+	 0)
+	((not (qempty? *scheduleQ*))
+	 (pause)
+	 0)
+	((> (%thread-count) 1)
+	 (let ((me (%thread-index)))
+	   (%mutex-add-waiter access-cons me)
+	   (let ((woken (or (null? (car access-cons)) ; freed meanwhile
+			    (%thread-park %mutex-park-ms))))
+	     (%mutex-drop-waiter access-cons me)
+	     (if woken 0 %mutex-park-ms))))
+	(else
+	 (%thread-yield)
+	 0)))
 
 ;;; --------------------------------------------------
 ;;;  Check to see if the user added a -pthreads option

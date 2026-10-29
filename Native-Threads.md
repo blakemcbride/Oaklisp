@@ -150,12 +150,16 @@ What is protected:
   again; a hit needs the same even count before and after its reads.
   `OP_METH_ALIST_MTF` is disabled under threads since it mutates the
   shared alist structure.
-- **Mutex spinning**: `acquire-mutex` calls `%thread-yield` (opcode 72,
-  `sched_yield()`) between attempts rather than busy-waiting.  A mutex
+- **Mutex waiting**: `acquire-mutex` does not spin: a waiter runs the
+  processes the scheduler has queued (`pause`), or parks its OS
+  thread (stream primitive 19) until `release-mutex` unparks it; it
+  yields (`%thread-yield`, opcode 72) only for the scheduler's lock
+  or inside the scheduler's section.  A mutex
   records the process holding it and a depth (reentrant; release by
   anyone else is an error), and may be named (`make-named-mutex`);
-  after `mutex-report-spins` attempts a waiter prints which mutex it
-  waits for and who holds it.  The scheduler's lock is a
+  after `mutex-report-spins` wait steps or `mutex-report-ms`
+  milliseconds parked a waiter prints which mutex it waits for and
+  who holds it.  The scheduler's lock is a
   `%thread-mutex`, held by the OS thread (`%thread-index`, LOAD-REG
   24): its section switches processes but runs with alarms off.
   `with-mutex` (exported) holds a mutex for a body and releases it on

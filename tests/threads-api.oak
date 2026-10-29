@@ -66,6 +66,30 @@
 		   '(1 2 3 4)))
 	 (car n))
        4000)
+(check "waiters park while the holder sleeps"
+       (let ((m (make mutex)) (got (list 0)))
+	 (let ((holder (make-thread
+			(lambda () (with-mutex m (thread-sleep 150) 'held)))))
+	   (thread-sleep 20)
+	   (let ((ws (map (lambda (k)
+			    (make-thread
+			     (lambda ()
+			       (with-mutex m (set! (car got) (+ (car got) 1)))
+			       k)))
+			  '(1 2 3))))
+	     (list (thread-join holder) (map thread-join ws) (car got)))))
+       '(held (1 2 3) 3))
+(check "contended mutex, many short sections"
+       (let ((m (make-named-mutex 'contended)) (n (list 0)))
+	 (map thread-join
+	      (map (lambda (k)
+		     (make-thread
+		      (lambda ()
+			(dotimes (i 5000)
+			  (with-mutex m (set! (car n) (+ (car n) 1)))))))
+		   '(1 2 3 4 5 6)))
+	 (car n))
+       30000)
 (check "fetch-and-add"
        (let ((c (list 0)))
 	 (map thread-join

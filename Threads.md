@@ -98,11 +98,17 @@ Oaklisp Runtime (`src/world/`)
 
 Synchronization primitives (all in `multiproc.oak`):
 
-- **Mutex**: Spin-lock via `%test-and-set-locative`, yielding between
-  attempts (`%thread-yield`, opcode 72).  Reentrant, held by the
-  process, released only by the holder; `with-mutex` releases on any
-  exit.  The runtime's own guarded sections go through `%guard`.
-  The scheduler's lock is held by the OS thread instead
+- **Mutex**: the held flag taken with `%test-and-set-locative`;
+  a waiter does not spin: it runs the processes the scheduler has
+  queued (`pause`, as the alarm would), or with none queued parks its
+  OS thread on the mutex's waiter list (stream primitive 19, 10 ms at
+  a time) until `release-mutex` unparks it; only the scheduler's own
+  lock, and a mutex taken inside the scheduler's section, is waited
+  for by yielding.  Reentrant, held by the process, released only by
+  the holder; `with-mutex` releases on any exit; a wait of a million
+  steps or five seconds parked is reported on standard error with
+  the holder.  The runtime's own guarded sections go through
+  `%guard`.  The scheduler's lock is held by the OS thread instead
   (`%thread-mutex`).
 - **Semaphore**: Mutex + waiting queue.  Blocked processes enqueued,
   woken on `signal`.

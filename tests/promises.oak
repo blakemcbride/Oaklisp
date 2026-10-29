@@ -60,3 +60,12 @@
 (check "with-mutex value" (let ((m (make mutex))) (with-mutex m (+ 1 2))) 3)
 (check "with-mutex releases on throw" (let ((m (make-named-mutex 'wm))) (catch k (with-mutex m (k 1))) (with-mutex m 'free)) 'free)
 (check "release by non-holder is an error" (let ((m (make mutex))) (catch-errors (general-error (lambda (e) 'caught)) (release-mutex m) 'released)) 'caught)
+
+;;; A process that finds a mutex held by another lightweight process
+;;; runs the queued processes instead of spinning until the alarm.
+(check "mutex held by a paused process"
+       (let* ((m (make mutex))
+	      (f (future (with-mutex m (pause) (pause) 'f))))
+	 (pause)
+	 (list (with-mutex m 'main) (force f)))
+       '(main f))
