@@ -138,4 +138,17 @@ out=$(OAKWORLD=/nonexistent ./tak-w-x) || fail "tak-w-x exited nonzero"
 test "$out" = 9 || fail "tak-w-x printed '$out', wanted 9"
 echo "ok tak-w-x (whole program)"
 
+# With threads: the thread API program (less its loads of the
+# examples) as straight C, its OS threads running the native call
+# driver.
+enabled=$(oak -- --eval '(print (%threads-enabled?) standard-output)' --exit 2>&1 | tail -c 3)
+case $enabled in
+  *T*)
+    sed '/^(load /,$d' "$testdir/threads-api.oak" > threads-x.oak
+    oak -- --load threads-x --exit 2>&1 | grep -E '^(PASS|FAIL)' > threads-x.oak.want
+    grep -q '^FAIL' threads-x.oak.want && fail "the emulator itself fails threads-x.oak"
+    check_exe threads-x.oak threads-x.oak
+    ;;
+esac
+
 echo "standalone test passed"

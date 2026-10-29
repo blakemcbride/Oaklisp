@@ -42,38 +42,17 @@
 #endif
 
 
-#ifndef THREADS
 /* Natively compiled modules resolve their oak_rt_* helpers against
    this executable, so the archive member holding them must be linked
    in even though the interpreter itself never calls them. */
 void (*volatile oak_force_native_ops) (void) = oak_native_run;
-#endif
 
 int
 oak_main(int argc, char **argv, const oak_embedding *emb)
 {
 #ifdef THREADS
-  int my_index;
-  int *my_index_p;
-  oak_threads_system_init();
-  oak_tls_create(&index_key, free_registers);
-#endif
-
-#ifdef THREADS
-  my_index_p = (int *)xmalloc(sizeof (int));
-  *my_index_p = get_next_index();
-  oak_tls_set(index_key, (void*)my_index_p);
-  my_index_p = oak_tls_get(index_key);
-  my_index = *my_index_p;
-  gc_ready[my_index] = 0;
-  /* inc_next_index();*/
-  value_stack_array[my_index] = (oakstack*)xmalloc(sizeof (oakstack));
-  cntxt_stack_array[my_index] = (oakstack*)xmalloc(sizeof (oakstack));
-  value_stack.size = 1024;
-  value_stack.filltarget = 1024/2;
-  context_stack.size = 512;
-  context_stack.filltarget = 512/2;
-  gc_examine_ptr = gc_examine_buffer;
+  oak_thread0_init();
+  oak_thread_entry = loop;
 #endif
 
   parse_cmd_line(argc, argv);
@@ -111,11 +90,9 @@ oak_main(int argc, char **argv, const oak_embedding *emb)
 #endif
 
   /* Cleared: e_process in particular has to start as the fixnum 0,
-     which is how the world knows no process object exists yet. */
-#ifdef THREADS
-  register_array[my_index] = (register_set_t*)xmalloc(sizeof(register_set_t));
-  memset(register_array[my_index], 0, sizeof(register_set_t));
-#else
+     which is how the world knows no process object exists yet (with
+     THREADS, oak_thread0_init did this). */
+#ifndef THREADS
   reg_set = (register_set_t*)xmalloc(sizeof(register_set_t));
   memset(reg_set, 0, sizeof(register_set_t));
 #endif

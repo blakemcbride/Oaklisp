@@ -100,8 +100,53 @@ lookup_bp_offset(ref_t y_type, ref_t meth_type)
 extern void find_method_type_pair(ref_t op, ref_t obj_type,
 				  ref_t * method_ptr, ref_t * type_ptr);
 
-#ifndef THREADS
-extern ref_t oak_native_find_method(ref_t op, ref_t y_type, ref_t * offset);
+/* An operation's one-entry method cache (OP_TYPE_METH_CACHE): the
+   method and bp offset for the type of its last argument.  With
+   THREADS a fill is guarded by a sequence count striped by operation
+   address: a reader trusts the three slots only if the count is the
+   same even number before and after reading them (the type slot alone
+   cannot guard them: a fill for another type writes the method and
+   offset before the type).  oak_mcache_read is the read: true with
+   *METHOD and *OFFSET when the cache is aimed at Y_TYPE, consistently;
+   oak_mcache_fill records a search's result, leaving the cache alone
+   when another fill has it. */
+#ifdef THREADS
+#include "oak-atomic.h"
+#define MCACHE_STRIPES 1024
+extern size_t mcache_seq[MCACHE_STRIPES];
+#define MCACHE_SEQ(op) \
+  (&mcache_seq[((unsigned long)(op) >> 4) & (MCACHE_STRIPES - 1)])
 #endif
+
+static inline bool
+oak_mcache_read(ref_t op, ref_t y_type, ref_t * method, ref_t * offset)
+{
+#ifdef THREADS
+  size_t *seqp = MCACHE_SEQ(op);
+  size_t seq1 = OAK_ATOMIC_LOAD_REF(seqp);
+  ref_t cached_type = OAK_ATOMIC_LOAD_REF(&REF_SLOT(op, OPERATION_CACHE_TYPE_OFF));
+
+  if ((seq1 & 1) || y_type != cached_type)
+    return false;
+  *method = OAK_ATOMIC_LOAD_REF(&REF_SLOT(op, OPERATION_CACHE_METH_OFF));
+  *offset = OAK_ATOMIC_LOAD_REF(&REF_SLOT(op, OPERATION_CACHE_TYPE_OFF_OFF));
+  OAK_ATOMIC_FENCE_ACQUIRE();
+  return OAK_ATOMIC_LOAD_REF(seqp) == seq1
+    && y_type == OAK_ATOMIC_LOAD_REF(&REF_SLOT(op, OPERATION_CACHE_TYPE_OFF));
+#else
+  if (y_type != REF_SLOT(op, OPERATION_CACHE_TYPE_OFF))
+    return false;
+  *method = REF_SLOT(op, OPERATION_CACHE_METH_OFF);
+  *offset = REF_SLOT(op, OPERATION_CACHE_TYPE_OFF_OFF);
+  return true;
+#endif
+}
+
+extern void oak_mcache_fill(ref_t op, ref_t y_type, ref_t method,
+			    ref_t offset);
+
+/* For natively compiled code (oak-native.h): the method as FUNCALL
+   finds it, filling the cache; e_nil when there is none. */
+extern ref_t oak_native_find_method(ref_t op, ref_t y_type, ref_t * offset);
 
 #endif

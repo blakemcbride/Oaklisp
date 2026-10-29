@@ -37,6 +37,8 @@ oak_mutex_t gc_lock = OAK_MUTEX_INITIALIZER;
 oak_mutex_t alloc_lock = OAK_MUTEX_INITIALIZER;
 oak_mutex_t index_lock = OAK_MUTEX_INITIALIZER;
 oak_mutex_t test_and_set_locative_lock = OAK_MUTEX_INITIALIZER;
+/* DUMP-WORLD and LOAD-WORLD, in the interpreter and in native code. */
+oak_mutex_t dump_lock = OAK_MUTEX_INITIALIZER;
 bool gc_pending = false;
 int gc_ready[MAX_THREAD_COUNT];
 /* Slots of threads that have exited.  next_index never decreases, so
@@ -106,12 +108,70 @@ oak_threads_system_init(void)
     oak_mutex_init(&test_and_set_locative_lock);
     {
       extern oak_mutex_t wp_lock;
-      extern oak_mutex_t dump_lock;
       oak_mutex_init(&wp_lock);
       oak_mutex_init(&dump_lock);
       oak_mutex_init(&park_init_lock);
     }
 #endif
+}
+
+/* Thread 0: the mutexes, the thread-local key and index, the slot,
+   its stacks (sized here, before the command line can resize them;
+   init_stacks allocates them) and a zeroed register set -- e_process
+   in particular has to start as the fixnum 0, which is how the world
+   knows no process object exists yet. */
+void
+oak_thread0_init(void)
+{
+  int my_index;
+  int *my_index_p;
+
+  oak_threads_system_init();
+  oak_tls_create(&index_key, free_registers);
+  my_index_p = (int *)malloc(sizeof (int));
+  if (my_index_p == NULL) {
+    fprintf(stderr, "Out of memory starting the main thread.\n");
+    exit(EXIT_FAILURE);
+  }
+  *my_index_p = get_next_index();
+  oak_tls_set(index_key, (void*)my_index_p);
+  my_index = *my_index_p;
+  oak_thread_index_var = my_index;
+  gc_ready[my_index] = 0;
+  value_stack_array[my_index] = (oakstack*)malloc(sizeof (oakstack));
+  cntxt_stack_array[my_index] = (oakstack*)malloc(sizeof (oakstack));
+  register_array[my_index] = (register_set_t*)malloc(sizeof(register_set_t));
+  if (value_stack_array[my_index] == NULL || cntxt_stack_array[my_index] == NULL
+      || register_array[my_index] == NULL) {
+    fprintf(stderr, "Out of memory starting the main thread.\n");
+    exit(EXIT_FAILURE);
+  }
+  memset(value_stack_array[my_index], 0, sizeof (oakstack));
+  memset(cntxt_stack_array[my_index], 0, sizeof (oakstack));
+  memset(register_array[my_index], 0, sizeof(register_set_t));
+  value_stack.size = 1024;
+  value_stack.filltarget = 1024/2;
+  context_stack.size = 512;
+  context_stack.filltarget = 512/2;
+  gc_examine_ptr = gc_examine_buffer;
+}
+
+/* A long blocking call, made with the stacks synchronized, counts as
+   time parked: say so for its length, and leave that state under
+   gc_lock so a collection that counted us stays stopped (as
+   oak_thread_park does). */
+void
+oak_thread_blocking_begin(void)
+{
+  gc_ready[oak_thread_index_var] = 1;
+}
+
+void
+oak_thread_blocking_end(void)
+{
+  oak_mutex_lock(&gc_lock);
+  gc_ready[oak_thread_index_var] = 0;
+  oak_mutex_unlock(&gc_lock);
 }
 #endif
 
@@ -120,6 +180,19 @@ typedef struct {
   int parent_index;
   int my_index;
 } start_info_t;
+
+#ifdef THREADS
+/* This thread's index, for code without a my_index local (threads.h). */
+#if defined(_MSC_VER) && !defined(__MINGW32__)
+__declspec(thread) int oak_thread_index_var;
+#else
+__thread int oak_thread_index_var __attribute__((tls_model("initial-exec")));
+#endif
+
+/* What a new thread runs: loop (oaklisp.c) or the native call driver
+   (embed-native.c), whichever entry point is linked in. */
+void (*oak_thread_entry)(ref_t start_operation) = NULL;
+#endif
 
 #ifdef THREADS
 static void *init_thread(void *info_p);
@@ -184,6 +257,7 @@ static void *init_thread (void *info_p)
   }
   *my_index_p = info.my_index;
   oak_tls_set(index_key, (void *)my_index_p);
+  oak_thread_index_var = my_index;
   /* From here on the thread-local destructor, free_registers, releases
      whatever has been allocated and hands the slot back, so an
      allocation failure only has to return. */
@@ -220,6 +294,9 @@ static void *init_thread (void *info_p)
 
   memcpy(register_array[my_index], register_array[info.parent_index],
 	 sizeof(register_set_t));
+  /* Alarms start off in a new thread, whatever its parent's were. */
+  register_array[my_index]->timer_counter = 0;
+  register_array[my_index]->timer_increment = 0;
 
   gc_examine_ptr = gc_examine_buffer;
 
@@ -239,7 +316,7 @@ static void *init_thread (void *info_p)
   if (setjmp(thread_exit_point[my_index]) == 0)
     {
       thread_exit_armed[my_index] = 1;
-      loop(info.start_operation);
+      (*oak_thread_entry)(info.start_operation);
     }
 
   thread_exit_armed[my_index] = 0;

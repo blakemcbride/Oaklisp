@@ -1118,7 +1118,7 @@
 	       (trap-resume op 1))
 	      ((set-contents)
 	       (emit "ON_NEED(1); x = sp[0];")
-	       (emit "if (TAG_IS(x, LOC_TAG)) { sp--; *LOC_TO_PTR(x) = sp[0]; }")
+	       (emit "if (TAG_IS(x, LOC_TAG)) { sp--; ON_STORE(LOC_TO_PTR(x), sp[0]); }")
 	       (trap-resume op 2))
 	      ((plus subtract)
 	       ;; Proven fixnums (the abstract stack) keep the overflow
@@ -1258,7 +1258,7 @@
 	      ((load-env)
 	       (emit (format #f "ON_PUSH(e_env[~D]);" (cadr instr))))
 	      ((store-env)
-	       (emit (format #f "e_env[~D] = sp[0];" (cadr instr))))
+	       (emit (format #f "ON_STORE(&e_env[~D], sp[0]);" (cadr instr))))
 	      ((make-env-loc)
 	       (emit (format #f "ON_PUSH(PTR_TO_LOC(e_env + ~D));" (cadr instr))))
 	      ;; Instance variables: the offset is read from the stub,
@@ -1267,7 +1267,7 @@
 	       (emit (format #f "x = e_bp[ON_OPERAND(P~D)]; ON_PUSH(x);"
 			     (operand instr))))
 	      ((store-bp)
-	       (emit (format #f "e_bp[ON_OPERAND(P~D)] = sp[0];" (operand instr))))
+	       (emit (format #f "ON_STORE(&e_bp[ON_OPERAND(P~D)], sp[0]);" (operand instr))))
 	      ((make-bp-loc)
 	       (emit (format #f "ON_PUSH(PTR_TO_LOC(e_bp + ON_OPERAND(P~D)));"
 			     (operand instr))))
@@ -1295,9 +1295,9 @@
 		   ((method-type) (emit "ON_PUSH(e_method_type);"))
 		   ((operation-type) (emit "ON_PUSH(e_operation_type);"))
 		   ((process) (emit "ON_PUSH(e_process);"))
-		   ((threads-enabled?) (emit "ON_PUSH(e_nil);"))
-		   ((thread-index) (emit "ON_PUSH(INT_TO_REF(0));"))
-		   ((thread-count) (emit "ON_PUSH(INT_TO_REF(1));"))
+		   ((threads-enabled?) (emit "ON_PUSH(ON_THREADS_ENABLED);"))
+		   ((thread-index) (emit "ON_PUSH(INT_TO_REF(ON_THREAD_INDEX));"))
+		   ((thread-count) (emit "ON_PUSH(INT_TO_REF(ON_THREAD_COUNT));"))
 		   (else (escape "" instr))))
 	      ((store-reg)
 	       (let* ((reg (cadr instr))
@@ -1395,7 +1395,7 @@
 		 (atrap-resume 2 spec 2)))
 	      ((set-car set-cdr)
 	       (emit "ON_NEED(1); x = sp[0];")
-	       (emit (format #f "if (TAG_IS(x, PTR_TAG) && REF_SLOT(x, 0) == e_cons_type) { sp -= 1; REF_SLOT(x, ~A) = sp[0]; }"
+	       (emit (format #f "if (TAG_IS(x, PTR_TAG) && REF_SLOT(x, 0) == e_cons_type) { sp -= 1; ON_STORE(&REF_SLOT(x, ~A), sp[0]); }"
 			     (if (eq? op 'set-car) "CONS_PAIR_CAR_OFF" "CONS_PAIR_CDR_OFF")))
 	       (trap-resume op 2))
 	      ((locate-car locate-cdr)
@@ -1458,7 +1458,7 @@
 	       (trap-resume op 1))
 	      ((store-bp-i)
 	       (emit "ON_NEED(1); x = sp[0];")
-	       (emit "if (TAG_IS(x, INT_TAG)) { sp -= 1; e_bp[REF_TO_INT(x)] = sp[0]; }")
+	       (emit "if (TAG_IS(x, INT_TAG)) { sp -= 1; ON_STORE(&e_bp[REF_TO_INT(x)], sp[0]); }")
 	       (trap-resume op 2))
 	      ((load-bp-i)
 	       (emit "x = sp[0];")
@@ -1474,7 +1474,7 @@
 	       (trap-resume op 2))
 	      ((store-slot)
 	       (emit "ON_NEED(1); x = sp[0];")
-	       (emit (format #f "if (TAG_IS(x, PTR_TAG)) { sp -= 1; REF_SLOT(x, ~D) = sp[0]; } else ON_ATRAP_TAIL(26, ~D, 2);"
+	       (emit (format #f "if (TAG_IS(x, PTR_TAG)) { sp -= 1; ON_STORE(&REF_SLOT(x, ~D), sp[0]); } else ON_ATRAP_TAIL(26, ~D, 2);"
 			     (cadr instr) (cadr instr))))
 	      ((load-slot)
 	       (emit "x = sp[0];")
@@ -1488,7 +1488,7 @@
 	       (atrap-resume 30 (cadr instr) 1))
 	      ((filltag)
 	       (emit "x = sp[0];")
-	       (emit (format #f "if (TAG_IS(x, PTR_TAG)) { REF_SLOT(x, ESCAPE_OBJECT_VAL_OFF) = INT_TO_REF((sp - value_stack.bp + 1) + value_stack.pushed_count - ~D); REF_SLOT(x, ESCAPE_OBJECT_CXT_OFF) = INT_TO_REF((context_stack.sp - context_stack.bp + 1) + context_stack.pushed_count); }"
+	       (emit (format #f "if (TAG_IS(x, PTR_TAG)) { ON_STORE(&REF_SLOT(x, ESCAPE_OBJECT_VAL_OFF), INT_TO_REF((sp - value_stack.bp + 1) + value_stack.pushed_count - ~D)); ON_STORE(&REF_SLOT(x, ESCAPE_OBJECT_CXT_OFF), INT_TO_REF((context_stack.sp - context_stack.bp + 1) + context_stack.pushed_count)); }"
 			     (cadr instr)))
 	       (atrap-resume 32 (cadr instr) 1))
 	      ((throw)
@@ -1525,12 +1525,12 @@
 	       (trap-resume op 2))
 	      ((test-and-set-locative)
 	       (emit "ON_NEED(2); x = sp[0];")
-	       (emit "if (TAG_IS(x, LOC_TAG)) { y = sp[-1]; sp -= 2; if (*LOC_TO_PTR(x) != y) sp[0] = e_false; else { *LOC_TO_PTR(x) = sp[0]; sp[0] = e_t; } }")
+	       (emit "if (TAG_IS(x, LOC_TAG)) { y = sp[-1]; sp -= 2; sp[0] = oak_rt_test_and_set(LOC_TO_PTR(x), y, sp[0]); }")
 	       (trap-resume op 3))
 	      ((make-heavyweight-thread)
-	       (emit "sp[0] = e_nil;"))
+	       (emit "sp[0] = oak_rt_make_thread(sp[0]);"))
 	      ((thread-yield)
-	       (emit "ON_PUSH(e_nil);"))
+	       (emit "oak_rt_thread_yield(); ON_PUSH(e_nil);"))
 	      ((enable-alarms)
 	       (emit "sp = oak_rt_enable_alarms(sp);"))
 	      ((disable-alarms)

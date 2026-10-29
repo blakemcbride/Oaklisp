@@ -62,17 +62,21 @@
 #include "weak.h"
 #include "timers.h"
 #include "cmdline.h"
+#include "gc.h"
+#include "dispatch.h"
 #include "native-ops.h"
+#include "threads.h"
 
 #ifdef THREADS
-#error "native code is not supported with threads"
+/* With THREADS the registers and stacks are per thread, reached
+   through my_index (data.h); here, where no interpreter local holds
+   it, it is the thread-local index of threads.c. */
+#define my_index oak_thread_index_var
 #endif
 
 /* Bump when the layout of anything below, or of the stub code
    vectors, changes. */
-#define OAK_NATIVE_ABI 5
-
-typedef int (*oak_native_fn) (unsigned resume);
+#define OAK_NATIVE_ABI 6
 
 typedef struct {
   const char *name;
@@ -97,12 +101,17 @@ typedef struct {
      path, exactly as the one-entry cache alone would.
 
    Sites hold raw refs, which the GC does not trace, so every
-   collection, world load and module registration flushes them all
-   (oak_native_flush_sites); in between nothing moves.  A filled site
-   with a null fn means "not directly callable, stop asking" -- until
-   the global holds something else, or the witnessed method changes. */
+   collection that moves objects, every world load and every module
+   registration flushes them all (oak_native_flush_sites); in between
+   nothing moves (a concurrent mark-sweep cycle moves nothing).  A
+   filled site with a null fn means "not directly callable, stop
+   asking" -- until the global holds something else, or the witnessed
+   method changes.  With THREADS a fill is guarded by the site's
+   sequence count (seq), odd while it writes, so a reader in another
+   thread never acts on half a fill. */
 typedef struct {
   ref_t epoch;			/* oak_native_epoch when filled, or 0 */
+  size_t seq;			/* THREADS: odd while a fill is writing */
   ref_t op;
   ref_t y_type;			/* generic: first argument's type; 0: lambda */
   ref_t offset;			/* generic: the method's bp offset (a fixnum) */
@@ -152,9 +161,9 @@ typedef struct {
     sizeof (entries) / sizeof ((entries)[0]), (entries),		\
     (sites), sizeof (sites) / sizeof ((sites)[0]) }
 
-/* What a native function asks the emulator to do next. */
-#define OAK_NATIVE_CONTINUE	0	/* resume bytecode at e_pc */
-#define OAK_NATIVE_FUNCALL	1	/* call the operation on top of the stack */
+/* What a native function asks the emulator to do next:
+   OAK_NATIVE_CONTINUE (resume bytecode at e_pc) or OAK_NATIVE_FUNCALL
+   (call the operation on top of the stack), native-ops.h. */
 
 /* NATIVE k is opcode 35 + k / 256 with argument k % 256. */
 #define ON_NATIVE_OPCODE 35
@@ -162,16 +171,51 @@ typedef struct {
 
 extern volatile sig_atomic_t signal_poll_flag;
 
-/* Something to deliver: a pending signal, or the alarm clock tripping.
-   This is native code's POLL_SIGNALS: without it the preemption the
-   thread system is built on (alarms, multiproc.oak) would never fire
-   in compiled code. */
+/* Something to deliver: a pending signal (thread 0's to deliver), the
+   alarm clock tripping, or with THREADS a collection another thread
+   is waiting to start.  This is native code's POLL_SIGNALS: without
+   it the preemption the thread system is built on (alarms,
+   multiproc.oak) would never fire in compiled code, and a thread in
+   a long native loop would never reach the collector's rendezvous;
+   the code returns to its dispatcher, which delivers. */
+#ifdef THREADS
+#define ON_PENDING()							\
+  ((signal_poll_flag && my_index == 0) || gc_pending			\
+   || (oak_timer_increment						\
+       && (oak_timer_counter += oak_timer_increment) > OAK_TIMER_LIMIT))
+#else
 #define ON_PENDING()							\
   (signal_poll_flag							\
    || (oak_timer_increment						\
        && (oak_timer_counter += oak_timer_increment) > OAK_TIMER_LIMIT))
+#endif
 extern ref_t oak_native_epoch;
-extern oak_native_fn *oak_native_fns;
+
+/* The registered functions, by index, in chunks that never move. */
+#define OAK_NATIVE_FN_CHUNK	1024
+#define OAK_NATIVE_FN_CHUNKS	4096
+extern oak_native_fn *oak_native_fn_chunks[OAK_NATIVE_FN_CHUNKS];
+#define oak_native_fn_at(i)						\
+  (oak_native_fn_chunks[(i) / OAK_NATIVE_FN_CHUNK][(i) % OAK_NATIVE_FN_CHUNK])
+
+/* Every store of a ref into a heap object that generated code and
+   the helpers make goes through this, which is where the write
+   barrier of the concurrent collector (gc-ms.h) sits; a store into a
+   stack or a register does not.  native-parity.test greps the
+   generated C for raw stores. */
+#define ON_STORE(p, v)							\
+  do { ref_t *_on_p = (p); SATB_BARRIER(_on_p); *_on_p = (v); } while (0)
+
+/* The thread registers (LOAD-REG 23 to 25). */
+#ifdef THREADS
+#define ON_THREADS_ENABLED	e_t
+#define ON_THREAD_INDEX		my_index
+#define ON_THREAD_COUNT		oak_live_thread_count()
+#else
+#define ON_THREADS_ENABLED	e_nil
+#define ON_THREAD_INDEX		0
+#define ON_THREAD_COUNT		1
+#endif
 
 /* Slow paths, in native.c.  They take and return the value stack
    pointer, which the generated code keeps in a local. */
@@ -302,9 +346,15 @@ oak_native_known(ref_t seg)
 
   if ((*CODE_SEG_FIRST_INSTR(seg) & 0xFF) != (ON_NATIVE_OPCODE << 2))
     return NULL;
+  /* The epoch is written last by a resolution (an acquiring load
+     here sees the index with it). */
+#ifdef THREADS
+  if (OAK_ATOMIC_LOAD_REF(&cv[n - 1]) != oak_native_epoch)
+#else
   if (cv[n - 1] != oak_native_epoch)
+#endif
     return oak_native_resolve(seg);
-  return oak_native_fns[REF_TO_INT(cv[n - 3])];
+  return oak_native_fn_at(REF_TO_INT(cv[n - 3]));
 }
 
 static inline ref_t
@@ -364,12 +414,8 @@ oak_native_call_1(oak_native_fn * fn, int ignore_signal)
 	return 0;
       y = sp[-1];
       y_type = e_nargs == 0 ? e_object_type : oak_native_type(y);
-      if (y_type == REF_SLOT(op, OPERATION_CACHE_TYPE_OFF))
-	{
-	  m = REF_SLOT(op, OPERATION_CACHE_METH_OFF);
-	  offset = REF_SLOT(op, OPERATION_CACHE_TYPE_OFF_OFF);
-	}
-      else if ((m = oak_native_find_method(op, y_type, &offset)) == e_nil)
+      if (!oak_mcache_read(op, y_type, &m, &offset)
+	  && (m = oak_native_find_method(op, y_type, &offset)) == e_nil)
 	return 0;
       e_bp = REF_TO_PTR(y) + REF_TO_INT(offset);
     }
@@ -473,23 +519,42 @@ oak_native_direct_return(unsigned *k)
        return OAK_NATIVE_CONTINUE; } while (0)
 #endif
 
-/* The common tail of a site hit: the registers, then the jump. */
-#ifdef ON_MUSTTAIL
-#define ON_SITE_JUMP(s)							\
-  do { e_current_method = (s)->method;					\
-       e_code_segment = (s)->code;					\
-       e_env = REF_TO_PTR((s)->env);					\
-       e_pc = CODE_SEG_FIRST_INSTR((s)->code) + 1;			\
-       ON_SYNC;								\
-       ON_MUSTTAIL return (s)->fn(0); } while (0)
+/* The common tail of a site hit: the registers, then the jump.  The
+   fields are taken into locals and, with THREADS, trusted only if the
+   site's sequence count is still the even number ON_SITE_CALL read
+   first (a fill in another thread takes it odd and leaves it changed);
+   otherwise the call falls through to the ON_FUNCALL after it.  BP is
+   1 for a generic site, whose bp offset applies, 0 for a lambda. */
+#ifdef THREADS
+#define ON_SITE_CHECK(s, seq1)						\
+  (OAK_ATOMIC_FENCE_ACQUIRE(), OAK_ATOMIC_LOAD_REF(&(s)->seq) == (seq1))
 #else
-#define ON_SITE_JUMP(s)							\
-  do { e_current_method = (s)->method;					\
-       e_code_segment = (s)->code;					\
-       e_env = REF_TO_PTR((s)->env);					\
-       e_pc = CODE_SEG_FIRST_INSTR((s)->code);				\
-       ON_SYNC;								\
-       return OAK_NATIVE_CONTINUE; } while (0)
+#define ON_SITE_CHECK(s, seq1)	1
+#endif
+#ifdef ON_MUSTTAIL
+#define ON_SITE_JUMP(s, seq1, bp)					\
+  do { ref_t _on_m = (s)->method, _on_c = (s)->code, _on_e = (s)->env;	\
+       ref_t _on_o = (s)->offset; oak_native_fn _on_fn = (s)->fn;	\
+       if (ON_SITE_CHECK(s, seq1))					\
+	 { if (bp) e_bp = REF_TO_PTR(sp[-1]) + REF_TO_INT(_on_o);	\
+	   e_current_method = _on_m;					\
+	   e_code_segment = _on_c;					\
+	   e_env = REF_TO_PTR(_on_e);					\
+	   e_pc = CODE_SEG_FIRST_INSTR(_on_c) + 1;			\
+	   ON_SYNC;							\
+	   ON_MUSTTAIL return _on_fn(0); } } while (0)
+#else
+#define ON_SITE_JUMP(s, seq1, bp)					\
+  do { ref_t _on_m = (s)->method, _on_c = (s)->code, _on_e = (s)->env;	\
+       ref_t _on_o = (s)->offset;					\
+       if (ON_SITE_CHECK(s, seq1))					\
+	 { if (bp) e_bp = REF_TO_PTR(sp[-1]) + REF_TO_INT(_on_o);	\
+	   e_current_method = _on_m;					\
+	   e_code_segment = _on_c;					\
+	   e_env = REF_TO_PTR(_on_e);					\
+	   e_pc = CODE_SEG_FIRST_INSTR(_on_c);				\
+	   ON_SYNC;							\
+	   return OAK_NATIVE_CONTINUE; } } while (0)
 #endif
 
 /* A call through the site cache S: V, the operation on top of the
@@ -505,23 +570,29 @@ oak_native_direct_return(unsigned *k)
    have behaved.  V and the argument are read from the stack, not from
    C locals: pushing them may have collected garbage, which moves the
    operation and flushes every site. */
+#ifdef THREADS
+#define ON_SITE_SEQ(s)	OAK_ATOMIC_LOAD_REF(&(s)->seq)
+#else
+#define ON_SITE_SEQ(s)	0
+#endif
 #define ON_SITE_CALL(s, v)						\
-  do { ref_t _on_v = (v), _on_t = INT_TO_REF(0);			\
+  do { ref_t _on_v = (v), _on_t = INT_TO_REF(0), _on_cm, _on_co;	\
+       size_t _on_s1 = ON_SITE_SEQ(s);					\
        if (sp - value_stack.bp >= 1)					\
 	 _on_t = e_nargs == 0 ? e_object_type				\
 	   : oak_native_type(sp[-1]);					\
-       if ((s)->epoch != oak_native_epoch || (s)->op != _on_v)		\
+       if (_on_s1 & 1)							\
+	 ;	/* another thread is filling it: the long way */	\
+       else if ((s)->epoch != oak_native_epoch || (s)->op != _on_v)	\
 	 oak_native_site_fill((s), _on_v, _on_t);			\
        else if ((s)->y_type == INT_TO_REF(0))				\
 	 { if ((s)->fn != NULL && !ON_PENDING())			\
-	     ON_SITE_JUMP(s); }						\
-       else if (REF_SLOT(_on_v, OPERATION_CACHE_TYPE_OFF) == _on_t)	\
-	 { if (_on_t != (s)->y_type					\
-	       || REF_SLOT(_on_v, OPERATION_CACHE_METH_OFF) != (s)->method) \
+	     ON_SITE_JUMP(s, _on_s1, 0); }				\
+       else if (oak_mcache_read(_on_v, _on_t, &_on_cm, &_on_co))	\
+	 { if (_on_t != (s)->y_type || _on_cm != (s)->method)		\
 	     oak_native_site_fill((s), _on_v, _on_t);			\
 	   else if ((s)->fn != NULL && !ON_PENDING())			\
-	     { e_bp = REF_TO_PTR(sp[-1]) + REF_TO_INT((s)->offset);	\
-	       ON_SITE_JUMP(s); } }					\
+	     ON_SITE_JUMP(s, _on_s1, 1); }				\
      } while (0)
 
 /* Do what the emulator does when an argless instruction INSTR fails

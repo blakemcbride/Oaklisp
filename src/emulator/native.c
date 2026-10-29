@@ -32,6 +32,7 @@
 #include "stacks.h"
 #include "xmalloc.h"
 #include "native.h"
+#include "oak-native.h"
 
 /* The embedded program's .oa text (oak-embed.h), or null. */
 const char *oak_embedded_program = NULL;
@@ -70,19 +71,37 @@ oak_load_pending_native_modules(void)
       exit(EXIT_FAILURE);
 }
 
-#ifndef THREADS
-
 #ifdef HAVE_DLOPEN
 #include <dlfcn.h>
 #endif
 
 /* Every function of every loaded module, by name.  A name loaded
    again (a module recompiled and reloaded) takes over its old index,
-   so stubs already pointing there call the new code. */
+   so stubs already pointing there call the new code.  The functions
+   sit in chunks that are never moved or freed, so a stub's index is
+   good to read without a lock while a registration grows the table;
+   the names and the hash are only touched under native_lock. */
 
-oak_native_fn *oak_native_fns = NULL;
+oak_native_fn *oak_native_fn_chunks[OAK_NATIVE_FN_CHUNKS];
 static char **native_names = NULL;
 static size_t native_count = 0, native_capacity = 0;
+
+#ifdef THREADS
+/* The registry (functions, names, hash, resolution), and the sites
+   (fills and flushes); a fill resolves, so it takes site_lock then
+   native_lock, and registration never holds both. */
+static oak_mutex_t native_lock = OAK_MUTEX_INITIALIZER;
+static oak_mutex_t site_lock = OAK_MUTEX_INITIALIZER;
+#define NATIVE_LOCK()	oak_mutex_lock(&native_lock)
+#define NATIVE_UNLOCK()	oak_mutex_unlock(&native_lock)
+#define SITE_LOCK()	oak_mutex_lock(&site_lock)
+#define SITE_UNLOCK()	oak_mutex_unlock(&site_lock)
+#else
+#define NATIVE_LOCK()	((void)0)
+#define NATIVE_UNLOCK()	((void)0)
+#define SITE_LOCK()	((void)0)
+#define SITE_UNLOCK()	((void)0)
+#endif
 
 static size_t *native_hash = NULL;	/* index + 1, or 0 for empty */
 static size_t native_hash_size = 0;
@@ -138,24 +157,36 @@ register_function(const char *name, oak_native_fn fn)
   slot = lookup_slot(name);
   if (native_hash[slot] != 0)
     {
-      oak_native_fns[native_hash[slot] - 1] = fn;
+      oak_native_fn_at(native_hash[slot] - 1) = fn;
       return;
     }
   if (native_count == native_capacity)
     {
       native_capacity = native_capacity ? native_capacity * 2 : 256;
-      oak_native_fns =
-	realloc(oak_native_fns, native_capacity * sizeof(*oak_native_fns));
       native_names =
 	realloc(native_names, native_capacity * sizeof(*native_names));
-      if (oak_native_fns == NULL || native_names == NULL)
+      if (native_names == NULL)
 	{
 	  fprintf(stderr, "Fatal error (vm): out of memory "
 		  "registering native functions.\n");
 	  exit(EXIT_FAILURE);
 	}
     }
-  oak_native_fns[native_count] = fn;
+  if (native_count % OAK_NATIVE_FN_CHUNK == 0)
+    {
+      size_t chunk = native_count / OAK_NATIVE_FN_CHUNK;
+
+      if (chunk >= OAK_NATIVE_FN_CHUNKS)
+	{
+	  fprintf(stderr, "Fatal error (vm): more than %lu native "
+		  "functions.\n",
+		  (unsigned long)OAK_NATIVE_FN_CHUNK * OAK_NATIVE_FN_CHUNKS);
+	  exit(EXIT_FAILURE);
+	}
+      oak_native_fn_chunks[chunk] =
+	xmalloc(OAK_NATIVE_FN_CHUNK * sizeof(oak_native_fn));
+    }
+  oak_native_fn_at(native_count) = fn;
   native_names[native_count] = strdup(name);
   native_hash[slot] = ++native_count;
 }
@@ -168,6 +199,16 @@ oak_native_init(void)
   /* Any fixnum but zero; the top bits are dropped to make it one. */
   r &= ((size_t)1 << (OAK_WORD_SIZE - TAGSIZE - 1)) - 1;
   oak_native_epoch = INT_TO_REF(r | 1);
+#if defined(THREADS) && defined(OAK_NEEDS_DYNAMIC_MUTEX_INIT)
+  oak_mutex_init(&native_lock);
+  oak_mutex_init(&site_lock);
+#endif
+}
+
+oak_native_fn
+oak_native_lookup(ref_t seg)
+{
+  return oak_native_known(seg);
 }
 
 bool
@@ -231,9 +272,11 @@ oak_native_flush_sites(void)
 {
   unsigned i, j;
 
+  SITE_LOCK();
   for (i = 0; i < site_module_count; i++)
     for (j = 0; j < site_modules[i]->site_count; j++)
       site_modules[i]->sites[j].epoch = INT_TO_REF(0);
+  SITE_UNLOCK();
 }
 
 /* Register a module's functions: one statically linked into an oakc
@@ -246,6 +289,7 @@ oak_native_register(const void *module_info)
   const oak_native_module *m = module_info;
   unsigned i;
 
+  NATIVE_LOCK();
   for (i = 0; i < m->count; i++)
     register_function(m->entries[i].name, m->entries[i].fn);
 
@@ -272,6 +316,7 @@ oak_native_register(const void *module_info)
 	}
       site_modules[site_module_count++] = m;
     }
+  NATIVE_UNLOCK();
 
   /* Sites may hold functions this module's code replaces. */
   oak_native_flush_sites();
@@ -288,10 +333,10 @@ oak_native_register(const void *module_info)
    so the site refills once the cache comes back to Y_TYPE).  The
    checks mirror oak_native_call_1 (oak-native.h). */
 
-void
-oak_native_site_fill(oak_native_site * s, ref_t v, ref_t y_type)
+static void
+site_fill_locked(oak_native_site * s, ref_t v, ref_t y_type)
 {
-  ref_t m, seg;
+  ref_t m, seg, offset;
   oak_native_fn fn;
 
   s->epoch = oak_native_epoch;
@@ -312,13 +357,12 @@ oak_native_site_fill(oak_native_site * s, ref_t v, ref_t y_type)
 	  return;
 	}
       s->y_type = y_type;
-      if (REF_SLOT(v, OPERATION_CACHE_TYPE_OFF) != y_type)
+      if (!oak_mcache_read(v, y_type, &m, &offset))
 	return;
-      m = REF_SLOT(v, OPERATION_CACHE_METH_OFF);
       if (!TAG_IS(m, PTR_TAG) || REF_SLOT(m, 0) != e_method_type)
 	return;
       s->method = m;
-      s->offset = REF_SLOT(v, OPERATION_CACHE_TYPE_OFF_OFF);
+      s->offset = offset;
     }
   else
     {
@@ -332,6 +376,28 @@ oak_native_site_fill(oak_native_site * s, ref_t v, ref_t y_type)
   s->code = seg;
   s->env = REF_SLOT(m, METHOD_ENV_OFF);
   s->fn = fn;
+}
+
+/* With THREADS a fill takes the site's sequence count from even to
+   odd and back (ON_SITE_CALL trusts what it read only if the count
+   is the same even number before and after), under site_lock so two
+   fills cannot interleave. */
+void
+oak_native_site_fill(oak_native_site * s, ref_t v, ref_t y_type)
+{
+#ifdef THREADS
+  size_t seq;
+
+  SITE_LOCK();
+  seq = OAK_ATOMIC_LOAD_REF(&s->seq);
+  OAK_ATOMIC_STORE_REF(&s->seq, seq + 1);
+  OAK_ATOMIC_FENCE_RELEASE();
+  site_fill_locked(s, v, y_type);
+  OAK_ATOMIC_STORE_REF(&s->seq, seq + 2);
+  SITE_UNLOCK();
+#else
+  site_fill_locked(s, v, y_type);
+#endif
 }
 
 /* Find the C function for the stub code vector SEG and record it
@@ -350,17 +416,26 @@ oak_native_resolve(ref_t seg)
     return NULL;
   s = REF_TO_PTR(name);
   cname = oak_c_string(s + 3, (int)REF_TO_INT(s[2]));
+  NATIVE_LOCK();
   slot = native_hash_size ? lookup_slot(cname) : 0;
   if (native_hash_size == 0 || native_hash[slot] == 0)
     {
+      NATIVE_UNLOCK();
       fprintf(stderr, "Native function %s is not loaded.\n", cname);
       free(cname);
       return NULL;
     }
   free(cname);
+  /* The index first, the epoch last: a reader that sees the epoch
+     (oak_native_known, an acquiring load) sees the index. */
   cv[n - 3] = INT_TO_REF(native_hash[slot] - 1);
+#ifdef THREADS
+  OAK_ATOMIC_STORE_REF(&cv[n - 1], oak_native_epoch);
+#else
   cv[n - 1] = oak_native_epoch;
-  return oak_native_fns[native_hash[slot] - 1];
+#endif
+  NATIVE_UNLOCK();
+  return oak_native_fn_at(REF_TO_INT(cv[n - 3]));
 }
 
 /* Build NAME.so from NAME.c. */
@@ -535,42 +610,3 @@ oak_native_dead(unsigned k)
   fprintf(stderr, "Fatal error (vm): a dead direct call ran.\n");
   exit(EXIT_FAILURE);
 }
-
-#else /* THREADS */
-
-void
-oak_native_init(void)
-{
-}
-
-void
-oak_native_flush_sites(void)
-{
-}
-
-void
-oak_native_register(const void *module_info)
-{
-  (void)module_info;
-  fprintf(stderr, "Native code is not supported with threads.\n");
-  exit(EXIT_FAILURE);
-}
-
-bool
-oak_native_load(const char *path)
-{
-  fprintf(stderr, "Unable to load native module %s: "
-	  "native code is not supported with threads.\n", path);
-  return false;
-}
-
-bool
-oak_native_cc(const char *c_file, const char *so_file)
-{
-  (void)c_file;
-  (void)so_file;
-  fprintf(stderr, "Native code is not supported with threads.\n");
-  return false;
-}
-
-#endif

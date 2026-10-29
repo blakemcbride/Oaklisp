@@ -94,6 +94,14 @@ typedef struct {
   instr_t *e_pc;
   unsigned  e_nargs;
   ref_t     e_process;
+#ifdef THREADS
+  /* The alarm clock (ENABLE-ALARMS...) is per thread.  The interpreter
+     keeps it in locals and synchronizes them here at every
+     UNLOCALIZE/LOCALIZE, which is how natively compiled code, which
+     reads and sets oak_timer_* through these, shares it. */
+  unsigned  timer_counter;
+  unsigned  timer_increment;
+#endif
 } register_set_t;
 
 
@@ -125,8 +133,11 @@ extern int dump_base;
 
 extern bool dump_flag;
 
-/* The alarm clock, shared between the interpreter and native code. */
+/* The alarm clock, shared between the interpreter and native code;
+   per thread with THREADS (register_set_t). */
+#ifndef THREADS
 extern unsigned oak_timer_counter, oak_timer_increment;
+#endif
 
 /* threads.c, in every configuration: the live OS threads (1 without
    threads), and the parking of the thread stream primitives. */
@@ -614,6 +625,12 @@ extern void ms_verify_log_alloc(ref_t *p, int path, size_t words);
 #define e_env              ( (reg_set->e_env) )
 #define e_nargs            ( (reg_set->e_nargs) )
 #define e_process          ( (reg_set->e_process) )
+#define oak_timer_counter   (reg_set->timer_counter)
+#define oak_timer_increment (reg_set->timer_increment)
+/* What a new OS thread runs with its start operation (threads.c):
+   loop in the emulator, the native call driver in a stand-alone
+   executable, each entry point setting it. */
+extern void (*oak_thread_entry)(ref_t start_operation);
 
 #else
 

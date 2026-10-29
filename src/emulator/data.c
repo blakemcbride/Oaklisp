@@ -37,8 +37,10 @@ ref_t *free_point = 0;
 
 /* The alarm clock (ENABLE-ALARMS...), shared between the interpreter
    and natively compiled code so either side can trip it. */
+#ifndef THREADS
 unsigned oak_timer_counter = 0;
 unsigned oak_timer_increment = 0;
+#endif
 
 int  trace_traps = false;	/* trace tag traps */
 int  trace_files = false;	/* trace file opening */

@@ -59,9 +59,12 @@ ref_to_file(ref_t r)
     : (FILE *) r;
 }
 
-#ifndef THREADS
-
-typedef int (*oak_rt_fn) (unsigned resume);
+/* A natively compiled block's C function (oak-native.h), and what
+   it asks its caller to do next. */
+typedef int (*oak_native_fn) (unsigned resume);
+typedef oak_native_fn oak_rt_fn;
+#define OAK_NATIVE_CONTINUE	0	/* resume bytecode at e_pc */
+#define OAK_NATIVE_FUNCALL	1	/* call the operation on top of the stack */
 
 extern ref_t *oak_rt_reverse_cons(ref_t * sp);
 extern bool oak_rt_allocate(ref_t ** spp);	/* 2 */
@@ -92,12 +95,19 @@ extern bool oak_rt_load_world(ref_t ** spp);	/* 2; sets registers */
    type pushed back on the stack (e_nargs + 2 arguments). */
 extern int oak_rt_super_call(oak_rt_fn * fn);
 
-/* The alarm counters of natively compiled code.  Nothing polls them
-   there yet (see ON_POLL), so alarms do not preempt native code; the
-   instructions exist so the code runs. */
+/* The alarm clock of natively compiled code (ON_PENDING polls it;
+   per thread with THREADS). */
 extern ref_t *oak_rt_enable_alarms(ref_t * sp);
 extern ref_t *oak_rt_disable_alarms(ref_t * sp);
 extern ref_t *oak_rt_reset_alarm_counter(ref_t * sp);
+
+/* TEST-AND-SET-LOCATIVE on the cell at P: #t with NEW stored if the
+   cell held OLD, else #f (with THREADS, as the interpreter's, under
+   the one test-and-set lock, failing when it is busy). */
+extern ref_t oak_rt_test_and_set(ref_t * p, ref_t old, ref_t new);
+/* HEAVYWEIGHT-THREAD: start an OS thread running OP; #t or #f. */
+extern ref_t oak_rt_make_thread(ref_t op);
+extern void oak_rt_thread_yield(void);
 
 /* The call driver: runs a world whose code is all native, in place of
    the interpreter.  The caller has set the registers to the boot
@@ -105,6 +115,9 @@ extern ref_t *oak_rt_reset_alarm_counter(ref_t * sp);
    this is the only execution engine. */
 extern void oak_native_run(void);
 
-#endif
+/* What a new OS thread runs in such an executable: the driver on
+   START_OPERATION called with no arguments, until the thread's thunk
+   returns (threads.c's entry point). */
+extern void oak_native_run_thread(ref_t start_operation);
 
 #endif

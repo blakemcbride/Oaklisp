@@ -37,21 +37,14 @@ extern void oak_native_register(const void *module_info);
 
 /* Forget every direct-call site cache (oak-native.h): they hold raw
    refs and function pointers, so the GC, a world load and module
-   registration each call this.  A no-op with THREADS. */
+   registration each call this. */
 extern void oak_native_flush_sites(void);
 
-#ifndef THREADS
+#include "native-ops.h"
 
-#include "oak-native.h"
-
-/* The C function for the stub code vector SEG, or NULL;
-   oak_native_known (oak-native.h) resolves as needed nowadays. */
-static inline oak_native_fn
-oak_native_lookup(ref_t seg)
-{
-  return oak_native_known(seg);
-}
-
-#endif
+/* The C function for the stub code vector SEG, resolved as needed, or
+   NULL (native.c).  The interpreter's NATIVE instruction uses this;
+   natively compiled code has oak_native_known (oak-native.h). */
+extern oak_native_fn oak_native_lookup(ref_t seg);
 
 #endif

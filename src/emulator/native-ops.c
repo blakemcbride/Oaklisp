@@ -46,8 +46,7 @@
 #ifdef USE_MARK_SWEEP
 #include "gc-ms.h"
 #endif
-
-#ifndef THREADS
+#include "threads.h"
 
 #include "oak-native.h"
 
@@ -516,7 +515,19 @@ oak_rt_stream_primitive(unsigned n, ref_t ** spp)
 	so_file = oak_c_string((ref_t *) LOC_TO_PTR(sp[-2]),
 			       REF_TO_INT(sp[-3]));
 	sp -= 3;
-	sp[0] = oak_native_cc(c_file, so_file) ? e_t : e_nil;
+	/* The C compiler takes a while: with THREADS this thread
+	   counts as parked meanwhile (the stack is synchronized for
+	   a collection in another thread). */
+	{
+	  bool built;
+
+	  value_stack.sp = sp;
+	  THREADY(oak_thread_blocking_begin());
+	  built = oak_native_cc(c_file, so_file);
+	  THREADY(oak_thread_blocking_end());
+	  sp = value_stack.sp;
+	  sp[0] = built ? e_t : e_nil;
+	}
 	free(c_file);
 	free(so_file);
       }
@@ -558,18 +569,30 @@ oak_rt_stream_primitive(unsigned n, ref_t ** spp)
       }
       break;
 
-      /* Natively compiled code does not run with threads: parking has
-	 no one to wait for and unparking no one to wake. */
+      /* Parking and sleeping block with the stack synchronized: the
+	 thread is at a safepoint meanwhile (threads.c). */
     case 19:
-      sp[0] = e_nil;
+      x = sp[0];
+      if (x != e_nil && !TAG_IS(x, INT_TAG))
+	return 1;
+      value_stack.sp = sp;
+      y = oak_thread_park(x == e_nil ? -1L : (long)REF_TO_INT(x))
+	? e_t : e_nil;
+      sp = value_stack.sp;
+      sp[0] = y;
       break;
     case 20:
-      sp[0] = e_nil;
+      x = sp[0];
+      if (!TAG_IS(x, INT_TAG))
+	return 1;
+      sp[0] = BOOL_TO_REF(oak_thread_unpark((int)REF_TO_INT(x)));
       break;
     case 21:
       if (!TAG_IS(sp[0], INT_TAG))
 	return 1;
+      value_stack.sp = sp;
       oak_thread_sleep_ms((long)REF_TO_INT(sp[0]));
+      sp = value_stack.sp;
       sp[0] = e_t;
       break;
 
@@ -625,10 +648,12 @@ oak_rt_fill_continuation(void)
   stack_flush(&value_stack, 2);
   stack_flush(&context_stack, 0);
   x = value_stack.sp[0];
-  REF_SLOT(x, CONTINUATION_VAL_SEGS) = value_stack.segment;
-  REF_SLOT(x, CONTINUATION_VAL_OFF) = INT_TO_REF(value_stack.pushed_count);
-  REF_SLOT(x, CONTINUATION_CXT_SEGS) = context_stack.segment;
-  REF_SLOT(x, CONTINUATION_CXT_OFF) = INT_TO_REF(context_stack.pushed_count);
+  ON_STORE(&REF_SLOT(x, CONTINUATION_VAL_SEGS), value_stack.segment);
+  ON_STORE(&REF_SLOT(x, CONTINUATION_VAL_OFF),
+	   INT_TO_REF(value_stack.pushed_count));
+  ON_STORE(&REF_SLOT(x, CONTINUATION_CXT_SEGS), context_stack.segment);
+  ON_STORE(&REF_SLOT(x, CONTINUATION_CXT_OFF),
+	   INT_TO_REF(context_stack.pushed_count));
 }
 
 bool
@@ -658,7 +683,12 @@ oak_rt_continue(void)
 void
 oak_rt_gc(int full)
 {
+#if defined(THREADS) && defined(USE_MARK_SWEEP)
+  (void)full;
+  ms_collect_explicit("explicit call");
+#else
   gc(false, full != 0, "explicit call", 0);
+#endif
   if (value_stack.sp + 1 >= value_stack.bp + value_stack.size)
     stack_flush(&value_stack, value_stack.filltarget);
   *++value_stack.sp = e_false;
@@ -681,6 +711,7 @@ oak_rt_dump_world(ref_t ** spp)
   if (!TAG_IS(x, LOC_TAG))
     return false;
   s = oak_c_string((ref_t *) LOC_TO_PTR(x), REF_TO_INT(sp[-1]));
+  THREADY(oak_mutex_lock(&dump_lock));
   old_dump_file_name = dump_file_name;
   dump_file_name = s;
   sp -= 1;
@@ -689,6 +720,7 @@ oak_rt_dump_world(ref_t ** spp)
   dump_world(false);
   sp = value_stack.sp;
   dump_file_name = old_dump_file_name;
+  THREADY(oak_mutex_unlock(&dump_lock));
   free(s);
   sp[0] = e_t;
   *spp = sp;
@@ -706,6 +738,7 @@ oak_rt_load_world(ref_t ** spp)
     return false;
   s = oak_c_string((ref_t *) LOC_TO_PTR(x), REF_TO_INT(sp[-1]));
 
+  THREADY(oak_mutex_lock(&dump_lock));
   free_space(&spatic);
   free_space(&new_space);
   read_world(s);
@@ -738,6 +771,7 @@ oak_rt_load_world(ref_t ** spp)
   *++value_stack.sp = INT_TO_REF(4321);
   *++value_stack.sp = INT_TO_REF(54321);
   *spp = value_stack.sp;
+  THREADY(oak_mutex_unlock(&dump_lock));
   return true;
 }
 
@@ -823,6 +857,51 @@ oak_rt_reset_alarm_counter(ref_t * sp)
   return sp;
 }
 
+/* TEST-AND-SET-LOCATIVE, as loop.c does it: with THREADS under the one
+   lock, and refused (#f) when another thread holds it. */
+ref_t
+oak_rt_test_and_set(ref_t * p, ref_t old, ref_t new)
+{
+#ifdef THREADS
+  if (oak_mutex_trylock(&test_and_set_locative_lock) != 0)
+    return e_false;
+  if (*p != old)
+    {
+      oak_mutex_unlock(&test_and_set_locative_lock);
+      return e_false;
+    }
+  SATB_BARRIER(p);
+  *p = new;
+  oak_mutex_unlock(&test_and_set_locative_lock);
+  return e_t;
+#else
+  if (*p != old)
+    return e_false;
+  SATB_BARRIER(p);
+  *p = new;
+  return e_t;
+#endif
+}
+
+ref_t
+oak_rt_make_thread(ref_t op)
+{
+#ifdef THREADS
+  return BOOL_TO_REF(create_thread(op));
+#else
+  (void)op;
+  return e_nil;
+#endif
+}
+
+void
+oak_rt_thread_yield(void)
+{
+#ifdef THREADS
+  oak_thread_yield();
+#endif
+}
+
 /* The call driver: the execution engine of a stand-alone executable,
    where every method is native.  It does what the emulator's FUNCALL
    and NATIVE instructions do, and nothing else: there is no bytecode
@@ -838,7 +917,7 @@ run_signal_trap(void)
   ref_t *c;
   int alarm = 0;
 
-  if (signal_poll_flag)
+  if (signal_poll_flag THREADY(&& my_index == 0))
     signal_poll_flag = 0;
   else
     {
@@ -876,12 +955,26 @@ run_funcall_trap(void)
   e_nargs = old_nargs + 2;
 }
 
+/* Something to deliver before running on: a signal (thread 0's) or
+   the alarm clock.  A collection another thread asked for is waited
+   out first, here, where this thread's stacks are synchronized. */
+static int
+run_pending(void)
+{
+#ifdef THREADS
+  if (gc_pending)
+    wait_for_gc();
+#endif
+  return (signal_poll_flag THREADY(&& my_index == 0))
+    || (oak_timer_increment && oak_timer_counter > OAK_TIMER_LIMIT);
+}
+
+static void run_loop(oak_native_fn fn, unsigned k);
+
 void
 oak_native_run(void)
 {
   oak_native_fn fn;
-  unsigned k;
-  int r;
 
   /* Enter the boot method. */
   fn = oak_native_known(e_code_segment);
@@ -892,11 +985,38 @@ oak_native_run(void)
       exit(EXIT_FAILURE);
     }
   e_pc = CODE_SEG_FIRST_INSTR(e_code_segment) + 1;
-  k = 0;
+  run_loop(fn, 0);
+}
+
+/* A new OS thread (threads.c): call START_OPERATION with no arguments
+   -- what loop() does for one, from its tail-recursion instruction --
+   and drive it until its thunk returns, which underflows this thread's
+   context stack and unwinds out of here. */
+void
+oak_native_run_thread(ref_t start_operation)
+{
+  oak_native_fn fn = NULL;
+
+  if (value_stack.sp + 2 >= value_stack.bp + value_stack.size)
+    stack_flush(&value_stack, value_stack.filltarget);
+  *++value_stack.sp = INT_TO_REF(4321);
+  *++value_stack.sp = start_operation;
+  e_nargs = 0;
+  e_code_segment = e_nil;
+  e_pc = NULL;
+  /* As the driver does for a function that returned OAK_NATIVE_FUNCALL:
+     a null function with that result enters the call path. */
+  run_loop(fn, 0);
+}
+
+static void
+run_loop(oak_native_fn fn, unsigned k)
+{
+  int r;
 
   for (;;)
     {
-      r = fn(k);
+      r = fn == NULL ? OAK_NATIVE_FUNCALL : fn(k);
 
       if (r == OAK_NATIVE_FUNCALL)
 	{
@@ -923,9 +1043,7 @@ oak_native_run(void)
 		  exit(EXIT_FAILURE);
 		}
 	    }
-	  if (signal_poll_flag
-	      || (oak_timer_increment
-		  && oak_timer_counter > OAK_TIMER_LIMIT))
+	  if (run_pending())
 	    {
 	      /* Deliver the signal (or alarm) at the callee's entry,
 		 the way the emulator's NATIVE case polls before
@@ -948,8 +1066,7 @@ oak_native_run(void)
 
       /* OAK_NATIVE_CONTINUE: run from e_pc, which must sit on a
 	 NATIVE instruction of a native code vector. */
-      if (signal_poll_flag
-	  || (oak_timer_increment && oak_timer_counter > OAK_TIMER_LIMIT))
+      if (run_pending())
 	{
 	  /* e_pc is at the instruction to resume (ON_POLL); deliver
 	     the signal first, as the emulator's intr_trap does. */
@@ -985,5 +1102,3 @@ oak_native_run(void)
       exit(EXIT_FAILURE);
     }
 }
-
-#endif /* !THREADS */

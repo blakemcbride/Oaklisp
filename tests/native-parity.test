@@ -30,8 +30,14 @@ compare() {
   done
   loads=
   for d in $deps; do loads="$loads --load $d"; done
-  (cd bc && oak -- $locale $loads "$@" --exit 2>&1) | grep -v '^Loaded ' > bc.$name.out
-  (cd nat && oak -- $locale $loads "$@" --exit 2>&1) | grep -v '^Loaded ' > nat.$name.out
+  # A debugging emulator's collector prints what it takes for a bad
+  # reference after each copying collection: a method called on a
+  # fixnum leaves a bogus bp in its frame, which it reports without
+  # harm.  Not program output; left out of the comparison.
+  (cd bc && oak -- $locale $loads "$@" --exit 2>&1) | grep -v '^Loaded ' \
+    | grep -vE ' = \[-?[0-9]+;tag:[0-9]+;.\]' > bc.$name.out
+  (cd nat && oak -- $locale $loads "$@" --exit 2>&1) | grep -v '^Loaded ' \
+    | grep -vE ' = \[-?[0-9]+;tag:[0-9]+;.\]' > nat.$name.out
   if cmp -s bc.$name.out nat.$name.out; then
     echo "PASS $name ($(grep -c . bc.$name.out) lines)"
   else
@@ -50,4 +56,13 @@ compare eval-check ""
 for f in "$testdir"/bench-*.oak; do
   compare $(basename "$f" .oak) "" --eval '(print (bench) standard-output)'
 done
+
+# Every store into the heap in the generated C goes through ON_STORE,
+# where the concurrent collector's write barrier sits (oak-native.h).
+raw=$(grep -nE 'REF_SLOT\([^;]*\) = |\*LOC_TO_PTR\([^;]*\) = |e_env\[[^]]*\] = |e_bp\[[^]]*\] = ' nat/*.c | head -5)
+if test -n "$raw"; then
+  echo "FAIL raw heap store in generated C:"; echo "$raw"; status=1
+else
+  echo "PASS no raw heap store in the generated C"
+fi
 exit $status

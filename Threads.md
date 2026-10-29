@@ -49,6 +49,8 @@ Key files and `#ifdef THREADS` sections:
 | `config.h` | `MAX_THREAD_COUNT` (200), disables move-to-front under threads |
 | `gc-ms.c` | Mark-sweep GC, TLABs, TLAB retire/refill, deferred objstart buffer |
 | `gc-ms.h` | MS-GC and TLAB declarations, `TLAB_SIZE` (4096 words) |
+| `oak-native.h`, `native.c`, `native-ops.c` | Natively compiled code: `my_index` is the thread-local `oak_thread_index_var`, `ON_STORE` (barrier), `ON_PENDING` (rendezvous), seqlocked call sites, the registry under `native_lock`, `oak_native_run_thread` |
+| `dispatch.h`, `dispatch.c` | `oak_mcache_read`/`oak_mcache_fill`: the operations' method caches under their striped sequence counts, for the interpreter and native code |
 
 Per-thread state (via TLS `index_key`):
 
@@ -117,6 +119,49 @@ Synchronization primitives (all in `multiproc.oak`):
 - **Scheduler**: Global `*scheduleQ*` protected by mutex + alarm
   disable.  `pause()` does `call/cc` context switch.
 
+
+Natively compiled code
+======================
+
+Natively compiled code (`--compile-native`, the native world, oakc
+executables) runs with threads too, by the same rules as the
+interpreter:
+
+- The generated C and the helpers (`native.c`, `native-ops.c`) find
+  the registers and stacks of their thread through `my_index`, which
+  oak-native.h defines as `oak_thread_index_var`, a thread-local
+  variable of the executable (initial-exec model, so a module loaded
+  with dlopen reads it with a load, not a call).
+- Every store of a ref into the heap is an `ON_STORE`, which is where
+  the SATB write barrier sits; native-parity.test fails on a raw
+  store in the generated C.
+- `ON_PENDING`, polled at every call, return and backward branch,
+  includes `gc_pending`: a thread in native code returns to its
+  dispatcher, which waits for the collection (the interpreter's loop
+  top, or `run_pending` in the call driver), so no native loop stalls
+  a collection.
+- The alarm clock is per thread: `register_set_t` holds it, the
+  interpreter's locals are synchronized with it at every
+  LOCALIZE/UNLOCALIZE, and native code reads and sets it there.
+- The operations' one-entry method caches are read and filled under
+  their striped sequence counts (`oak_mcache_read`, `oak_mcache_fill`
+  in dispatch.c, shared with FUNCALL); a call site's cache
+  (`oak_native_site`) has a sequence count of its own, odd while a
+  fill writes it, and a reader trusts the fields it copied only if the
+  count is unchanged, else takes the long way.
+- Module registration, name resolution and site fills take
+  `native_lock`/`site_lock`; the function table grows in chunks that
+  never move, so a stub's index is read without a lock.
+- The C compiler run by `--compile-native` counts as time parked
+  (`oak_thread_blocking_begin`/`end`), so a collection in another
+  thread does not wait for it.
+- `%test-and-set-locative` in native code is `oak_rt_test_and_set`,
+  under the interpreter's lock; `%make-heavyweight-thread` and
+  `%thread-yield` are real; parking and sleeping synchronize the
+  stack first.
+- A stand-alone executable's new OS thread runs the call driver
+  (`oak_native_run_thread`) instead of `loop`: threads.c calls
+  `oak_thread_entry`, which each entry point sets.
 
 Initialization
 ===============
@@ -260,9 +305,14 @@ stand-alone and consistency tests, which need the build tree's own
 emulator) against the standard world, with the emulator built each
 way.  `threads-stress.test` runs `threads-stress.oak` (bignums,
 lists, interning, `add-method`, `catch`/`throw`, `eval`, all compiled
-at load) three times under `--pthreads 3`, then compiles six files at
-once in futures and requires the objects to match a single-threaded
-compile.
+at load) three times under `--pthreads 3`, once more compiled
+natively, then compiles six files at once in futures and requires the
+objects to match a single-threaded compile; `threads-api.test` runs
+its program natively too.  In the threads build the native,
+native-parity and stand-alone tests run as well (`standalone.test`
+then also builds the thread API program as a straight-C executable,
+whose threads run the native call driver), and the stress program
+compiled natively passes under `-DOAK_GC_VERIFY`.
 
 | Config | Flags | Result |
 |--------|-------|--------|

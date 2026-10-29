@@ -396,7 +396,9 @@ SATB Write Barriers
 
 Snapshot-at-the-beginning (SATB) barriers ensure concurrent marking
 correctness.  They are inserted at all 10 heap-write sites in the
-bytecode interpreter (`loop.c`):
+bytecode interpreter (`loop.c`), and natively compiled code has the
+same ones through `ON_STORE` (oak-native.h), its one store macro,
+which native-parity.test checks the generated C for:
 
 1. SET-CONTENTS (locative store)
 2. STORE-BP-I (indexed base-pointer store)

@@ -63,6 +63,11 @@ AC_ARG_ENABLE([threads],
        [enable_threads=no])
 AC_MSG_RESULT([$enable_threads])
 AM_CONDITIONAL([ENABLE_THREADS], [test x${enable_threads} = xyes])
+# Natively compiled code built outside the emulator's own Makefile
+# (oakc, the native runtime library) must see the same definitions.
+AS_IF([test x${enable_threads} = xyes],
+      [OAKC_THREADS="-DTHREADS -DUSE_MARK_SWEEP"],[OAKC_THREADS=])
+AC_SUBST([OAKC_THREADS])
 
 AC_MSG_CHECKING([enable_cold_linker])
 AC_ARG_ENABLE([cold-linker],

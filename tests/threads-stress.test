@@ -19,6 +19,23 @@ for run in 1 2 3; do
   test $rc = 0 && test $fails = 0 && test $passes = 20 || { tail -5 stress-$run.out; status=1; }
 done
 
+# The stress program compiled natively, when a module can be built,
+# under the same load.
+rm -rf stress-native && mkdir stress-native && cp "$testdir/threads-stress.oak" stress-native/
+(cd stress-native && oak -- --compile-native threads-stress --exit >compile.log 2>&1)
+if test -f stress-native/threads-stress.so; then
+  (cd stress-native && timeout 300 "$OAKLISP" --batch --world "$OAKWORLD" -- \
+     --locale system-locale --pthreads 3 --load threads-stress --exit) \
+    > stress-native.out 2>&1
+  rc=$?
+  passes=$(grep -c '^PASS' stress-native.out)
+  fails=$(grep -c '^FAIL' stress-native.out)
+  echo "native run: exit $rc, $passes passed, $fails failed"
+  test $rc = 0 && test $fails = 0 && test $passes = 20 || { tail -5 stress-native.out; status=1; }
+else
+  echo "no native module built; native run skipped"
+fi
+
 files="arith data control objects io promises"
 rm -rf stress-seq stress-par; mkdir stress-seq stress-par
 for f in $files; do

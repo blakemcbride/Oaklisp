@@ -61,10 +61,11 @@ CC='@CC@'
 CFLAGS='@CFLAGS@'
 LIBS='@LIBS@'
 OAKC_FAST='@OAKC_FAST@'
+OAKC_THREADS='@OAKC_THREADS@'
 
 EMUDIR=$builddir/src/emulator
 OAKLISP=${OAKC_OAKLISP:-$EMUDIR/oaklisp}
-INCLUDES="-DHAVE_CONFIG_H $OAKC_FAST -I$srcdir/src/emulator -I$builddir"
+INCLUDES="-DHAVE_CONFIG_H $OAKC_FAST $OAKC_THREADS -I$srcdir/src/emulator -I$builddir"
 
 out=
 locale=system-locale

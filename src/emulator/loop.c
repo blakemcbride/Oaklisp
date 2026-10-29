@@ -63,16 +63,28 @@
 #define ENABLE_TIMER	1
 #endif
 
+/* The alarm clock's locals and their per-thread home (stacks-loop.h). */
+#if defined(THREADS) && ENABLE_TIMER
+#define LOCALIZE_TIMER()				\
+{	timer_counter = reg_set->timer_counter;		\
+	timer_increment = reg_set->timer_increment;	\
+}
+#define UNLOCALIZE_TIMER()				\
+{	reg_set->timer_counter = timer_counter;		\
+	reg_set->timer_increment = timer_increment;	\
+}
+#else
+#define LOCALIZE_TIMER()
+#define UNLOCALIZE_TIMER()
+#endif
+
 /* How many instructions the interpreter has to execute after a crash
    recovery before the crash is no longer considered "consecutive". */
 #define CRASH_PROGRESS_INSTRS 1024
 
-/* The trace flags and dump switches live in data.c, so that an
-   executable without the interpreter still links them. */
-
-#ifdef THREADS
-oak_mutex_t dump_lock = OAK_MUTEX_INITIALIZER;
-#endif
+/* The trace flags and dump switches live in data.c, and the world
+   dump's lock in threads.c, so that an executable without the
+   interpreter still links them. */
 
 #ifdef FAST
 #define maybe_put(x,s)
@@ -125,14 +137,9 @@ static inline void _check_val_bounds(ref_t *sp, int offset, ref_t *bp, int line)
 }
 #endif
 
-#ifdef THREADS
-/* Sequence counts for the operations' method caches, striped by
-   operation address (see FUNCALL). */
-#define MCACHE_STRIPES 1024
-static size_t mcache_seq[MCACHE_STRIPES];
-#define MCACHE_SEQ(op) \
-  (&mcache_seq[((unsigned long)(op) >> 4) & (MCACHE_STRIPES - 1)])
-#endif
+/* The operations' method caches are read here and filled through
+   dispatch.h (oak_mcache_fill), which natively compiled code shares;
+   with THREADS their sequence counts (mcache_seq) guard both. */
 
 /* The OS threads running Oaklisp code (threads.c; 1 without threads). */
 extern int oak_live_thread_count(void);
@@ -1918,37 +1925,8 @@ loop(ref_t initial_tos)
 
 #ifdef OP_TYPE_METH_CACHE
 		      maybe_put(trace_mcache, "M");
-		      /* Cache the results of this search.
-		         Write method and offset first, then type last
-		         (type acts as commit flag for readers). */
-#ifdef THREADS
-		      /* Fill only with the stripe's count taken from even to
-			 odd; if another fill has it, leave the cache be. */
-		      {
-			size_t *seqp = MCACHE_SEQ(x);
-			size_t seq = OAK_ATOMIC_LOAD_REF(seqp);
-			if (!(seq & 1) && OAK_ATOMIC_CAS_SIZE(seqp, &seq, seq + 1))
-			  {
-			    OAK_ATOMIC_FENCE_RELEASE();
-			    SATB_BARRIER(&REF_SLOT(x, OPERATION_CACHE_TYPE_OFF));
-			    OAK_ATOMIC_STORE_REF(
-			      &REF_SLOT(x, OPERATION_CACHE_TYPE_OFF), y_type);
-			    SATB_BARRIER(&REF_SLOT(x, OPERATION_CACHE_METH_OFF));
-			    OAK_ATOMIC_STORE_REF(
-			      &REF_SLOT(x, OPERATION_CACHE_METH_OFF),
-			      e_current_method);
-			    OAK_ATOMIC_STORE_REF(
-			      &REF_SLOT(x, OPERATION_CACHE_TYPE_OFF_OFF), offset);
-			    OAK_ATOMIC_STORE_REF(seqp, seq + 2);
-			  }
-		      }
-#else
-		      SATB_BARRIER(&REF_SLOT(x, OPERATION_CACHE_TYPE_OFF));
-		      REF_SLOT(x, OPERATION_CACHE_TYPE_OFF) = y_type;
-		      SATB_BARRIER(&REF_SLOT(x, OPERATION_CACHE_METH_OFF));
-		      REF_SLOT(x, OPERATION_CACHE_METH_OFF) = e_current_method;
-		      REF_SLOT(x, OPERATION_CACHE_TYPE_OFF_OFF) = offset;
-#endif
+		      /* Cache the results of this search (dispatch.c). */
+		      oak_mcache_fill(x, y_type, e_current_method, offset);
 #endif
 		    }
 #if defined(OP_TYPE_METH_CACHE) && defined(THREADS)
@@ -2289,7 +2267,19 @@ loop(ref_t initial_tos)
 					  REF_TO_INT(y));
 		    so_file = oak_c_string((ref_t *) LOC_TO_PTR(z),
 					   REF_TO_INT(PEEKVAL()));
-		    PEEKVAL() = oak_native_cc(c_file, so_file) ? e_t : e_nil;
+		    /* The C compiler takes a while: with THREADS this
+		       thread counts as parked meanwhile, so a collection
+		       in another thread need not wait for it. */
+		    {
+		      bool built;
+
+		      UNLOCALIZE_ALL();
+		      THREADY(oak_thread_blocking_begin());
+		      built = oak_native_cc(c_file, so_file);
+		      THREADY(oak_thread_blocking_end());
+		      LOCALIZE_ALL();
+		      PEEKVAL() = built ? e_t : e_nil;
+		    }
 		    free(c_file);
 		    free(so_file);
 		  }
@@ -2447,11 +2437,13 @@ loop(ref_t initial_tos)
 
 	    case 35: case 36: case 37: case 38:	/* NATIVE k */
 	    case 39: case 40: case 41: case 42:
-#ifndef THREADS
 	      /* Run natively compiled code from resume point K, the
 		 argument plus 256 times the opcode's distance from 35;
 		 see oak-native.h.  Signals are polled first, so a trap
-		 here comes back to this same instruction. */
+		 here comes back to this same instruction.  (With
+		 THREADS the code finds this thread's registers through
+		 oak_thread_index_var, and UNLOCALIZE_ALL hands it the
+		 alarm clock.) */
 	      POLL_SIGNALS();
 	      {
 		oak_native_fn fn = oak_native_lookup(e_code_segment);
@@ -2482,9 +2474,6 @@ loop(ref_t initial_tos)
 		  }
 		LOCALIZE_ALL();
 	      }
-#else
-	      TRAP0(0);
-#endif
 	      GOTO_TOP;
 
 	    default:

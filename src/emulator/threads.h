@@ -37,6 +37,29 @@ extern oak_mutex_t dump_lock;
    init_thread through these.  */
 extern int oak_thread_can_exit(void);
 extern void oak_thread_exit_unwind(void);
+
+/* The calling thread's index for code that has no my_index local of
+   its own: natively compiled code and its helpers (oak-native.h
+   defines my_index as this).  A thread-local variable of the
+   executable; a module loaded with dlopen reaches it in the
+   initial-exec model, which is valid for a variable the executable
+   itself defines and costs a load, not a call. */
+#if defined(_MSC_VER) && !defined(__MINGW32__)
+extern __declspec(thread) int oak_thread_index_var;
+#else
+extern __thread int oak_thread_index_var __attribute__((tls_model("initial-exec")));
+#endif
+
+/* Thread 0's slot, thread-local index, stacks and registers: what
+   every entry point (oaklisp.c, embed-native.c) does first. */
+extern void oak_thread0_init(void);
+
+/* Around a long blocking call (the C compiler) made with this thread's
+   stacks synchronized: the thread counts as at a safepoint meanwhile,
+   so a collection does not wait for it, and it leaves that state under
+   gc_lock, like a parked thread. */
+extern void oak_thread_blocking_begin(void);
+extern void oak_thread_blocking_end(void);
 #endif
 
 

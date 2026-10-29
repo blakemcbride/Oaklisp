@@ -36,12 +36,19 @@
 {	context_stack.sp = local_context_sp;		\
 }
 
+/* LOCALIZE_TIMER and UNLOCALIZE_TIMER are loop.c's: with THREADS the
+   alarm clock is per thread (register_set_t) and the interpreter keeps
+   it in locals, which natively compiled code cannot see, so the two
+   are synchronized with the registers. */
+
 #define LOCALIZE_REGS()					\
 {	local_e_pc = e_pc;				\
+	LOCALIZE_TIMER();				\
 }
 
 #define UNLOCALIZE_REGS()				\
 {	e_pc = local_e_pc;				\
+	UNLOCALIZE_TIMER();				\
 }
 
 #define LOCALIZE_STKS()					\

@@ -7,4 +7,23 @@ enabled=$(oak -- --eval '(print (%threads-enabled?) standard-output)' --exit 2>&
 case $enabled in *T*) ;; *) skip "emulator built without threads";; esac
 ex="$top_srcdir/doc/examples/"
 run_oak_test threads-api.oak --eval "(define #*oaklisp-examples \"$ex\")" || fail "threads-api.oak"
+want=$(oak -- --eval "(define #*oaklisp-examples \"$ex\")" --load "$testdir/threads-api" --exit 2>&1 | grep -c '^PASS')
 echo "thread API tests pass"
+
+# The same program compiled natively, when a module can be built: the
+# threads run native code.
+rm -rf api-native && mkdir api-native && cp "$testdir/threads-api.oak" api-native/
+(cd api-native && oak -- --compile-native threads-api --exit >compile.log 2>&1)
+if test -f api-native/threads-api.so; then
+  out=$(cd api-native && timeout 300 "$OAKLISP" --batch --world "$OAKWORLD" -- \
+	  --locale system-locale --eval "(define #*oaklisp-examples \"$ex\")" \
+	  --load threads-api --exit 2>&1)
+  rc=$?
+  got=$(printf '%s\n' "$out" | grep -c '^PASS')
+  bad=$(printf '%s\n' "$out" | grep -c '^FAIL')
+  test $rc = 0 && test "$bad" = 0 && test "$got" = "$want" \
+    || { printf '%s\n' "$out" | tail -8; fail "native threads-api: exit $rc, $got passed, $bad failed (want $want)"; }
+  echo "native thread API tests pass ($got)"
+else
+  echo "no native module built; native leg skipped"
+fi

@@ -26,6 +26,7 @@
 #include <stddef.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <string.h>
 #include "config.h"
 #include "data.h"
 #include "cmdline.h"
@@ -37,12 +38,10 @@
 #include "native.h"
 #include "oak-embed.h"
 
-#ifdef THREADS
-
-/* Stand-alone executables are not supported with threads; a threaded
-   emulator build simply carries no native entry point. */
-
-#else
+#ifdef USE_MARK_SWEEP
+#include "gc-ms.h"
+#endif
+#include "threads.h"
 
 int
 oak_main_native(int argc, char **argv, const oak_embedding *emb,
@@ -62,6 +61,11 @@ oak_main_native(int argc, char **argv, const oak_embedding *emb,
     nargv[j++] = argv[i];
   nargv[j] = NULL;
 
+#ifdef THREADS
+  oak_thread0_init();
+  oak_thread_entry = oak_native_run_thread;
+#endif
+
   parse_cmd_line(j, nargv);
 
   init_weakpointer_tables();
@@ -79,7 +83,17 @@ oak_main_native(int argc, char **argv, const oak_embedding *emb,
   alloc_space(&new_space, new_space.size);
   free_point = new_space.start;
 
+#ifdef USE_MARK_SWEEP
+  ms_init();
+#ifdef THREADS
+  gc_safepoint_init();
+#endif
+#endif
+
+#ifndef THREADS
   reg_set = (register_set_t *) xmalloc(sizeof(register_set_t));
+  memset(reg_set, 0, sizeof(register_set_t));
+#endif
 
   e_current_method = e_boot_code;
   e_env = REF_TO_PTR(REF_SLOT(e_current_method, METHOD_ENV_OFF));
@@ -95,5 +109,3 @@ oak_main_native(int argc, char **argv, const oak_embedding *emb,
   oak_native_run();
   return 0;
 }
-
-#endif /* THREADS */

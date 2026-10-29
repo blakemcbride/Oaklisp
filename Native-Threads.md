@@ -1,9 +1,9 @@
 Native Thread Support in Oaklisp
 =================================
 
-Status: the interpreter and the bytecode compiler work with threads
-(see Threads.md); natively compiled code does not run threaded yet.
-Disabled by default.
+Status: the interpreter, the bytecode compiler and natively compiled
+code (mixed mode and oakc executables) work with threads (see
+Threads.md).  Disabled by default.
 
 Enable with: `./configure --enable-threads`
 

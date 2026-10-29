@@ -24,20 +24,14 @@
 #ifndef _OAK_EMBED_H_INCLUDED
 #define _OAK_EMBED_H_INCLUDED
 
-#ifndef THREADS
 #include "oak-native.h"
-#endif
 
 typedef struct {
   const unsigned char *world;	/* world image bytes */
   size_t world_size;
   const char *program;		/* .oa text of the program's files, in order */
   size_t program_size;
-#ifndef THREADS
   const oak_native_module *const *modules;
-#else
-  const void *const *modules;
-#endif
   unsigned module_count;
 } oak_embedding;
 

@@ -186,7 +186,45 @@ find_method_type_pair(ref_t op,
 
 
 
-#ifndef THREADS
+#ifdef THREADS
+size_t mcache_seq[MCACHE_STRIPES];
+#endif
+
+/* Record a search's result in OP's one-entry cache: method and offset
+   first, then the type, which commits it for readers.  With THREADS
+   only with the stripe's count taken from even to odd; if another
+   fill has it, leave the cache be. */
+void
+oak_mcache_fill(ref_t op, ref_t y_type, ref_t method, ref_t offset)
+{
+#ifdef OP_TYPE_METH_CACHE
+#ifdef THREADS
+  size_t *seqp = MCACHE_SEQ(op);
+  size_t seq = OAK_ATOMIC_LOAD_REF(seqp);
+
+  if (!(seq & 1) && OAK_ATOMIC_CAS_SIZE(seqp, &seq, seq + 1))
+    {
+      OAK_ATOMIC_FENCE_RELEASE();
+      SATB_BARRIER(&REF_SLOT(op, OPERATION_CACHE_TYPE_OFF));
+      OAK_ATOMIC_STORE_REF(&REF_SLOT(op, OPERATION_CACHE_TYPE_OFF), y_type);
+      SATB_BARRIER(&REF_SLOT(op, OPERATION_CACHE_METH_OFF));
+      OAK_ATOMIC_STORE_REF(&REF_SLOT(op, OPERATION_CACHE_METH_OFF), method);
+      OAK_ATOMIC_STORE_REF(&REF_SLOT(op, OPERATION_CACHE_TYPE_OFF_OFF),
+			   offset);
+      OAK_ATOMIC_STORE_REF(seqp, seq + 2);
+    }
+#else
+  SATB_BARRIER(&REF_SLOT(op, OPERATION_CACHE_TYPE_OFF));
+  REF_SLOT(op, OPERATION_CACHE_TYPE_OFF) = y_type;
+  SATB_BARRIER(&REF_SLOT(op, OPERATION_CACHE_METH_OFF));
+  REF_SLOT(op, OPERATION_CACHE_METH_OFF) = method;
+  REF_SLOT(op, OPERATION_CACHE_TYPE_OFF_OFF) = offset;
+#endif
+#else
+  (void)op; (void)y_type; (void)method; (void)offset;
+#endif
+}
+
 /* For natively compiled code (oak-native.h): find the method as
    FUNCALL does, filling the operation's method cache. */
 ref_t
@@ -199,12 +237,7 @@ oak_native_find_method(ref_t op, ref_t y_type, ref_t *offset)
   if (method == e_nil)
     return e_nil;
   *offset = lookup_bp_offset(y_type, meth_type);
-#ifdef OP_TYPE_METH_CACHE
-  REF_SLOT(op, OPERATION_CACHE_TYPE_OFF) = y_type;
-  REF_SLOT(op, OPERATION_CACHE_METH_OFF) = method;
-  REF_SLOT(op, OPERATION_CACHE_TYPE_OFF_OFF) = *offset;
-#endif
+  oak_mcache_fill(op, y_type, method, *offset);
   return method;
 }
-#endif
 
