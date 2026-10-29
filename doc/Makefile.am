@@ -29,11 +29,14 @@ EXTRA_DIST = $(LATEX_SRCS)
 # ../mandefs.tex and ../oakman.bib are, and writes everything to the
 # corresponding directory here (-outdir), so an out-of-tree build
 # leaves the source tree alone.  bibtex runs in the output directory,
-# so ../oakman.bib has to be here too.
+# so ../oakman.bib has to be here too.  The PDFs are kept in git
+# beside their sources; when latexmk fails the existing one is used
+# (copied here from the source tree in an out-of-tree build).
 .tex.pdf:
 	$(MKDIR_P) `dirname $@`
 	$(LATEXMK) -cd -pdf -outdir=$(abs_builddir)/`dirname $@` $< \
-	 || cp $(top_srcdir)/prebuilt/doc/$@ $@
+	 || { test -f $@ || cp $(srcdir)/$@ $@; \
+	      echo "latexmk failed; using existing $@"; }
 
 # The bibliography, here, for bibtex; one target so that a parallel
 # make copies it once.
@@ -67,9 +70,10 @@ EXTRA_DIST += examples/bank-example.oak examples/change.oak		\
  lang/user.tex lim/admin.tex lim/boot.tex lim/bytecode.tex		\
  lim/compiler.tex lim/cover.tex lim/dataform.tex lim/intro.tex		\
  lim/language.tex lim/methods.tex lim/oaklevel.tex lim/stack.tex	\
- mandefs.tex manprelude.tex oakman.bib
+ mandefs.tex manprelude.tex oakman.bib $(LATEX_PDFS)
 
-CLEANFILES = $(LATEX_PDFS)
+# The PDFs are tracked, so clean leaves them alone.
+CLEANFILES =
 
 # Only an out-of-tree build has a copy of the bibliography here.
 distclean-local:

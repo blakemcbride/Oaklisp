@@ -26,6 +26,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 #ifndef _WIN32
 #include <unistd.h>
 #endif
@@ -536,6 +537,24 @@ oak_rt_stream_primitive(unsigned n, ref_t ** spp)
 	  sp[0] = e_nil;
 	else
 	  sp[0] = CHAR_TO_REF(oak_embedded_program[i]);
+      }
+      break;
+
+    case 18:
+      {
+	char *first, *second;
+	struct stat st1, st2;
+
+	if (!TAG_IS(sp[0], LOC_TAG) || !TAG_IS(sp[-2], LOC_TAG))
+	  return 4;
+	first = oak_c_string((ref_t *) LOC_TO_PTR(sp[0]), REF_TO_INT(sp[-1]));
+	second = oak_c_string((ref_t *) LOC_TO_PTR(sp[-2]), REF_TO_INT(sp[-3]));
+	sp -= 3;
+	sp[0] = (stat(first, &st1) == 0
+		 && stat(second, &st2) == 0
+		 && st1.st_mtime > st2.st_mtime) ? e_t : e_nil;
+	free(first);
+	free(second);
       }
       break;
 

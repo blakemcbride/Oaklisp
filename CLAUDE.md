@@ -12,7 +12,7 @@ src/world/          Oaklisp runtime + compiler (~145 .oak files, ~22K lines)
 src/misc/           Contributed code (unit testing, examples)
 doc/lang/           Language manual (LaTeX)
 doc/lim/            Implementation manual (LaTeX)
-doc/summary/        Concise programmer reference (LaTeX)
+doc/summary/        Concise programmer reference (LaTeX); the three PDFs are tracked beside their .tex sources, set in Latin Modern
 doc/examples/       Example Oaklisp programs
 man/man1/           Man page template (oaklisp.1.in)
 resources/          Desktop entry, icon, shell completions (bash, zsh, fish)
@@ -111,7 +111,7 @@ The compiler reaches a fixpoint: `make check` runs `check-fixpoint`, `check-cold
 - **Big-endian works** for both word sizes, native code included (tested under qemu-user; zig makes a no-install cross compiler: `./configure --host=s390x-linux-gnu CC="zig cc -target s390x-linux-musl -std=gnu23 -D_GNU_SOURCE" LDFLAGS=-static`, world built from the host's `.oa` files, and `tests/qemu-native.sh` runs natively compiled programs statically linked into an emulator-carrying executable, since a static binary cannot dlopen). On 64-bit big-endian, instructions live in the *high* 32 bits of each code ref (first in memory order); see `code-vector.oak`, `fasl.oak`, and `read_ref()` in `worldio.c`.
 - **Cold-world files can't contain bignums:** the linkers range-check integer constants against the target fixnum size. Don't write literals ≥ 2^29 in files listed in `COLDFILES`.
 - **Shifts are not constant-folded:** `ash-left`/`ash-right`/`rot-*` wrap modulo the fixnum size, so folding them would make compiled code depend on the compiling host's word size. They deliberately lack `foldable-mixin` (numbers.oak).
-- **Rest args are not lists:** `(define (f a . rest) ...)` follows the documented Oaklisp semantics (rest args live on the stack; use `listify-args`/`consume-args`; a bare `(rest-length rest)` leaves them on the stack and the compiler warns). A change making `lambda` auto-listify was dropped (twice) because it broke `^super`, `exit`, etc. when the world was recompiled. Exception: `scheme.oak`/`scheme-macros.oak` are compiled in `scheme-locale`, whose `add-method` gives dotted lists their R3RS meaning, so code there must be written R3RS-style.
+- **Rest args become lists when used as lists:** the expander (`idiosyncratically-grovel` in `expand.oak`, mirrored in `src/cold-compiler/host/translate.scm` so the Guile host stays byte-identical) checks each expanded `%add-method` with a rest name.  If the body uses it only the native way -- passed on at the end of a tail call `(f a . rest)` of the method itself (bodies of LET/LABELS lambdas count as the method itself) or in `(rest-length rest)` -- nothing changes.  Any other use (ordinary variable, non-tail pass-on, inside an inner lambda) wraps the body as `(listify-args (lambda (rest) BODY') . rest)`, with `(f a . rest)` → `(apply f a rest)` and `(rest-length rest)` → `(length rest)` in BODY'.  No system source triggers it, so every world object is unchanged.  A rest name starting with `%` opts out (`dump-stack.oak`).  A body that never passes its rest args on still only gets the compiler's warning (`^super`, the cold `error`, `%push` do that on purpose).  Earlier attempts that listified every rest `lambda` were dropped because they broke `^super`, `exit`, etc. Exception: `scheme.oak`/`scheme-macros.oak` are compiled in `scheme-locale`, whose `add-method` gives dotted lists their R3RS meaning, so code there must be written R3RS-style.
 - **Threads:** `--enable-threads` = `-DTHREADS -DUSE_MARK_SWEEP` (they can't be separated: THREADS without mark-sweep hangs). Experimental: with `--pthreads N` the compiler deadlocks. Costs up to 5× on allocation-heavy code (`format`) even unused; numbers in BUILD.md.
 
 ## Architecture
@@ -324,6 +324,9 @@ of `oak-native.h`.
   `%embedded-program-char` (stream primitive 17: a character of the
   embedded program, or with index -1 whether one is embedded, which is
   how warm boot and the loader keep quiet in an executable).
+- Stream primitive 18 is `file-newer?` (load-file.oak, stat mtimes):
+  given a base name, `load` takes `NAME.oak` over `NAME.oa` when the
+  source is strictly newer.
 
 ### Stand-alone executables (`oakc`, milestones 3-4): straight C
 

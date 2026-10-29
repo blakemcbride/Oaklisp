@@ -8,5 +8,5 @@
 *.ind
 *.log
 *.out
-*.pdf
+*-eps-converted-to.pdf
 *.toc

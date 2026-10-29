@@ -1,0 +1,55 @@
+;;; Rest arguments: a method whose rest name is used as an ordinary
+;;; variable gets the extra arguments as a list; one that only passes
+;;; them on in a tail call or measures them with rest-length keeps the
+;;; stack convention.
+
+(define (check name got expected)
+  (if (equal? got expected)
+      (format #t "PASS ~A~%" name)
+      (format #t "FAIL ~A: got ~S expected ~S~%" name got expected))
+  (flush standard-output))
+
+(set! #*print-length #f)
+(set! #*print-level #f)
+
+(define (ra-list a . r) (list a r))
+(define (ra-all . r) r)
+(define (ra-length . r) (length r))
+(define (ra-mixed a . r) (if (null? r) a (+ a . r)))
+(define (ra-closure . r) (lambda () (car r)))
+(define (ra-rest-length a . r) (list (rest-length r) (list a . r)))
+(define (ra-map x . r) (map (lambda (y) (* y x)) r))
+(define (ra-non-tail a . r) (cons 0 (list a . r)))
+(define (ra-let a . r) (let ((x (list a . r))) x))
+(define (ra-set . r) (set! r (reverse r)) r)
+(define (ra-iterate . r)
+  (iterate loop ((l r) (s 0)) (if (null? l) s (loop (cdr l) (+ s (car l))))))
+(define (ra-stack a . r) (+ a . r))
+(define (ra-stack-let a . r) (let ((n 5)) (list (rest-length r) n a . r)))
+(define (ra-count a . r) (rest-length r))
+(define (ra-ignore a . r) a)
+(define-instance ra-op operation)
+(add-method (ra-op (object) self a . r) (list self a r))
+
+(check "rest as list" (ra-list 1 2 3) '(1 (2 3)))
+(check "rest empty" (ra-all) '())
+(check "rest only" (ra-all 1 2) '(1 2))
+(check "rest length" (ra-length 1 2 3 4) 4)
+(check "rest null? and pass on" (list (ra-mixed 1) (ra-mixed 1 2 3)) '(1 6))
+(check "rest closed over" ((ra-closure 7 8)) 7)
+(check "rest-length becomes length" (ra-rest-length 1 2 3) '(2 (1 2 3)))
+(check "rest mapped" (ra-map 2 1 2 3) '(2 4 6))
+(check "pass on not in tail position" (ra-non-tail 1 2 3) '(0 1 2 3))
+(check "pass on inside let" (ra-let 1 2 3) '(1 2 3))
+(check "rest assigned" (ra-set 1 2 3) '(3 2 1))
+(check "rest in iterate" (ra-iterate 1 2 3) 6)
+(check "stack convention kept" (ra-stack 1 2 3) 6)
+(check "stack convention in let" (ra-stack-let 1 2 3) '(2 5 1 2 3))
+(check "rest-length only" (list (ra-count 1) (ra-count 1 2 3)) '(0 2))
+(check "rest ignored" (ra-ignore 1 2 3) 1)
+(check "method with rest" (ra-op 'x 1 2 3) '(x 1 (2 3)))
+(check "apply on rest-list function" (apply ra-list 1 '(2 3)) '(1 (2 3)))
+
+;;; The same in a method written with lambda.
+(let ((f (lambda (a . r) (map (lambda (x) (+ x a)) r))))
+  (check "lambda rest as list" (f 10 1 2 3) '(11 12 13)))

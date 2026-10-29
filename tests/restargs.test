@@ -1,0 +1,23 @@
+#!/bin/sh
+# Rest arguments as lists, interpreted and compiled; then LOAD's
+# preference for a source file newer than its object.
+. "$(dirname "$0")/testlib.sh"
+rm -rf restargs-check && mkdir restargs-check && cd restargs-check || exit 99
+run_oak_test restargs.oak || fail "interpreted"
+cp "$testdir/restargs.oak" compiled.oak
+oak -- --compile compiled --exit >compile.log 2>&1 || fail "compile"
+testdir=$(pwd)
+run_oak_test compiled.oa || fail "compiled"
+# newer.oa says OBJECT; newer.oak, edited later, says SOURCE.
+echo "(define which 'object)" > newer.oak
+oak -- --compile newer --exit >>compile.log 2>&1 || fail "compile newer"
+echo "(define which 'source)" > newer.oak
+touch -d '2000-01-01' newer.oa
+out=$(oak -- --load newer --eval '(print which standard-output)' --exit 2>&1)
+echo "$out"
+printf '%s' "$out" | grep -q 'SOURCE$' || fail "stale .oa shadowed a newer .oak"
+touch -d '2000-01-01' newer.oak
+touch newer.oa
+out=$(oak -- --load newer --eval '(print which standard-output)' --exit 2>&1)
+echo "$out"
+printf '%s' "$out" | grep -q 'OBJECT$' || fail "newer .oa not preferred"

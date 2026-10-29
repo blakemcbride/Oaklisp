@@ -105,13 +105,19 @@ are also provided.
 \mc{define}{\lpar variable \dt arg-list\rpar \dt body}
 \doc{\macdef{}{(define \emph{variable} (lambda \emph{arg-list} . \emph{body}))}}
 
-When \emph{arg-list} is dotted, the expansion shown for \df{lambda}
-applies only if the body uses the rest name as a rest name, that is, at
-the end of a call or in a \df{rest-length} form, as described in the
-section on rest args below.  A body that instead refers to the name as
-an ordinary variable gets it bound to a list of the extra arguments,
-which \df{lambda} collects with \df{listify-args}.  Only \df{lambda}
-does this; \df{add-method} always binds a rest name the native way.
+When \emph{arg-list} is dotted, the rest name is bound the native way,
+as described in the section on rest args below, only if the body uses
+it as a rest name: at the end of a call in tail position, or in a
+\df{rest-length} form.  A body that uses the name any other way---as an
+ordinary variable, at the end of a call that is not in tail position,
+or inside an inner \df{lambda}---gets it bound to a list of the extra
+arguments, collected with \df{listify-args}; in such a body
+\texttt{(f a .\ \emph{rest})} means \texttt{(apply f a \emph{rest})}
+and \texttt{(rest-length \emph{rest})} means \texttt{(length
+\emph{rest})}.  This holds for every method, whether written with
+\df{lambda}, \df{define} or \df{add-method}.  A rest name that begins
+with \texttt{\%} is always bound the native way, for code that plays
+tricks with the stack.
 
 
 \section{Dispatching to Supertypes}
@@ -158,7 +164,9 @@ rest name can't be evaluated and can only be referred to in two
 places: at the end of a function call that uses dotted syntax (which
 signifies that the extra values should be passed on to the function
 being called), and in a \df{rest-length} form, which is the mechanism
-for finding out how many rest args a method has been passed.
+for finding out how many rest args a method has been passed.  (A method
+whose body uses its rest name in any other way receives the rest args
+as a list instead; see \df{lambda} above.)
 
 \sform{rest-length}{rest-name}
 \doc{Yields the number of extra values that were received by the

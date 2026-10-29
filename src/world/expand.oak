@@ -87,10 +87,17 @@
 	  ((or (eq? s '%add-method)
 	       (eq? s '_%add-method))
 	   (destructure* (kind (op (typ . ivars) . args) body) form
-	     `(,kind
-	       (,(expand-groveling self op)
-		(,(expand-groveling self typ) . ,ivars) . ,args)
-	       ,(expand-groveling self body))))
+	     (let ((rest (improper-list? args))
+		   (body (expand-groveling self body)))
+	       `(,kind
+		 (,(expand-groveling self op)
+		  (,(expand-groveling self typ) . ,ivars) . ,args)
+		 ,(if (and rest
+			   (eq? kind '%add-method)
+			   (not (raw-rest-name? rest))
+			   (rest-needs-list? body rest (lambda-op? op)))
+		      (listify-rest-body self rest body)
+		      body)))))
 	  ((eq? s '%labels)
 	   `(,(first form)
 	     ,(map (lambda (x)
@@ -101,6 +108,155 @@
 	  ((eq? s 'quote)
 	   form)
 	  (else (error "Form ~S can't be idiosyncratically groveled." form)))))
+
+
+;;; Rest arguments as lists.  A rest argument lives on the stack, and a
+;;; method may only pass it on in a tail call, (f a . rest), or measure
+;;; it with (rest-length rest).  When the expanded body of a method uses
+;;; its rest name any other way -- as an ordinary variable, in a call
+;;; that is not a tail call, from inside an inner lambda -- the body is
+;;; rewritten to receive the extra arguments as a list:
+;;;
+;;;   (listify-args (lambda (rest) BODY') . rest)
+;;;
+;;; where BODY' has (f a . rest) turned into (apply f a rest) and
+;;; (rest-length rest) into (length rest).  Methods that use the rest
+;;; name only the documented ways are left exactly as they were, and so
+;;; are methods whose rest name starts with %, for code that plays
+;;; tricks with the stack (dump-stack).
+
+(define (raw-rest-name? rest)
+  (eq? #\% (nth (#^string rest) 0)))
+
+(define (rest-shadowed? rest ivars args)
+  (or (memq rest ivars)
+      (memq rest (make-proper args))
+      (eq? rest (improper-list? args))))
+
+;;; The documented ways, as the compiler supports them: (f a . rest) as
+;;; a tail call of the method itself, and (rest-length rest) anywhere
+;;; in the method itself.  The body of an immediately applied lambda
+;;; (what LET becomes) or of a LABELS binding (what ITERATE becomes) is
+;;; compiled inline, so it counts as the method itself; any other inner
+;;; lambda does not.  TOP? says we are in the method itself, TAIL? in
+;;; tail position.
+;;;
+;;; A LAMBDA (or DEFINE) whose body never passes its rest args on gets
+;;; the list too, since returning would leave them on the stack;
+;;; (lambda (a . r) (rest-length r)) answers the right number that way.
+;;; Only a LAMBDA: low level methods written with ADD-METHOD (^SUPER's,
+;;; the cold ERROR, %PUSH) leave theirs on purpose, and keep the
+;;; compiler's warning.
+
+;;; The operation of a method LAMBDA made: ('make 'operation).
+(define (lambda-op? op)
+  (and (pair? op)
+       (pair? (cdr op))
+       (null? (cddr op))
+       (pair? (car op)) (eq? (car (car op)) 'quote)
+       (pair? (cadr op)) (eq? (car (cadr op)) 'quote)))
+
+(define (rest-needs-list? body rest anonymous?)
+  (let ((passed? #f))
+    (labels (((walk form top? tail?)
+		(cond ((eq? form rest) #t)
+		      ((not (pair? form)) #f)
+		      (else
+		       (let ((s (car form)))
+			 (cond ((eq? s 'quote) #f)
+			       ((or (eq? s '%add-method)
+				    (eq? s '_%add-method))
+				(walk-method form top? #f #f))
+			       ((eq? s '%labels)
+				(and (not (any? (lambda (b) (eq? (car b) rest))
+						(second form)))
+				     (or (any? (lambda (b)
+						 (let ((val (second b)))
+						   (if (and (pair? val)
+							    (eq? (car val) '%add-method))
+						       (walk-method val top? top? #t)
+						       (walk val top? #f))))
+					       (second form))
+					 (walk (third form) top? tail?))))
+			       ((eq? s '%if)
+				(or (walk (second form) top? #f)
+				    (any? (lambda (x) (walk x top? tail?))
+					  (cddr form))))
+			       ((eq? s '%block)
+				(iterate next ((l (cdr form)))
+				  (cond ((null? l) #f)
+					((null? (cdr l)) (walk (car l) top? tail?))
+					((walk (car l) top? #f) #t)
+					(else (next (cdr l))))))
+			       ((and (eq? s 'rest-length)
+				     (pair? (cdr form))
+				     (eq? (second form) rest))
+				(not top?))
+			       (else
+				(or (any? (lambda (x) (walk x top? #f))
+					  (make-proper (cdr form)))
+				    (if (and (pair? s)
+					     (eq? (car s) '%add-method))
+					(walk-method s top? top? tail?)
+					(walk s top? #f))
+				    (and (eq? (improper-list? form) rest)
+					 (if (and top? tail?)
+					     (block (set! passed? #t) #f)
+					     #t)))))))))
+	       ;; A method form: its body is the method itself only when
+	       ;; INLINE? (an immediately applied lambda).
+	       ((walk-method form top? inline? tail?)
+		(destructure* (kind (op (typ . ivars) . args) bod) form
+		  (or (walk op top? #f)
+		      (walk typ top? #f)
+		      (and (not (rest-shadowed? rest ivars args))
+			   (walk bod inline? (and inline? tail?)))))))
+      (or (walk body #t #t)
+	  (and anonymous? (not passed?))))))
+
+(define (rewrite-rest-uses form rest)
+  (labels (((rewrite form)
+	    (if (not (pair? form))
+		form
+		(let ((s (car form)))
+		  (cond ((eq? s 'quote) form)
+			((or (eq? s '%add-method)
+			     (eq? s '_%add-method))
+			 (destructure* (kind (op (typ . ivars) . args) bod) form
+			   `(,kind
+			     (,(rewrite op) (,(rewrite typ) . ,ivars) . ,args)
+			     ,(if (rest-shadowed? rest ivars args)
+				  bod
+				  (rewrite bod)))))
+			((eq? s '%labels)
+			 (if (any? (lambda (b) (eq? (car b) rest)) (second form))
+			     form
+			     `(,s ,(map (lambda (b) (list (car b) (rewrite (second b))))
+					(second form))
+				  ,(rewrite (third form)))))
+			((and (eq? s 'rest-length)
+			      (pair? (cdr form))
+			      (eq? (second form) rest))
+			 `(length ,rest))
+			((eq? (improper-list? form) rest)
+			 `(apply ,@(map rewrite (make-proper form)) ,rest))
+			(else (map-proper-part rewrite form)))))))
+    (rewrite form)))
+
+(define (replace-eq new old tree)
+  (cond ((eq? tree old) new)
+	((pair? tree)
+	 (cons (replace-eq new old (car tree))
+	       (replace-eq new old (cdr tree))))
+	(else tree)))
+
+(define (listify-rest-body locale rest body)
+  (let ((placeholder (genvar)))
+    (replace-eq (rewrite-rest-uses body rest)
+		placeholder
+		(expand-groveling locale
+				  `(listify-args (lambda (,rest) ,placeholder)
+						 . ,rest)))))
 
 
 
