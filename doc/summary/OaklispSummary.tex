@@ -550,6 +550,36 @@ available in system-locale but not in oaklisp-locale or user-locale.
 
 \newpage
 
+{\Large \bfseries Threads}
+
+\smallskip
+
+With an emulator built with threads (\emph{configure --enable-threads}),
+a program may run code on operating-system threads of its own; each
+runs one process, starting with a copy of its creator's fluid
+bindings.  Mutexes are held by a process and are reentrant.
+
+\vspace{\baselineskip}
+
+\hbox{\begin{tabular}{|l|l|}\hline
+Form & Meaning \\\hline
+(make-thread thunk [name]) & start a thread; its thread object \\
+(thread-join t [ms]) & its value, waiting; \#f on a timeout; its error, re-signaled \\
+(thread-alive? t), (thread-name t) & still running?; its name \\
+(current-thread), (thread-count) & this thread's object; the live threads \\
+(thread-sleep ms) & sleep \\
+(make mutex), (make-named-mutex n) & a mutex \\
+(with-mutex m . body) & body holding m, released on any exit \\
+(make condition-variable) & a condition variable \\
+(condition-wait cv m [ms]) & release m, wait for a notify, take m again \\
+(condition-notify cv), (condition-notify-all cv) & wake one waiter, or all \\
+(compare-and-swap loc old new) & atomic: store new if the cell holds old \\
+(fetch-and-add loc n) & atomic: add n to the fixnum in the cell \\
+\hline
+\end{tabular}}
+
+\bigskip
+
 {\Large \bfseries Classes and Types}
 
 In classical object-oriented terminology, the following terms apply:

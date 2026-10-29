@@ -1,0 +1,120 @@
+;;; The thread API (ThreadUpdate.md Phase 4): threads made and joined,
+;;; errors propagated, condition variables, the atomic cell
+;;; operations, the two examples.  Run with threads enabled.
+
+(define (check name got expected)
+  (if (equal? got expected)
+      (format #t "PASS ~A~%" name)
+      (format #t "FAIL ~A: got ~S expected ~S~%" name got expected))
+  (flush standard-output))
+
+(set! #*print-length #f)
+(set! #*print-level #f)
+
+(check "make-thread and join" (thread-join (make-thread (lambda () (* 6 7)))) 42)
+(check "thread name" (thread-name (make-thread (lambda () 1) 'worker)) 'worker)
+(check "default name" (let ((n (thread-name (make-thread (lambda () 1)))))
+			(and (string? n) (equal? (subseq-indexes n 0 7) "thread-")))
+       #t)
+(check "join twice, not alive after"
+       (let ((t (make-thread (lambda () 'x))))
+	 (thread-join t)
+	 (list (thread-alive? t) (thread-join t)))
+       '(() x))
+(check "error propagation"
+       (catch-errors (general-error (lambda (e) 'propagated))
+	 (thread-join (make-thread (lambda () (car 1)))))
+       'propagated)
+(check "join timeout"
+       (let ((t (make-thread (lambda () (thread-sleep 1500) 'late))))
+	 (list (thread-join t 100) (thread-join t)))
+       '(#f late))
+(check "current-thread of main" (thread-name (current-thread)) 'main)
+(check "current-thread in a thread"
+       (thread-join (make-thread (lambda () (thread-name (current-thread))) 'inner))
+       'inner)
+(check "thread-count counts the live ones"
+       (let ((t (make-thread (lambda () (thread-sleep 500)))))
+	 (let ((n (thread-count)))
+	   (thread-join t)
+	   (> n 1)))
+       #t)
+(check "fluids copied, not shared"
+       (bind ((#*print-radix 7))
+	 (thread-join (make-thread (lambda ()
+				     (let ((seen #*print-radix))
+				       (bind ((#*print-radix 3)) (thread-sleep 10))
+				       seen)))))
+       7)
+(check "parallel sum"
+       (apply + (map thread-join
+		     (map (lambda (k)
+			    (make-thread
+			     (lambda ()
+			       (let loop ((i 0) (s 0))
+				 (if (= i 100000) s (loop (+ i 1) (+ s k)))))))
+			  '(1 2 3 4))))
+       1000000)
+(check "mutex across threads"
+       (let ((m (make mutex)) (n (list 0)))
+	 (map thread-join
+	      (map (lambda (k)
+		     (make-thread
+		      (lambda ()
+			(dotimes (i 1000)
+			  (with-mutex m (set! (car n) (+ (car n) 1)))))))
+		   '(1 2 3 4)))
+	 (car n))
+       4000)
+(check "fetch-and-add"
+       (let ((c (list 0)))
+	 (map thread-join
+	      (map (lambda (k)
+		     (make-thread
+		      (lambda ()
+			(dotimes (i 1000) (fetch-and-add (make-locative (car c)) 1)))))
+		   '(1 2 3 4)))
+	 (car c))
+       4000)
+(check "compare-and-swap"
+       (let ((c (list 1)))
+	 (list (compare-and-swap (make-locative (car c)) 1 2)
+	       (compare-and-swap (make-locative (car c)) 1 3)
+	       (car c)))
+       '(1 2 2))
+(check "condition variable handoff"
+       (let ((m (make mutex)) (cv (make condition-variable)) (box (list #f)))
+	 (let ((t (make-thread
+		   (lambda ()
+		     (with-mutex m
+		       (let wait ()
+			 (unless (car box) (condition-wait cv m) (wait))))
+		     (car box)))))
+	   (thread-sleep 50)
+	   (with-mutex m (set! (car box) 'delivered) (condition-notify cv))
+	   (thread-join t)))
+       'delivered)
+(check "condition-wait timeout"
+       (let ((m (make mutex)) (cv (make condition-variable)))
+	 (with-mutex m (condition-wait cv m 50)))
+       #f)
+(check "notify-all wakes every waiter"
+       (let ((m (make mutex)) (cv (make condition-variable)) (go (list #f)))
+	 (let ((ts (map (lambda (k)
+			  (make-thread
+			   (lambda ()
+			     (with-mutex m
+			       (let wait ()
+				 (unless (car go) (condition-wait cv m) (wait))))
+			     k)))
+			'(1 2 3))))
+	   (thread-sleep 100)
+	   (with-mutex m (set! (car go) #t) (condition-notify-all cv))
+	   (map thread-join ts)))
+       '(1 2 3))
+
+;;; The manual's examples.
+(load (append (file-base (#^string (fluid oaklisp-examples))) "parallel-map"))
+(load (append (file-base (#^string (fluid oaklisp-examples))) "producer-consumer"))
+(check "parallel-map example" (parallel-map (lambda (n) (* n n)) '(1 2 3 4 5)) '(1 4 9 16 25))
+(check "producer/consumer example" (producer-consumer 200) 19900)

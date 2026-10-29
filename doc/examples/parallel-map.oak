@@ -1,0 +1,11 @@
+;;; Parallel map: F over the elements of L, each on an OS thread of
+;;; its own, the results in order.  For a few long computations, not
+;;; many short ones: an OS thread costs far more than a process.
+;;;
+;;; Needs an emulator with threads (configure --enable-threads).
+
+(define (parallel-map f l)
+  (map thread-join
+       (map (lambda (x) (make-thread (lambda () (f x)))) l)))
+
+;;; (parallel-map (lambda (n) (* n n)) '(1 2 3 4 5))  =>  (1 4 9 16 25)

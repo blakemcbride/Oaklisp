@@ -1,0 +1,120 @@
+%% Copyright (C) 2026 Barak A. Pearlmutter
+
+\chapter{Threads} \label{threads}
+
+Oaklisp has two kinds of concurrency.  \emph{Processes} are
+lightweight: any number of them share one or more operating-system
+threads under a scheduler of Oaklisp's own, switching at
+\df{pause} and when preempted, and they are what \df{future},
+\df{delay} and the semaphores of this chapter are built on.
+\emph{Threads} are operating-system threads: with an emulator built
+with thread support (\texttt{configure --enable-threads}) Oaklisp
+code runs on several of them at once, and a program may make one of
+its own with \df{make-thread}.
+
+Each thread runs one process from a thunk to its end.  That process
+starts with a copy of its creator's fluid bindings and its creator's
+winding stack, so \df{bind} and \df{wind-protect} nest as they would
+in a call; global variables and all other objects are shared.  The
+runtime's own tables (the symbol table, the locales, the streams) are
+safe to use from several threads at once, and \df{format} writes a
+call's whole output to a stream at once; a hash table of the program's
+own is safe to read while another thread writes it, but two writers
+need a mutex.
+
+\section{Threads}
+
+\op{make-thread}{thunk $[$name$]$}
+\doc{Starts an operating-system thread running \emph{thunk} and
+returns its \df{thread} object at once.  \emph{Name} is for
+messages and \df{thread-name}; by default the threads are numbered.
+An error if the emulator has no thread support.}
+
+\op{thread-join}{thread $[$milliseconds$]$}
+\doc{Waits for \emph{thread} to finish and returns the value of its
+thunk; joined again, returns it again.  If the thunk signaled an
+error that nothing in the thread handled, \df{thread-join} signals an
+error in the joiner, carrying the thread's.  With \emph{milliseconds},
+waits at most that long and returns \texttt{\#f} if the thread is
+still running.  While it waits, the joiner's own operating-system
+thread is parked: no other process runs on it meanwhile.}
+
+\op{thread-alive?}{thread}
+\doc{Whether \emph{thread} has not finished yet.}
+
+\op{thread-name}{thread}
+\doc{The name \emph{thread} was made with.}
+
+\op{current-thread}{}
+\doc{The \df{thread} object of the thread this is called on; the
+main thread's is named \texttt{main}, a scheduler thread's
+\texttt{scheduler}.}
+
+\op{thread-count}{}
+\doc{The number of operating-system threads running Oaklisp code.}
+
+\op{thread-sleep}{milliseconds}
+\doc{Suspends the calling thread for \emph{milliseconds}.}
+
+\section{Mutexes}
+
+A mutex may be held by one process at a time.  It is held by a
+\emph{process}: a process that is preempted inside a critical section
+and resumed on another thread still holds it, and only the holder may
+release it.  A mutex is reentrant: the holder may acquire it again,
+and must release it as many times.
+
+\op{make-named-mutex}{name}
+\doc{A new mutex, named for messages; \texttt{(make mutex)} makes an
+anonymous one.}
+
+\op{acquire-mutex}{mutex}
+\doc{Waits until \emph{mutex} is free and takes it.}
+
+\op{release-mutex}{mutex}
+\doc{Releases \emph{mutex}; an error if the caller does not hold it.}
+
+\mc{with-mutex}{mutex \dt body}
+\doc{Evaluates \emph{body} holding \emph{mutex}, releasing it however
+the body is left, including by a throw.}
+
+\section{Condition Variables}
+
+\op{condition-variable}{}
+\doc{The type; \texttt{(make condition-variable)} makes one.  Used
+with a mutex that protects the state being waited for.}
+
+\op{condition-wait}{condition-variable mutex $[$milliseconds$]$}
+\doc{The caller must hold \emph{mutex}.  Releases it, waits until the
+condition variable is notified (or for at most \emph{milliseconds}),
+takes \emph{mutex} again and returns \texttt{\#t}, or \texttt{\#f}
+after a timeout.  Wake-ups can be spurious: test the condition in a
+loop around the wait.}
+
+\op{condition-notify}{condition-variable}
+\doc{Wakes one waiter, if any; whether there was one.}
+
+\op{condition-notify-all}{condition-variable}
+\doc{Wakes every waiter; how many.}
+
+\section{Atomic Operations}
+
+These act on a cell given as a locative, as \texttt{(make-locative
+(car x))} or \texttt{(make-locative variable)}, and compare with
+\df{eq?}, so they are for fixnums and objects, not bignums.
+
+\op{compare-and-swap}{locative old new}
+\doc{If the cell holds \emph{old} (by \df{eq?}), stores \emph{new}
+and returns \emph{old}; otherwise returns what the cell holds,
+unchanged.  Atomic with respect to every other thread.}
+
+\op{fetch-and-add}{locative n}
+\doc{Adds \emph{n} to the fixnum in the cell and returns the value it
+had.}
+
+\section{Examples}
+
+Two programs in \texttt{doc/examples}: \texttt{parallel-map.oak}, a
+\df{map} that runs each application on a thread of its own, and
+\texttt{producer-consumer.oak}, a bounded queue with a mutex and two
+condition variables between a producer thread and a consumer.

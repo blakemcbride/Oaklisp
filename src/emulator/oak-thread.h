@@ -101,6 +101,15 @@ static __inline void oak_cond_broadcast(oak_cond_t *cv) {
     WakeAllConditionVariable(cv);
 }
 
+/* Wait at most MS milliseconds: 1 if woken, 0 on timeout. */
+static __inline int oak_cond_timedwait_ms(oak_cond_t *cv, oak_mutex_t *m, long ms) {
+    return SleepConditionVariableCS(cv, m, (DWORD)ms) ? 1 : 0;
+}
+
+static __inline void oak_sleep_ms(long ms) {
+    Sleep((DWORD)ms);
+}
+
 
 /* -- Thread-local storage ------------------------------------------ */
 
@@ -182,6 +191,8 @@ static __inline void oak_thread_yield(void) {
 
 #include <pthread.h>
 #include <sched.h>
+#include <time.h>
+#include <errno.h>
 
 
 /* -- Mutex --------------------------------------------------------- */
@@ -232,6 +243,24 @@ static inline void oak_cond_wait(oak_cond_t *cv, oak_mutex_t *m) {
 
 static inline void oak_cond_broadcast(oak_cond_t *cv) {
     pthread_cond_broadcast(cv);
+}
+
+/* Wait at most MS milliseconds: 1 if woken, 0 on timeout. */
+static inline int oak_cond_timedwait_ms(oak_cond_t *cv, oak_mutex_t *m, long ms) {
+    struct timespec t;
+    clock_gettime(CLOCK_REALTIME, &t);
+    t.tv_sec += ms / 1000;
+    t.tv_nsec += (ms % 1000) * 1000000L;
+    if (t.tv_nsec >= 1000000000L) { t.tv_sec++; t.tv_nsec -= 1000000000L; }
+    return pthread_cond_timedwait(cv, m, &t) == ETIMEDOUT ? 0 : 1;
+}
+
+static inline void oak_sleep_ms(long ms) {
+    struct timespec t;
+    t.tv_sec = ms / 1000;
+    t.tv_nsec = (ms % 1000) * 1000000L;
+    while (nanosleep(&t, &t) != 0 && errno == EINTR)
+	;
 }
 
 

@@ -2331,6 +2331,32 @@ loop(ref_t initial_tos)
 		  }
 		  GOTO_TOP;
 
+		case 19:	/* thread-park ms-or-nil: #t unparked, nil timed out */
+		  x = PEEKVAL();
+		  if (x != e_nil)
+		    CHECKTAG0(x, INT_TAG, 1);
+		  UNLOCALIZE_ALL();
+		  y = oak_thread_park(x == e_nil ? -1L : (long)REF_TO_INT(x))
+		    ? e_t : e_nil;
+		  LOCALIZE_ALL();
+		  PEEKVAL() = y;
+		  GOTO_TOP;
+
+		case 20:	/* thread-unpark index */
+		  x = PEEKVAL();
+		  CHECKTAG0(x, INT_TAG, 1);
+		  PEEKVAL() = BOOL_TO_REF(oak_thread_unpark((int)REF_TO_INT(x)));
+		  GOTO_TOP;
+
+		case 21:	/* thread-sleep ms */
+		  x = PEEKVAL();
+		  CHECKTAG0(x, INT_TAG, 1);
+		  UNLOCALIZE_ALL();
+		  oak_thread_sleep_ms((long)REF_TO_INT(x));
+		  LOCALIZE_ALL();
+		  PEEKVAL() = e_t;
+		  GOTO_TOP;
+
 		default:
 		  printf("\nError (vm interpreter): "
 			 "bad stream primitive %d.\n",

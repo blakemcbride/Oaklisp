@@ -190,6 +190,28 @@ Performance
 See `GC.md` for full garbage collection documentation.
 
 
+The API
+=======
+
+Documented in the language manual's Threads chapter
+(`doc/lang/threads.tex`).  `make-thread` starts an OS thread running a
+thunk as one process (a copy of the creator's fluid bindings, the
+creator's winding stack); `thread-join` waits for it, parked, and
+gives its value or re-signals its error; `thread-alive?`,
+`thread-name`, `current-thread`, `thread-count`, `thread-sleep`.
+`condition-variable` with `condition-wait` (releases the mutex, parks,
+takes it again), `condition-notify`, `condition-notify-all`.
+`compare-and-swap` and `fetch-and-add` on a cell.  Parking is the
+emulator's: stream primitives 19 (park, with an optional timeout, the
+thread at a safepoint for the collector throughout), 20 (unpark, with
+a permit so an unpark before the park counts) and 21 (sleep).  The
+scheduler threads of `--pthreads N` park the same way while the queue
+is empty, and `release-scheduler` wakes one when a process is queued,
+so idle threads cost nothing.  A waiting thread runs no other process
+meanwhile; with one OS thread, waiting on a condition variable that
+only another OS thread could notify never ends.
+
+
 Shared state
 ============
 
@@ -211,7 +233,8 @@ safe (ThreadUpdate.md Phase 3):
 | Stream-primitive cache | streams.oak | `*stream-primitive-mutex*` |
 | Output streams | format.oak | a `format` call's output reaches the stream at once, under `*output-mutex*`, rendered first outside it; `print` or `write-string` straight to a shared stream from several threads interleaves |
 | Input streams | — | one reader per stream; not locked |
-| Scheduler queue | multiproc.oak | `*scheduleQ-mutex*`, held by the OS thread, alarms off |
+| Scheduler queue, idle scheduler list | multiproc.oak | `*scheduleQ-mutex*`, held by the OS thread, alarms off |
+| Thread objects (`*threads*`), a thread's state and joiners | multiproc.oak | `*threads-mutex*`; each thread's own mutex |
 | Process ids | multiproc.oak | lock-free compare-and-swap |
 | `load` | load-file.oak | a mutex per file name: the same file loads serially, different files in parallel |
 | The bytecode compiler | compiler-locale | per-compilation state in fluids and the AST; `crunch-class-alist`, the opcode tables and `nichevo` are read-only after load; concurrent `compile-file`s give byte-identical objects (`threads-stress.test`), and so does compiling with threads live (`check-threaded-fixpoint`) |

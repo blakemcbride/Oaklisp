@@ -558,6 +558,21 @@ oak_rt_stream_primitive(unsigned n, ref_t ** spp)
       }
       break;
 
+      /* Natively compiled code does not run with threads: parking has
+	 no one to wait for and unparking no one to wake. */
+    case 19:
+      sp[0] = e_nil;
+      break;
+    case 20:
+      sp[0] = e_nil;
+      break;
+    case 21:
+      if (!TAG_IS(sp[0], INT_TAG))
+	return 1;
+      oak_thread_sleep_ms((long)REF_TO_INT(sp[0]));
+      sp[0] = e_t;
+      break;
+
     default:
       fprintf(stderr, "\nError (native code): bad stream primitive %u.\n", n);
       maybe_dump_world(333);

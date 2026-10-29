@@ -1,0 +1,58 @@
+;;; A bounded queue shared by a producer thread and a consumer, with a
+;;; mutex and two condition variables: the producer waits while the
+;;; queue is full, the consumer while it is empty.
+;;;
+;;; Needs an emulator with threads (configure --enable-threads).
+
+(define-instance bounded-queue type
+  '(items count limit lock not-empty not-full) (list object))
+
+(define-instance queue-put operation)
+(define-instance queue-take operation)
+
+(add-method (initialize (bounded-queue items count limit lock not-empty not-full)
+		    self the-limit)
+  (set! items '())
+  (set! count 0)
+  (set! limit the-limit)
+  (set! lock (make mutex))
+  (set! not-empty (make condition-variable))
+  (set! not-full (make condition-variable))
+  self)
+
+(add-method (queue-put (bounded-queue items count limit lock not-empty not-full)
+		    self x)
+  (with-mutex lock
+    (let wait ()
+      (when (= count limit)
+	(condition-wait not-full lock)
+	(wait)))
+    (set! items (append! items (list x)))
+    (set! count (+ count 1))
+    (condition-notify not-empty))
+  x)
+
+(add-method (queue-take (bounded-queue items count lock not-empty not-full) self)
+  (with-mutex lock
+    (let wait ()
+      (when (= count 0)
+	(condition-wait not-empty lock)
+	(wait)))
+    (let ((x (car items)))
+      (set! items (cdr items))
+      (set! count (- count 1))
+      (condition-notify not-full)
+      x)))
+
+;;; N items 0 .. N-1 through a queue of 5, produced by a thread,
+;;; consumed by the caller; their sum.
+
+(define (producer-consumer n)
+  (let ((q (make bounded-queue 5)))
+    (let ((producer (make-thread (lambda () (dotimes (i n) (queue-put q i)) 'done))))
+      (let loop ((i 0) (sum 0))
+	(if (= i n)
+	    (block (thread-join producer) sum)
+	    (loop (+ i 1) (+ sum (queue-take q))))))))
+
+;;; (producer-consumer 200)  =>  19900

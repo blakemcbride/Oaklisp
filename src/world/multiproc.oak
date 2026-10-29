@@ -251,12 +251,28 @@
 (define *pid-counter* 0)
 
 (define (new-pid)
-  ;; Lock-free, a compare-and-swap on the counter's cell: a new OS
-  ;; thread makes its first process while its process register still
-  ;; holds its parent's, so this must not depend on who holds a mutex.
+  ;; Lock-free: a new OS thread makes its first process while its
+  ;; process register still holds its parent's, so this must not
+  ;; depend on who holds a mutex.
+  (fetch-and-add (make-locative *pid-counter*) 1))
+
+;;; Atomic operations on a cell (a locative), in terms of
+;;; %TEST-AND-SET-LOCATIVE, which compares with EQ?, so these are for
+;;; fixnums and objects, not bignums.
+
+;;; The value found: OLD when the swap happened, else what was there.
+(define (compare-and-swap loc old new)
   (iterate retry ()
-    (let ((old *pid-counter*))
-      (if (%test-and-set-locative (make-locative *pid-counter*) old (+ old 1))
+    (let ((cur (contents loc)))
+      (cond ((not (eq? cur old)) cur)
+	    ((%test-and-set-locative loc old new) old)
+	    (else (retry))))))
+
+;;; Adds N to the fixnum in the cell; the value before.
+(define (fetch-and-add loc n)
+  (iterate retry ()
+    (let ((old (contents loc)))
+      (if (%test-and-set-locative loc old (+ old n))
 	  old
 	  (retry)))))
 
@@ -302,6 +318,9 @@
     (set! *native-compiler-mutex* (make-named-mutex 'native-compiler))
     (set! *load-mutexes* (make-string-hash-table))
     (set! *load-table-mutex* (make-named-mutex 'load-table))
+    (set! *threads* (make-eq-hash-table))
+    (set! *threads-mutex* (make-named-mutex 'threads))
+    (%thread-register (make thread 'main))
     (set! %threads-initialized #t)))
 
 (define (setup-initial-process-object)
@@ -394,8 +413,20 @@
   (%disable-alarms)
   (acquire-mutex *scheduleQ-mutex*))
 (define (release-scheduler)
-  (release-mutex *scheduleQ-mutex*)
-  (%enable-alarms))
+  ;; Something to run and a scheduler thread asleep: wake it (after
+  ;; the release, so it finds the lock free).
+  (let ((wake (and (not (null? *idle-schedulers*))
+		   (not (qempty? *scheduleQ*))
+		   (let ((w (car *idle-schedulers*)))
+		     (set! *idle-schedulers* (cdr *idle-schedulers*))
+		     w))))
+    (release-mutex *scheduleQ-mutex*)
+    (%enable-alarms)
+    (when wake (%thread-unpark wake))))
+
+;;; The OS threads parked in BUSY-WORK for want of a process to run,
+;;; by index; under the scheduler mutex.
+(define *idle-schedulers* '())
 
 (define (lwp thunk)
   (acquire-scheduler)
@@ -468,7 +499,18 @@
 ;;; busy waiting take less machine time
 
 (define (busy-work)
-  (while #t (pause)))
+  ;; A scheduler thread's life: run the queued processes, and park
+  ;; while there are none (RELEASE-SCHEDULER wakes it when one comes).
+  (iterate loop ()
+    (acquire-scheduler)
+    (cond ((qempty? *scheduleQ*)
+	   (set! *idle-schedulers* (cons (%thread-index) *idle-schedulers*))
+	   (release-scheduler)
+	   (%thread-park #f))
+	  (else
+	   (release-scheduler)
+	   (pause)))
+    (loop)))
 
 
 ;;; What a new heavyweight thread runs: (%make-heavyweight-thread
@@ -480,6 +522,7 @@
 
 (define (start-busy-work)
   (%store-process (make process))
+  (%thread-register (make thread 'scheduler))
   (busy-work))
 
 ;;; --------------------------------------------------
@@ -625,3 +668,164 @@
     `(let ((foosym (make future-obj (lambda () . ,(cdr form)))))
        (process-run-fn force (list foosym))
        foosym)))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; OS threads for programs: MAKE-THREAD, THREAD-JOIN, condition
+;;; variables.  Each such thread runs one process (with a copy of its
+;;; creator's fluid bindings and its creator's winding stack) on an OS
+;;; thread of its own, from the thunk to its end; THREAD-JOIN waits
+;;; for it and gives its value, or signals its error again.  Waiting
+;;; parks the OS thread (the emulator's park/unpark, stream primitives
+;;; 19 and 20): no spinning, but no other process runs on that thread
+;;; meanwhile either, so these are for programs that want OS threads,
+;;; not a replacement for FUTURE and the lightweight processes.
+
+(define (%thread-park ms) ((%stream-primitive 19) ms))	; #f: until unparked
+(define (%thread-unpark index) ((%stream-primitive 20) index))
+(define (thread-sleep ms) ((%stream-primitive 21) ms))
+(define (thread-count) (%thread-count))
+
+(define-instance thread type
+  '(name state value index process lock waiters) (list object))
+
+(define-instance thread-name operation)
+(define-instance thread-alive? operation)
+(define-instance thread-join operation)
+(define-instance %thread-register operation)
+(define-instance %thread-run operation)
+
+;;; The thread objects by OS thread index, the main thread's first.
+(define *threads* #f)
+(define *threads-mutex* #f)
+(define *thread-counter* 0)
+
+(add-method (initialize (thread name state value index process lock waiters)
+		    self the-name)
+  (set! name the-name)
+  (set! state 'new)			; then RUNNING, and DONE or FAILED
+  (set! value #f)			; the thunk's value, or its condition
+  (set! index #f)
+  (set! process #f)
+  (set! lock (make-named-mutex the-name))
+  (set! waiters '())			; OS threads parked in THREAD-JOIN
+  self)
+
+(add-method (thread-name (thread name) self) name)
+
+(add-method (thread-alive? (thread state) self)
+  (or (eq? state 'new) (eq? state 'running)))
+
+(add-method (print (thread name state) self stream)
+  (format stream "#<Thread ~A ~A>" name state))
+
+;;; On the thread itself: it is the current thread from here on.
+(add-method (%thread-register (thread state index process) self)
+  (set! index (%thread-index))
+  (set! process (current-process))
+  (set! state 'running)
+  (%guard *threads-mutex*
+	  (lambda () (set! (present? *threads* index) self))))
+
+(define (current-thread)
+  (and *threads*
+       (%guard *threads-mutex*
+	       (lambda ()
+		 (let ((entry (present? *threads* (%thread-index))))
+		   (and entry (cdr entry)))))))
+
+(define (%condition-string c)
+  (let ((s (make string-output-stream)))
+    (report c s)
+    (#^string s)))
+
+;;; What the new OS thread runs.
+(add-method (%thread-run (thread name state value index lock waiters)
+		    self thunk)
+  (%store-process (make process))
+  (%thread-register self)
+  (let ((outcome (catch-errors (general-error (lambda (e) (cons 'failed e)))
+		   (cons 'done (thunk)))))
+    (let ((ws (%guard lock
+		      (lambda ()
+			(set! value (cdr outcome))
+			(set! state (car outcome))
+			(let ((w waiters))
+			  (set! waiters '())
+			  w)))))
+      (dolist (w ws) (%thread-unpark w)))
+    (%guard *threads-mutex*
+	    (lambda () (set! (present? *threads* index) nil)))))
+
+(define (make-thread thunk . name)
+  (let ((t (make thread
+		 (if (null? name)
+		     (format #f "thread-~D"
+			     (fetch-and-add (make-locative *thread-counter*) 1))
+		     (car name)))))
+    (unless (and *threads*
+		 (%make-heavyweight-thread (lambda () (%thread-run t thunk))))
+      (error "MAKE-THREAD: no OS thread could be started (an emulator without threads?)~%"))
+    t))
+
+;;; The thread's value, waiting for it; with a timeout in milliseconds,
+;;; #f if it is still running when that runs out.  A thread that
+;;; failed makes its error the joiner's.
+(add-method (thread-join (thread name state value lock waiters) self . timeout)
+  (let ((ms (if (null? timeout) #f (car timeout)))
+	(me (%thread-index)))
+    (iterate wait ()
+      (let ((finished
+	     (%guard lock
+		     (lambda ()
+		       (or (eq? state 'done) (eq? state 'failed)
+			   (block (set! waiters (cons me waiters)) #f))))))
+	(cond (finished
+	       (if (eq? state 'failed)
+		   (error "Thread ~A died: ~A~%" name (%condition-string value))
+		   value))
+	      ((%thread-park ms) (wait))
+	      (else
+	       (%guard lock (lambda () (set! waiters (delq me waiters))))
+	       (if (or (eq? state 'done) (eq? state 'failed)) (wait) #f)))))))
+
+;;; Condition variables, for use with a mutex: CONDITION-WAIT gives
+;;; the mutex up, parks until notified (or for a timeout, in
+;;; milliseconds), and takes the mutex again before returning #t
+;;; (#f after a timeout).  Spurious wake-ups are possible: wait in a
+;;; loop that tests the condition.
+
+(define-instance condition-variable type '(waiters lock) (list object))
+(define-instance condition-wait operation)
+(define-instance condition-notify operation)
+(define-instance condition-notify-all operation)
+
+(add-method (initialize (condition-variable waiters lock) self)
+  (set! waiters '())
+  (set! lock (make-named-mutex 'condition-variable))
+  self)
+
+(add-method (condition-wait (condition-variable waiters lock) self m . timeout)
+  (let ((ms (if (null? timeout) #f (car timeout)))
+	(me (%thread-index)))
+    (%guard lock (lambda () (set! waiters (append! waiters (list me)))))
+    (release-mutex m)
+    (let ((woken (%thread-park ms)))
+      (unless woken
+	(%guard lock (lambda () (set! waiters (delq me waiters)))))
+      (acquire-mutex m)
+      woken)))
+
+(add-method (condition-notify (condition-variable waiters lock) self)
+  (let ((w (%guard lock
+		   (lambda ()
+		     (and (not (null? waiters))
+			  (let ((x (car waiters)))
+			    (set! waiters (cdr waiters))
+			    x))))))
+    (when w (%thread-unpark w))
+    (not (not w))))
+
+(add-method (condition-notify-all (condition-variable waiters lock) self)
+  (let ((ws (%guard lock (lambda () (let ((w waiters)) (set! waiters '()) w)))))
+    (dolist (w ws) (%thread-unpark w))
+    (length ws)))

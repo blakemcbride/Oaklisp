@@ -109,6 +109,7 @@ oak_threads_system_init(void)
       extern oak_mutex_t dump_lock;
       oak_mutex_init(&wp_lock);
       oak_mutex_init(&dump_lock);
+      oak_mutex_init(&park_init_lock);
     }
 #endif
 }
@@ -243,11 +244,113 @@ static void *init_thread (void *info_p)
 
   thread_exit_armed[my_index] = 0;
 
-  fprintf(stderr, "Warning: heavyweight thread %d thunk returned; thread exiting.\n",
-	  my_index);
+  /* The thunk returned: the thread is done (MAKE-THREAD's threads end
+     this way; the scheduler's never return). */
   return 0;
 }
 #endif
+
+#ifdef THREADS
+/* Parking (stream primitives 19 and 20): a thread blocks on its own
+   condition variable until another thread unparks it.  A permit makes
+   an unpark before the park count, so no wake-up is lost.  A parked
+   thread is at a safepoint: the caller has unlocalized its stacks, and
+   gc_ready says so for the length of the block; it leaves the parked
+   state under gc_lock, as wait_for_gc does, so a stop-the-world that
+   counted it stays stopped.  The slots are set up on first use, under
+   a lock of their own. */
+static oak_mutex_t park_init_lock = OAK_MUTEX_INITIALIZER;
+static int park_inited;
+static oak_mutex_t park_lock[MAX_THREAD_COUNT];
+static oak_cond_t park_cv[MAX_THREAD_COUNT];
+static int park_permit[MAX_THREAD_COUNT];
+
+static void
+park_init(void)
+{
+  if (!park_inited) {
+    oak_mutex_lock(&park_init_lock);
+    if (!park_inited) {
+      int i;
+      for (i = 0; i < MAX_THREAD_COUNT; i++) {
+	oak_mutex_init(&park_lock[i]);
+	oak_cond_init(&park_cv[i]);
+	park_permit[i] = 0;
+      }
+      park_inited = 1;
+    }
+    oak_mutex_unlock(&park_init_lock);
+  }
+}
+#endif
+
+/* Block until unparked, or for MS milliseconds if MS >= 0: 1 if
+   unparked, 0 on timeout (and always 0 at once without threads). */
+int
+oak_thread_park(long ms)
+{
+#ifdef THREADS
+  int idx = *(int *)oak_tls_get(index_key);
+  int got;
+
+  park_init();
+  gc_ready[idx] = 1;
+  oak_mutex_lock(&park_lock[idx]);
+  if (ms < 0) {
+    while (!park_permit[idx])
+      oak_cond_wait(&park_cv[idx], &park_lock[idx]);
+  } else if (!park_permit[idx]) {
+    oak_cond_timedwait_ms(&park_cv[idx], &park_lock[idx], ms);
+  }
+  got = park_permit[idx];
+  park_permit[idx] = 0;
+  oak_mutex_unlock(&park_lock[idx]);
+  oak_mutex_lock(&gc_lock);
+  gc_ready[idx] = 0;
+  oak_mutex_unlock(&gc_lock);
+  return got;
+#else
+  (void)ms;
+  return 0;
+#endif
+}
+
+/* Give thread IDX a permit, waking it if parked: 1, or 0 for no such
+   thread. */
+int
+oak_thread_unpark(int idx)
+{
+#ifdef THREADS
+  if (idx < 0 || idx >= next_index)
+    return 0;
+  park_init();
+  oak_mutex_lock(&park_lock[idx]);
+  park_permit[idx] = 1;
+  oak_cond_broadcast(&park_cv[idx]);
+  oak_mutex_unlock(&park_lock[idx]);
+  return 1;
+#else
+  (void)idx;
+  return 0;
+#endif
+}
+
+/* Sleep MS milliseconds, at a safepoint. */
+void
+oak_thread_sleep_ms(long ms)
+{
+#ifdef THREADS
+  int idx = *(int *)oak_tls_get(index_key);
+
+  gc_ready[idx] = 1;
+  oak_sleep_ms(ms);
+  oak_mutex_lock(&gc_lock);
+  gc_ready[idx] = 0;
+  oak_mutex_unlock(&gc_lock);
+#else
+  oak_sleep_ms(ms);
+#endif
+}
 
 /* The OS threads running Oaklisp code: 1 without threads. */
 int oak_live_thread_count(void)

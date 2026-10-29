@@ -50,6 +50,9 @@ extern void gc(bool pre_dump, bool full_gc, char *reason,
 extern int gc_ready[];
 extern int gc_thread_dead[];
 extern int oak_live_thread_count(void);
+extern int oak_thread_park(long ms);
+extern int oak_thread_unpark(int idx);
+extern void oak_thread_sleep_ms(long ms);
 extern bool gc_pending;
 extern oak_mutex_t gc_lock;
 #endif

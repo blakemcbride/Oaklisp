@@ -228,8 +228,10 @@ OA_COMPILE_none = @echo "no way to build the world: no old world ($(OLD_WORLD)) 
 # multiproc.oak uses the %THREADS-ENABLED? operation multi-em.oak
 # defines, and file-io.oak's RENAME-FILE uses (%STREAM-PRIMITIVE 14)
 # from streams.oak.
-multiproc.oa: OAKEXTRALOAD = --load old/multi-em
-multiproc.oa: $(if $(filter world,$(OAK_COMPILE)),old/multi-em.oa)
+# (multiproc.oak also folds the thread stream primitives, 19 to 21,
+# which only the new streams.oak knows.)
+multiproc.oa: OAKEXTRALOAD = --load old/multi-em --load old/multi-off --load old/streams
+multiproc.oa: $(if $(filter world,$(OAK_COMPILE)),old/multi-em.oa old/multi-off.oa old/streams.oa)
 
 # (streams.oak's %STREAM-PRIMITIVE runs its section through %GUARD from
 # multi-off.oak, so that goes in first.)

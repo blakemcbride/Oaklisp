@@ -173,6 +173,10 @@
     process current-process process-id process-run-fn mutex semaphore
     acquire-mutex release-mutex make-named-mutex mutex-name with-mutex
     test-and-set
+    thread make-thread thread-join thread-alive? thread-name
+    current-thread thread-count thread-sleep
+    condition-variable condition-wait condition-notify condition-notify-all
+    compare-and-swap fetch-and-add
     lwp wait pause
 
     ;; Undefined values returned by various forms

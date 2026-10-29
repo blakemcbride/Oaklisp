@@ -127,6 +127,13 @@ extern bool dump_flag;
 
 /* The alarm clock, shared between the interpreter and native code. */
 extern unsigned oak_timer_counter, oak_timer_increment;
+
+/* threads.c, in every configuration: the live OS threads (1 without
+   threads), and the parking of the thread stream primitives. */
+extern int oak_live_thread_count(void);
+extern int oak_thread_park(long ms);
+extern int oak_thread_unpark(int idx);
+extern void oak_thread_sleep_ms(long ms);
 #define OAK_TIMER_LIMIT 1000
 extern bool gc_before_dump;
 

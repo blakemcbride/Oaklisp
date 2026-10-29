@@ -1,0 +1,10 @@
+#!/bin/sh
+# The thread API: make-thread, thread-join, condition variables, the
+# atomic cell operations, and the manual's two examples; see
+# doc/lang/threads.tex.  Only with threads.
+. "$(dirname "$0")/testlib.sh"
+enabled=$(oak -- --eval '(print (%threads-enabled?) standard-output)' --exit 2>&1 | tail -c 3)
+case $enabled in *T*) ;; *) skip "emulator built without threads";; esac
+ex="$top_srcdir/doc/examples/"
+run_oak_test threads-api.oak --eval "(define #*oaklisp-examples \"$ex\")" || fail "threads-api.oak"
+echo "thread API tests pass"

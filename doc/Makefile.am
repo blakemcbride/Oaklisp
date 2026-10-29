@@ -63,6 +63,7 @@ prebuilt: $(LATEX_PDFS)
 
 EXTRA_DIST += examples/bank-example.oak examples/change.oak		\
  examples/test-bank-example.oak examples/unit-testing.oak		\
+ examples/parallel-map.oak examples/producer-consumer.oak		\
  lang/control.tex lang/cover.tex lang/dynamic.tex			\
  lang/graphic-numhier.tex lang/graphic-seqhier.tex lang/intro.tex	\
  lang/io.tex lang/locales.tex lang/methods.tex lang/misc.tex		\
