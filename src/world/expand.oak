@@ -141,8 +141,8 @@
 ;;; lambda does not.  TOP? says we are in the method itself, TAIL? in
 ;;; tail position.
 ;;;
-;;; A LAMBDA (or DEFINE) whose body never passes its rest args on gets
-;;; the list too, since returning would leave them on the stack;
+;;; A LAMBDA (or DEFINE) with a way out that leaves its rest args on
+;;; the stack gets the list too (REST-EXITS-OK? below);
 ;;; (lambda (a . r) (rest-length r)) answers the right number that way.
 ;;; Only a LAMBDA: low level methods written with ADD-METHOD (^SUPER's,
 ;;; the cold ERROR, %PUSH) leave theirs on purpose, and keep the
@@ -157,8 +157,7 @@
        (pair? (cadr op)) (eq? (car (cadr op)) 'quote)))
 
 (define (rest-needs-list? body rest anonymous?)
-  (let ((passed? #f))
-    (labels (((walk form top? tail?)
+  (labels (((walk form top? tail?)
 		(cond ((eq? form rest) #t)
 		      ((not (pair? form)) #f)
 		      (else
@@ -200,9 +199,7 @@
 					(walk-method s top? top? tail?)
 					(walk s top? #f))
 				    (and (eq? (improper-list? form) rest)
-					 (if (and top? tail?)
-					     (block (set! passed? #t) #f)
-					     #t)))))))))
+					 (not (and top? tail?))))))))))
 	       ;; A method form: its body is the method itself only when
 	       ;; INLINE? (an immediately applied lambda).
 	       ((walk-method form top? inline? tail?)
@@ -212,7 +209,124 @@
 		      (and (not (rest-shadowed? rest ivars args))
 			   (walk bod inline? (and inline? tail?)))))))
       (or (walk body #t #t)
-	  (and anonymous? (not passed?))))))
+	  (and anonymous?
+	       (not (rest-exits-ok? body rest))))))
+
+;;; Every way out of the method itself has to leave the extra arguments
+;;; off the stack: by passing them on in a tail call, or because the
+;;; tests on the way there have shown there are none, as in
+;;;
+;;;   (cond ((zero? (rest-length rest)) 'none)
+;;;         (else (f a . rest)))
+;;;
+;;; or after ((> (rest-length rest) 1) ...) and ((= (rest-length rest)
+;;; 1) ...) have both failed.  A LAMBDA that passes them on along some
+;;; paths but returns over them along others gets the list too.  Tail
+;;; calls to LABELS functions (ITERATE loops) count as their bodies'
+;;; exits, and a tail call to ERROR as no exit at all.  Anything not
+;;; understood counts as an exit that leaves them, which costs only the
+;;; list.  ADD-METHOD written out by hand is not checked: low level
+;;; methods such as + return an extra argument with (%RETURN).
+
+;;; What is known about the count of extra arguments: (LO HI EXCLUDED),
+;;; HI #f when unbounded.
+
+(define rest-count-unknown '(0 #f ()))
+
+;;; True when the count can only be zero, or when no count is possible
+;;; at all (the code is unreachable).
+(define (rest-count-zero? known)
+  (destructure (lo hi excluded) known
+    (and hi
+	 (or (< hi lo)
+	     (and (< (- hi lo) 64)
+		  (iterate next ((n (max lo 1)))
+		    (or (> n hi)
+			(and (memq n excluded) (next (+ n 1))))))))))
+
+;;; KNOWN after the test (REST-LENGTH REST) OP K: (IF-TRUE . IF-FALSE).
+(define (rest-count-compare op k known)
+  (destructure (lo hi excluded) known
+    (labels (((at-least n) (list (max lo n) hi excluded))
+	     ((at-most n) (list lo (if hi (min hi n) n) excluded)))
+      (cond ((memq op '(= eq?))
+	     (cons (list (max lo k) (if hi (min hi k) k) excluded)
+		   (list lo hi (cons k excluded))))
+	    ((eq? op '>) (cons (at-least (+ k 1)) (at-most k)))
+	    ((eq? op '<) (cons (at-most (- k 1)) (at-least k)))
+	    ((eq? op '>=) (cons (at-least k) (at-most (- k 1))))
+	    (else (cons (at-most k) (at-least (+ k 1))))))))
+
+;;; KNOWN after TEST: (IF-TRUE . IF-FALSE), or #f when TEST says
+;;; nothing about the count.  ELSE is what a COND's last clause tests.
+(define (rest-count-test test rest known)
+  (labels (((count? x)
+	    (and (pair? x) (eq? (car x) 'rest-length)
+		 (pair? (cdr x)) (eq? (second x) rest) (null? (cddr x))))
+	   ((args? n)
+	    (and (pair? (cdr test))
+		 (if (= n 1)
+		     (null? (cddr test))
+		     (and (pair? (cddr test)) (null? (cdddr test)))))))
+    (cond ((or (eq? test 'else) (eq? test #t))
+	   (cons known '(1 0 ())))
+	  ((not (pair? test)) #f)
+	  ((and (eq? (car test) 'not) (args? 1))
+	   (let ((r (rest-count-test (second test) rest known)))
+	     (and r (cons (cdr r) (car r)))))
+	  ((and (eq? (car test) 'zero?) (args? 1) (count? (second test)))
+	   (rest-count-compare '= 0 known))
+	  ((and (memq (car test) '(= eq? < > <= >=)) (args? 2))
+	   (let ((a (second test))
+		 (b (third test)))
+	     (cond ((and (count? a) (integer? b))
+		    (rest-count-compare (car test) b known))
+		   ((and (integer? a) (count? b))
+		    (rest-count-compare (cdr (assq (car test)
+						   '((= . =) (eq? . eq?)
+						     (< . >) (> . <)
+						     (<= . >=) (>= . <=))))
+					a known))
+		   (else #f))))
+	  (else #f))))
+
+(define (rest-exits-ok? body rest)
+  (labels (((ok? form loops known)
+	    (cond ((rest-count-zero? known) #t)
+		  ((not (pair? form)) #f)
+		  ((eq? (improper-list? form) rest) #t)
+		  (else
+		   (let ((s (car form)))
+		     (cond ((eq? s 'quote) #f)
+			   ((eq? s '%if)
+			    (let* ((r (rest-count-test (second form) rest known))
+				   (if-true (if r (car r) known))
+				   (if-false (if r (cdr r) known)))
+			      (and (ok? (third form) loops if-true)
+				   (if (pair? (cdddr form))
+				       (ok? (fourth form) loops if-false)
+				       (rest-count-zero? if-false)))))
+			   ((eq? s '%block)
+			    (and (pair? (cdr form)) (ok? (last form) loops known)))
+			   ((eq? s '%labels)
+			    (let ((loops (append (map car (second form)) loops)))
+			      (and (not (memq rest loops))
+				   (every? (lambda (b)
+					     (let ((val (second b)))
+					       (or (not (pair? val))
+						   (not (eq? (car val) '%add-method))
+						   (method-ok? val loops known))))
+					   (second form))
+				   (ok? (third form) loops known))))
+			   ((and (pair? s) (eq? (car s) '%add-method))
+			    (method-ok? s loops known))
+			   ((eq? s 'error) #t)
+			   (else (and (symbol? s) (memq s loops) #t)))))))
+	   ((method-ok? form loops known)
+	    (destructure* (kind (op (typ . ivars) . args) bod) form
+	      (and (not (rest-shadowed? rest ivars args))
+		   (ok? bod loops known)))))
+    (ok? body '() rest-count-unknown)))
 
 (define (rewrite-rest-uses form rest)
   (labels (((rewrite form)

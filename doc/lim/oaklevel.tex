@@ -90,6 +90,14 @@ and \emph{saved-fluid-binding-list} is the appropriate value for
 \doc{To reduce \df{find-join-point}'s complexity from quadratic to
 linear, we maintain \df{\%wind-count} $=$ \texttt{(length \%windings)}.}
 
+The winding stack belongs to the current process, as fluid bindings
+do, so that resuming one process's continuation does not unwind
+another's windings; these two globals hold it only until there is a
+process object (every warm boot makes one).  \df{current-windings},
+\df{current-wind-count}, \df{set-current-windings!},
+\df{\%push-winding} and \df{\%pop-winding} reach whichever is in
+effect.
+
 
 \section{Catch} \label{sec:oakcatch}
 
@@ -120,19 +128,18 @@ executed in the stack context where the continuation is invoked, and
 similarly the rewind actions must be executed in the destination stack
 context.
 
-\gv{\%\%join-count}
-\gv{\%\%new-windings}
-\gv{\%\%new-wind-count}
-\gv{\%\%cleanup-needed}
-\doc{These global are used to pass information about which rewind
-actions need to be executed by the destination of the continuation,
-since the normal parameter passing mechanisms are not available.  This
-would have to be done on a per processor basis in a multithreaded
-implementation.}
+\gv{\%\%pending-rewind}
+\doc{The rewind the destination of the continuation must perform, a
+list of the join count and the destination's windings and wind count,
+or \df{\#f}; it is passed this way since the normal parameter passing
+mechanisms are not available.  Like the winding stack, it belongs to
+the current process once there is one, and this global holds it only
+until then; \df{current-pending-rewind} and
+\df{set-current-pending-rewind!} reach whichever is in effect.}
 
 Continuations contain \df{saved-windings} and \df{saved-wind-count}
-instance variables, which have the values of \df{\%windings} and
-\df{\%wind-count} at the time the \df{\%call/cc} was entered.  Before
+instance variables, which have the values of \df{current-windings} and
+\df{current-wind-count} at the time the \df{\%call/cc} was entered.  Before
 the continuation is actually invoked and the destination stack photos
 restored, the highest join point between current and the destination
 winding lists is found, and all the unwind actions needed to get down
@@ -282,7 +289,8 @@ type, the user usually lands in the debugger after typing Control-C.}
 
 \section{Numbers}
 
-Small integers (between $-2^{29}$ and $2^{29}-1$ inclusive) are
+Small integers (between $-2^{29}$ and $2^{29}-1$ inclusive with 32-bit
+references, $-2^{61}$ and $2^{61}-1$ with 64-bit ones) are
 represented as immediates of type \df{fixnum} and handled directly by
 microcode.  When arithmetic instructions trap out, due to either their
 arguments not being \df{fixnum}s or to overflow, an Oaklisp operation
@@ -430,7 +438,10 @@ For example, this is legal,
 \end{verbatim}
 while this is not, because it has an exit when there might be extra
 arguments which does not pass the extra arguments along tail
-recursively (the compiler warns about it).
+recursively.  Defined with \df{define} or \df{lambda}, as here, it
+gets its extra arguments as a list instead (see below) and works.
+Written with \df{add-method} it would leave them on the stack: the
+compiler warns only about a method that never passes them along.
 \begin{verbatim}
 (define (not-okay x y . rest)
   (if (eq? x y)
@@ -455,11 +466,19 @@ and each \texttt{(rest-length \emph{rest})} becomes \texttt{(length
 Bodies of \df{let} and \df{labels} lambdas count as the method itself
 when deciding whether a use is native.  A rest name beginning with
 \texttt{\%} is never rewritten, for code that manipulates the stack
-directly.  A \df{lambda} or \df{define} body that never passes its rest
-args on is rewritten too, since returning would leave them on the
-stack; a method written with \df{add-method} keeps them, and only draws
-the compiler's warning (\df{{\protect\upar}super} and \df{\%push} rely on
-that).
+directly.  A \df{lambda} or \df{define} body is rewritten too when any
+way out of it might return over its rest args: every exit has to pass
+them on in a tail call or be reached only after tests on
+\texttt{(rest-length \emph{rest})} against constants (\df{=},
+\df{<}, \df{zero?} and the like, through \df{cond}, \df{if} and
+\df{not}) have shown there are none.  A tail call to a \df{labels}
+function (an \df{iterate} loop) counts as its body's exits, and a tail
+call to \df{error} as no exit.  So \df{okay} is left native and
+\df{not-okay} gets a list.  A method written with \df{add-method} is
+never rewritten for this, and draws the compiler's warning only when
+it never passes its rest args on (\df{{\protect\upar}super} and
+\df{\%push} rely on that, and \df{+} returns its one extra argument
+with \df{\%return}).
 
 The implementation behind this is very simple: extra arguments are
 ignored by the compiler, except that it emits a \df{check-nargs-gte}

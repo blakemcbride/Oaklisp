@@ -152,7 +152,7 @@ second & same as (nth x 1) &  &  & & \\
 third & same as (nth x 2) &  &  & & \\
 etc. & &  &  & & \\
  & & & & & \\
-last & & slow & no & (last {\ttfamily \textquotesingle{}}(A B C)) & (C) \\
+last & & slow & no & (last {\ttfamily \textquotesingle{}}(A B C)) & C \\
  & & & & & \\
  & Given: & & & & \\
  & (define lst (list {\ttfamily \textquotesingle{}}A {\ttfamily \textquotesingle{}}B {\ttfamily \textquotesingle{}}C)) & & & & \\
@@ -319,9 +319,13 @@ is the same as
 \bigskip
 
 \parbox[t]{3.4in}{
-(define (f a b . rest) ...)
+(define (f a b . rest) ...)\\
+(lambda (a b . rest) ...)\\
+\\
+(define (f . args) ...)\\
+(lambda args ...)
 }\parbox[t]{3.5in}{
- \emph{REST ARGS:}\ \ Extra arguments.  Passed on at the end of a tail call, \emph{(g a . rest)}, or counted with \emph{(rest-length rest)}, they stay on the stack; any other use binds \emph{rest} to a list of them.
+ \emph{REST ARGS:}\ \ Extra arguments, after any required ones; with no required ones, \emph{args} receives all the arguments.  Passed on at the end of a tail call, \emph{(g a . rest)}, or counted with \emph{(rest-length rest)}, they stay on the stack; any other use binds \emph{rest} to a list of them.
 }
 
 \bigskip
