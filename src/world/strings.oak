@@ -450,39 +450,79 @@
 
 
 
-; the coercion here between strings and char-lists
-; is for speed, not just convenience.
+;;; APPEND forces each argument that is forcible (a promise or a
+;;; future), checks that it is a string, and copies the characters into
+;;; one new string a word at a time.  APPEND-PIECE copies one string
+;;; into the result from character AT on and answers where the next one
+;;; starts.  A piece starting part
+;;; way through a word of the result is shifted into place: each of its
+;;; words splits into the characters that finish the result's word (LOW
+;;; of them, so the shift cannot overflow a fixnum) and the rest, which
+;;; begin the next.  The word a piece leaves unfinished is written all
+;;; the same, and the next piece picks it up from there.  A piece's last
+;;; word is masked, so that whatever sits in its padding stays out of
+;;; the result.
 
-(add-method (append (string) . rest)
-  (listify-args
-   (lambda (args)
-     (#^string
-      (apply append
-	     (map (lambda (x)
-		    (let ((x (if (is-a? x forcible) (force x) x)))
-		      (if (not (string? x))
-			  (append-type-error "string" x)
-			  (#^list-type x))))
-		  args))))
-   . rest))
+(let ((append-piece (make operation)))
 
+  (add-method (append-piece (variable-length-mixin) self n to at)
+    (if (zero? n)
+	at
+	(let* ((w (quotient at %chars-per-word))
+	       (nacc (- at (* w %chars-per-word)))
+	       (shift (* 8 nacc))
+	       (rshift (* 8 (- %chars-per-word nacc)))
+	       (low (- (ash-left 1 rshift) 1))
+	       (final (quotient (- n 1) %chars-per-word))
+	       (end (+ at n)))
+	  (iterate copy ((i 0) (w w)
+			 (acc (if (zero? nacc)
+				  0
+				  (contents (%increment-locative to w)))))
+	    (if (= i final)
+		(let ((sw (bit-and (%load-bp-i i)
+				   (%string-last-word-mask n))))
+		  (set! (contents (%increment-locative to w))
+			(bit-or acc (ash-left (bit-and low sw) shift)))
+		  (when (> end (* (+ w 1) %chars-per-word))
+		    (set! (contents (%increment-locative to (+ w 1)))
+			  (ash-right sw rshift)))
+		  end)
+		(let ((sw (%load-bp-i i)))
+		  (set! (contents (%increment-locative to w))
+			(bit-or acc (ash-left (bit-and low sw) shift)))
+		  (copy (+ i 1) (+ w 1) (ash-right sw rshift))))))))
 
+  (add-method (append (string) . rest)
+    (listify-args
+     (lambda (args)
+       (iterate check ((l args) (len 0))
+	 (if (null? l)
+	     (if (zero? len)
+		 ""
+		 (let* ((s (make string
+				 (quotient (+ len (- %chars-per-word 1))
+					   %chars-per-word)
+				 len))
+			(to (make-locative (%vref s 0))))
+		   (iterate next ((l args) (at 0))
+		     (if (null? l)
+			 s
+			 (let ((x (car l)))
+			   (next (cdr l) (append-piece x (length x) to at)))))))
+	     (let ((x (car l)))
+	       (if (eq? (get-type x) string)
+		   (check (cdr l) (+ len (length x)))
+		   (let ((x (if (is-a? x forcible)
+				(let ((y (force x)))
+				  (set! (car l) y)
+				  y)
+				x)))
+		     (if (not (string? x))
+			 (append-type-error "string" x)
+			 (check (cdr l) (+ len (length x))))))))))
+     . rest)))
 
-
-#|
-(add-method (append (string char-count) x y)
-  (let* ((y (#^string y))
-	 (l1 (length y))
-	 (l2 (+ char-count l1))
-	 (s (make-string l2)))
-    (dotimes (i char-count
-		(iterate aux ((i char-count) (j 0))
-		  (cond ((< j l1)
-			 (set! (nth s i) (nth y j))
-			 (aux (+ i 1) (+ j 1)))
-			(else s))))
-      (set! (nth s i) (nth x i)))))
-|#
 
 
 ; this method is simply wrong
