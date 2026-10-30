@@ -17,7 +17,6 @@
 SUBDIRS = emulator world
 
 EXTRA_DIST = misc/README misc/testing-tests.oak misc/uniq.oak	\
- misc/unit-testing.oak						\
  cold-compiler/README.md cold-compiler/oak-bootstrap.scm		\
  cold-compiler/host/reader.scm cold-compiler/host/kernel.scm	\
  cold-compiler/host/translate.scm cold-compiler/host/macros.scm	\

@@ -9,7 +9,7 @@ Oaklisp is a self-hosting, object-oriented dialect of Scheme (Lisp-1) featuring 
 ```
 src/emulator/       C bytecode VM/emulator (~6K lines)
 src/world/          Oaklisp runtime + compiler (~145 .oak files, ~22K lines)
-src/misc/           Contributed code (unit testing, examples)
+src/misc/           Contributed code (unit tests, uniq)
 doc/lang/           Language manual (LaTeX)
 doc/lim/            Implementation manual (LaTeX)
 doc/summary/        Concise programmer reference (LaTeX); the three PDFs are tracked beside their .tex sources, set in Latin Modern
@@ -463,15 +463,15 @@ Environment variable `OAKWORLD` overrides the default world location; `OAKLISP_O
 
 ## Testing
 
-- Unit testing framework at `src/misc/unit-testing.oak`
-- Example tests at `src/misc/testing-tests.oak` and `doc/examples/test-bank-example.oak`
+- Unit testing framework at `doc/examples/unit-testing.oak`
+- Example tests at `src/misc/testing-tests.oak` and `doc/examples/test-bank-example.oak` (after `doc/examples/bank-example.oak`)
 - Benchmarks: `src/world/compile-bench.oak`, `src/world/tak.oak`
 - No automated CI/CD pipeline
 
 ```sh
 # Run unit tests
 oaklisp --world oakworld.bin -- \
-  --load src/misc/unit-testing --load src/misc/testing-tests \
+  --load doc/examples/unit-testing --load src/misc/testing-tests \
   --eval "(run-all-tests unit-tests)" --exit
 
 # Quick compilation test

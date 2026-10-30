@@ -17,7 +17,8 @@
 ;;  (CREATE-TEST-SUITE unit-tests test-suite-name setup-thunk teardown-thunk)
 ;;	Creates a <unit-test-suite> and associates it with test-suite-name.
 ;;	The SETUP-THUNK is executed before the unit tests are run and
-;;      TEARDOWN-THUNK is executed afterward.
+;;      TEARDOWN-THUNK is executed afterward.  Optional: adding a test
+;;      to a unit with no suite creates one whose thunks do nothing.
 ;;
 ;;  (ADD-TEST unit-name expected-result form =? . message)
 ;;
@@ -42,6 +43,9 @@
 ;;
 ;;  (REMOVE-TESTS-FOR unit-tests 'whatever) => Remove tests for unit named WHATEVER.
 ;;    ..handy before rereading a test defining file.
+;;
+;;  (TESTS-FOR unit-tests 'whatever) => The <unit-test>s for unit named
+;;    WHATEVER, most recently added first, or #f if there is no such unit.
 ;;
 ;; If (VERBOSE? unit-tests) is false, only failures and exceptions are
 ;;  reported, else successful tests are reported as well.
@@ -181,6 +185,11 @@
 (add-method (remove-tests-for (<unit-test-suite> test-list) self)
             (set! test-list '()))
 
+(define-instance tests-for operation)
+
+(add-method (tests-for (<unit-test-suite> test-list) self)
+            test-list)
+
 (add-method (run-all-tests (<unit-test-suite> test-list setup-thunk teardown-thunk)
                            self test-name result-counter verbose-p break-on-error-p)
    (if (null? test-list)
@@ -250,13 +259,18 @@
   (unless (is-a? test-case <unit-test>)
     (error "(ADD-UNIT-TEST <unit-tests> name <unit-test>) requires a <unit-test>, got: ~a"
            test-case))
-  (cond ((present? self unit-name)
-         => (lambda (probe) (add-unit-test (cdr probe) test-case)))
-        (else
-         (error "Unit ~a not found. Try (CREATE-TEST-SUITE UNIT-TESTS ~a setup-thunk teardown-thunk)"
-                unit-name unit-name)))
+  (add-unit-test (cond ((present? self unit-name) => cdr)
+                       (else (create-test-suite self unit-name
+                                                default-setup-thunk
+                                                default-teardown-thunk)))
+                 test-case)
   test-case
 )
+
+(add-method (tests-for (<unit-tests>) self unit-name)
+            (cond ((present? self unit-name)
+                   => (lambda (probe) (tests-for (cdr probe))))
+                  (else #f)))
 
 (add-method (remove-tests-for (<unit-tests>) self unit-name)
             (cond
