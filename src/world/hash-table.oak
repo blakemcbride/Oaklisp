@@ -162,6 +162,20 @@
 (define-instance eq-hash-table
   type '(table count size) (list hash-table object))
 
+;;; Fixnums and the other immediates (characters, weak pointers) never
+;;; move, so they hash on their own bits.  Only a heap object needs
+;;; OBJECT-HASH, whose weak pointer follows it when the collector moves
+;;; it.  For an immediate, OBJECT-HASH would probe the global
+;;; weak-pointer table on every call and add an entry, never freed, for
+;;; each new key.
+
+(local-syntax (eq-hash-key x)
+  (let ((k (genvar)))
+    `(let ((,k ,x))
+       (cond ((eq? (%tag ,k) %fixnum-tag) ,k)
+	     ((eq? (%tag ,k) %immediate-tag) (%data ,k))
+	     (else (object-hash ,k))))))
+
 (add-method (initialize (eq-hash-table table count size) self)
   (set! count 0)
   (set! size 17)
@@ -171,11 +185,11 @@
 
 (add-method (present? (eq-hash-table table count size) self x)
   (let ((t table))
-    (%assq x (%vref-nocheck t (modulo (object-hash x) (length t))))))
+    (%assq x (%vref-nocheck t (modulo (eq-hash-key x) (length t))))))
 
 (add-method ((setter present?) (eq-hash-table table count size) self x v)
   (let* ((lslot (make-locative
-		 (nth table (modulo (object-hash x) size))))
+		 (nth table (modulo (eq-hash-key x) size))))
 	 (slot (contents lslot))
 	 (entry (%assq x slot)))
     (if v
@@ -206,7 +220,7 @@
     (dotimes (i old-size)
       (dolist (entry (nth old-table i))
 	(push (nth new-table
-		   (modulo (object-hash (car entry)) new-size))
+		   (modulo (eq-hash-key (car entry)) new-size))
 	      entry)))
     (set! table new-table)
     (set! size new-size)
