@@ -208,10 +208,10 @@ specified value for that of the failed computation.  The use of
 the following special form.
 
 \mc{bind-error-handler}
-{\lpar\lpar err$_1$ op$_1$\rpar\ldots\lpar err$_n$ op$_n$\rpar\rpar\dt body}
-\doc{Evaluates \emph{body} in a dynamic environment where the $n$
-error types have been associated with the $n$ error resolution
-operations.  When an error occurs, the current list of condition
+{\lpar err op\rpar\dt body}
+\doc{Evaluates \emph{body} in a dynamic environment where the error
+type \emph{err} has been associated with the error resolution
+operation \emph{op}; nest the forms to handle several types.  When an error occurs, the current list of condition
 bindings is searched to find an operation to perform.  An operation
 associated with a supertype of the actual error type will be selected
 if it is encountered on the list.  If a suitable operation cannot be

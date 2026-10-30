@@ -149,7 +149,7 @@ error occurs, an instance of that error type is created, and a message
 is sent to the error object asking for a handler to take control.  The
 default message causes the debugger to be invoked.  However, each
 process has some dynamic state which can be modified with the
-\df{condition-bind} construct to cause a different handler to be
+\df{bind-error-handler} construct to cause a different handler to be
 invoked when a particular error occurs at a particular time.  This
 mechanism brings the full power of the language to bear on the problem
 of resolving errors, and is the reason that we felt we could make the

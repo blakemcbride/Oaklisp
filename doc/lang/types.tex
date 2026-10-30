@@ -235,10 +235,11 @@ composite type library.}
 The Oaklisp operation type hierarchy is quite elaborite, containing a
 large number of functionally orthogonal mixins, and therefore the
 Oaklisp internals make heavy use of the mxin manager facility when
-dealing with operations.  For example, the following definition for
-\df{+} is drawn from deep within the bowels of Oaklisp.
+dealing with operations.  For example, the following definition of
+\df{eqv?} is drawn from deep within the bowels of Oaklisp.
 \begin{verbatim}
-(define-constant-instance +
-  (mix-types oc-mixer
-             (list foldable-mixin open-coded-mixin operation)))
+(define-constant eqv?
+  (add-method ((make (mix-types oc-mixer (list foldable-mixin operation)))
+               (object) x y)
+    (eq? x y)))
 \end{verbatim}

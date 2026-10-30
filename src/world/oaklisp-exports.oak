@@ -44,12 +44,12 @@
     block block0 let let* letrec labels iterate lambda
     define define-constant define-instance define-constant-instance
     define-syntax define-local-syntax local-syntax
-    set set! setter locater contents make-locative
+    set set! setter locater contents make-locative locative
     modify-location swap push pop pset
     do dolist dolist-count dotimes while until
     quasiquote comment
     fluid bind
-    delay force forcible future future-obj lazy-cons
+    delay force forcible promise future future-obj lazy-cons
     destructure destructure* destructure**
     select-type fselect-type eselect-type efselect-type
     listify-args consume-args
@@ -106,7 +106,7 @@
     character char? digit? graphic? digit-value digit->char
     string->number
     symbol symbol? intern gensym generate-symbol genvar genvar/1
-    subsequence?
+    subsequence? sequence?
 
     ;; Hash tables
     hash-table eq-hash-table equal-hash-table generic-hash-table
@@ -121,7 +121,7 @@
     standard-input standard-output standard-error
     open-input-file open-output-file open-output-file-append close
     with-open-file with-input-from-string
-    read read-char peek-char unread-char skip-whitespace
+    read read-char peek-char unread-char skip-whitespace really-read-char
     write-char write-string newline freshline flush
     print print-list-end format
     the-eof-token the-unread-object
@@ -156,7 +156,7 @@
 
     ;; Evaluation, loading, compiling, locales
     eval load compile-file cc
-    dump-world load-world
+    dump-world load-world ret feature? hash-bracket-option symbol-table
     locale variable? variable-here? macro? macro-here?
     frozen? frozen-here? export-sharing-cell
     system-locale oaklisp-locale user-locale compiler-locale

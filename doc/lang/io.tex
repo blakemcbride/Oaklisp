@@ -149,13 +149,14 @@ convenience of the user.
 \end{tabular}
 \end{center}
 
-\op{define-quotelike-macro-char}{character object}
+\op{define-quotelike-macro-char}{character object print?}
 \begin{docenv}
 Makes \emph{character} a terminating macro which returns a list of
 \emph{object} and the next thing read.  This also arranges for the printer
-to print using analogous syntax.  For instance, the quote syntax is
-defined with the line \texttt{(define-quotelike-macro-char
-\texttt{\#'} 'quote)} in the system internals.
+to print using analogous syntax when \emph{print?} is true.  For
+instance, the quote syntax is defined with the line
+\texttt{(define-quotelike-macro-char \#\textbackslash' 'quote \#t)} in the
+system internals.
 \end{docenv}
 
 \ob{the-unread-object}

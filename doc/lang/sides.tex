@@ -93,6 +93,8 @@ from a single physical location.  Locatable operations respond to
 See Chapter~6 of \emph{The T Manual} for a description of the
 following forms.
 
-\sform{swap}{location new-value}
-\sform{modify}{location procedure}
-\sform{modify-location}{location continuation}
+\sform{swap}{location$_1$ location$_2$}
+\doc{Exchanges the contents of the two locations.}
+\sform{modify-location}{location procedure}
+\doc{Stores the result of calling \emph{procedure} on the contents of
+\emph{location} back into \emph{location}.}

@@ -267,57 +267,54 @@ The following dialogue with Oaklisp illustrates some of these
 points.
 
 \begin{verbatim}
-Oaklisp 1.0  - (C) 1987 Barak A. Pearlmutter and Kevin J. Lang.
+Welcome to Oaklisp 2.1.2
 Oaklisp evaluation loop.
   Active handlers:
   0: Return to top level.
-
 > (with-open-file (inf "fone.nums" in) (car (read inf)))
 
-Error: Error opening "fone.nums" for reading.
+Error: Unable to open "fone.nums" for READ access.
 Oaklisp evaluation loop.
   Active handlers:
   0: Return to top level.
-  1: Retry opening file (argument for different file name).
+  1: Supply a file to READ instead (none to retry "fone.nums").
   2: Return to debugger level 1.
-
 >> (call/cc identity)                ;get error context.
-
+#<Op 1363>
 >> (set foo (fluid *))               ;stash it away.
 
+Warning: Installing FOO in #<Locale USER-LOCALE 1365>.
+#<Op FOO 1363>
 >> (ret 0)                           ;back to top level.
 
-   Invoking handler Return to top level..
+Invoking handler "Return to top level."
+  Active handlers:
+  0: Return to top level.
+> (describe foo)                     ;inspect continuation.
 
-> (describe foo)                    ;inspect continuation.
+#<Op FOO 1363> is of type #<Type OPERATION 1366>.
+ from #<Type OPERATION 1366>:
+    LAMBDA? : #<Object 1367>         ;what's this thing?
+    CACHE-TYPE : #<Undefined IVAR IVAR-UNDEFINED-VALUE 1368>
+    CACHE-METHOD : #<Undefined IVAR IVAR-UNDEFINED-VALUE 1368>
+    CACHE-TYPE-OFFSET : #<Undefined IVAR IVAR-UNDEFINED-VALUE 1368>
+#<Op FOO 1363>
+> (describe (object-unhash 1367))
 
-#<Op FOO 798> is of type #<Type OPERATION 801>.
+#<Object 1367> is of type #<Type 1369>.
+ from #<Type 1369>:
+    THE-CODE : #<VLmixin 1370>
+    THE-ENVIRONMENT : #<VLmixin 1371>
+#<Object 1367>
+> (foo 0)                            ;re-enter error context.
+0
+>> (ret 1 "phone.nums")              ;resume computation.
 
- from #<Type 801>:
-  LAMBDA? : #<Object 802>           ;what's this thing?
-  CACHE-TYPE : 0
-  CACHE-METHOD : 0
-  CACHE-TYPE-OFFSET : 0
-
-> (describe (object-unhash 802))
-
-#<Object 802> is of type #<Type %METHOD 803>.
-
- from #<Type 803>:
-  THE-CODE : #<VLmixin 804>
-  THE-ENVIRONMENT : #<VLmixin 805>
-
-> (foo 0)                    ;re-enter error context.
-
->> (ret 1 "phone.nums")      ;resume computation
-
-   Invoking handler Retry opening the file ...
-
-268-7598                     ;got that phone number!
-
+Invoking handler "Supply a file to READ instead (none to retry "fone.nums")."
+268-7598                             ;got that phone number!
 > (exit)
 
-Oaklisp stopped itself...
+Oaklisp stopped itself.
 \end{verbatim}
 
 Using the error system effectively is an important part of providing
