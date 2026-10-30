@@ -26,26 +26,60 @@
 (add-method (sort (sequence) v <=?)
   (sort! (copy v) <=?))
 
-(add-method (sort! (sequence) v <=?)
-  ;; This does a stupid bubble sort.  Should be fixed.
-  ;;
-  ;; The exchange is written out with NTH and its setter rather than
-  ;; with SWAP, which expands into MAKE-LOCATIVE and so needs (LOCATER
-  ;; NTH).  Strings do not have one and signal on purpose -- a character
-  ;; does not occupy a whole cell -- which left this method, and SORT
-  ;; with it, broken on the one sequence type that cannot supply it.
-  (let ((len (length v)))
-    ;;(vsort v (make simple-vector len) 0 0 len)
-    (when (> len 0)
-      (dotimes (i (- len 1))
-	(iterate aux ((j (+ i 1)))
-	  (when (< j len)
-	    (when (<=? (nth v j) (nth v i))
-	      (let ((tmp (nth v i)))
-		(set! (nth v i) (nth v j))
-		(set! (nth v j) tmp)))
-	    (aux (+ j 1))))))
-    v))
+;;; SORT! on a sequence other than a list is a merge sort.  The elements
+;;; are copied twice into one scratch vector, sorted there and written
+;;; back, so V is left as it was should <=? escape, and V needs nothing
+;;; but NTH and its setter (a string has no (LOCATER NTH)).  VSORT
+;;; splits and merges exactly as the list sort below does -- the first
+;;; half gets the smaller half when the length is odd, and a tie goes to
+;;; the element of the second half whenever (<=? second first) -- so a
+;;; vector sorts into the same order its elements would as a list, with
+;;; the same calls to <=?.
+
+(let ((vsort (make operation)))
+
+  ;; Sort the elements LO to HI of the half of SELF at offset FROM into
+  ;; the same places of the half at offset TO.  Both halves hold the
+  ;; same elements there to begin with; FROM's are scrambled after.
+  (add-method (vsort (variable-length-mixin) self from to lo hi <=?)
+    (when (> (- hi lo) 1)
+      (let ((mid (+ lo (quotient (- hi lo) 2))))
+	;; Second half first, as the list sort's arguments are evaluated.
+	(vsort self to from mid hi <=?)
+	(vsort self to from lo mid <=?)
+	(iterate merge ((i lo) (j mid) (k lo))
+	  (cond ((= i mid)
+		 (iterate rest ((j j) (k k))
+		   (when (< j hi)
+		     (set! (%load-bp-i (+ to k)) (%load-bp-i (+ from j)))
+		     (rest (+ j 1) (+ k 1)))))
+		((= j hi)
+		 (iterate rest ((i i) (k k))
+		   (when (< i mid)
+		     (set! (%load-bp-i (+ to k)) (%load-bp-i (+ from i)))
+		     (rest (+ i 1) (+ k 1)))))
+		(else
+		 (let ((a (%load-bp-i (+ from i)))
+		       (b (%load-bp-i (+ from j))))
+		   (cond ((<=? b a)
+			  (set! (%load-bp-i (+ to k)) b)
+			  (merge i (+ j 1) (+ k 1)))
+			 (else
+			  (set! (%load-bp-i (+ to k)) a)
+			  (merge (+ i 1) j (+ k 1)))))))))))
+
+  (add-method (sort! (sequence) v <=?)
+    (let ((len (length v)))
+      (when (> len 1)
+	(let ((buf (make simple-vector (* 2 len))))
+	  (dotimes (i len)
+	    (let ((x (nth v i)))
+	      (set! (nth buf i) x)
+	      (set! (nth buf (+ i len)) x)))
+	  (vsort buf len 0 0 len <=?)
+	  (dotimes (i len)
+	    (set! (nth v i) (nth buf i)))))
+      v)))
 
 
 
@@ -66,36 +100,27 @@
 			     <=?))]))]
 	 [merge!-aux
 	  ;; Destructively merges the first LENA guys of LA with the
-	  ;; first LENB guys of LB.
-	  (lambda (la lena lb lenb <=?)
-	    (cond [(zero? lena) lb]
-		  [(zero? lenb) la]
-		  [(not (<=? (car lb) (car la)))
-		   (set! (cdr la)
-			 (merge!-aux (cdr la) (- lena 1)
-				     lb lenb <=?))
-		   la]
-		  [else
-		   (set! (cdr lb)
-			 (merge!-aux la lena
-				     (cdr lb) (- lenb 1) <=?))
-		   lb]))]
-	 [merge-aux
-	  ;; Merge the first LENA guys of LA with the first LENB guys of LB.
+	  ;; first LENB guys of LB.  END is the last guy merged so far;
+	  ;; the guy after it is linked on once it is known.
 	  (lambda (la lena lb lenb <=?)
 	    (cond [(zero? lena) lb]
 		  [(zero? lenb) la]
 		  [else
-		   (let ([a (car la)]
-			 [b (car lb)])
-		     (if (<=? b a)
-			 (cons b
-			       (merge-aux la lena
-					  (cdr lb) (- lenb 1)
-					  <=?))
-			 (cons a
-			       (merge-aux (cdr la) (- lena 1)
-					  lb lenb <=?))))]))])
+		   (let ([take-a? (not (<=? (car lb) (car la)))])
+		     (iterate aux ([end (if take-a? la lb)]
+				   [la (if take-a? (cdr la) la)]
+				   [lena (if take-a? (- lena 1) lena)]
+				   [lb (if take-a? lb (cdr lb))]
+				   [lenb (if take-a? lenb (- lenb 1))])
+		       (cond [(zero? lena) (set! (cdr end) lb)]
+			     [(zero? lenb) (set! (cdr end) la)]
+			     [(not (<=? (car lb) (car la)))
+			      (set! (cdr end) la)
+			      (aux la (cdr la) (- lena 1) lb lenb)]
+			     [else
+			      (set! (cdr end) lb)
+			      (aux lb la lena (cdr lb) (- lenb 1))]))
+		     (if take-a? la lb))]))])
 
   (add-method (sort! (list-type) l <=?)
     (let* ([len (length l)]
@@ -104,9 +129,18 @@
 	(set! (cdr (tail l (- len 1))) nil))
       l))
 
+  ;; SORT! on a fresh copy of L makes the same calls to <=? and puts
+  ;; the guys in the same order as merging into new pairs would.
   (add-method (sort (list-type) l <=?)
-    (let* ([len (length l)]
-	   [l (sort-aux l (length l) <=? merge-aux)])
-      (head l len))))
+    (let ([len (length l)])
+      (if (zero? len)
+	  '()
+	  (let ([new (cons (car l) '())])
+	    (iterate aux ([l (cdr l)] [end new] [i 1])
+	      (when (< i len)
+		(let ([c (cons (car l) '())])
+		  (set! (cdr end) c)
+		  (aux (cdr l) c (+ i 1)))))
+	    (sort! new <=?))))))
 
 ;;; eof
