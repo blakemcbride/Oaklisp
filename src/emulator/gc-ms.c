@@ -18,14 +18,16 @@
 /*
  * gc-ms.c - Non-moving mark-sweep garbage collector
  *
- * Design:
- *   - Heap is the existing contiguous new_space.
- *   - Two bitmaps: object-start (1 bit per ref_t word) and mark.
- *   - Allocation: segregated free lists by size class, with
- *     bump-pointer (free_point) fallback for virgin space.
- *   - Collection: stop-the-world mark from roots, sweep to rebuild
- *     free lists.
- *   - The copying GC (gc.c) is retained for pre-dump compaction.
+ * Design (GC.md):
+ *   - The heap is a set of regions: spans of 1 MB chunks, mapped on
+ *     demand within a budget and unmapped when they sweep empty, each
+ *     with its own object-start and mark bitmaps (1 bit per word).
+ *   - Allocation: segregated free lists by size class over all
+ *     regions, TLABs out of big free runs or a region's virgin tail.
+ *   - Collection: mark from the roots (concurrently with threads),
+ *     sweep lazily, region by region, during allocation.
+ *   - The copying GC (gc.c) is retained for pre-dump compaction
+ *     only; the heap grows by mapping a region, never by copying.
  */
 
 #define _REENTRANT
@@ -44,31 +46,360 @@
 #include "stacks.h"
 #include "signals.h"
 #include "oak-atomic.h"
+#include "threads.h"
+
+#ifdef _WIN32
+#include <malloc.h>
+#else
+#include <sys/mman.h>
+#ifndef MAP_ANONYMOUS
+#define MAP_ANONYMOUS MAP_ANON
+#endif
+#endif
 
 
 /* ------------------------------------------------------------------ */
-/*  Bitmaps                                                            */
+/*  Regions                                                            */
 /* ------------------------------------------------------------------ */
 
-uint64_t *objstart_bitmap;          /* 1 bit per ref_t word in new_space */
-static uint64_t *mark_bitmap;       /* 1 bit per ref_t word in new_space */
-static size_t bitmap_words;         /* number of uint64_t in each bitmap */
+size_t ms_region_l1[(size_t)1 << MS_L1_BITS];
 
-#define BM_IDX(p)    ((size_t)((p) - new_space.start))
-#define BM_SET(bm, i)   ((bm)[(i)/64] |=  (1ULL << ((i) % 64)))
-#define BM_CLR(bm, i)   ((bm)[(i)/64] &= ~(1ULL << ((i) % 64)))
-#define BM_TEST(bm, i)  ((bm)[(i)/64] &   (1ULL << ((i) % 64)))
+/* The heap's regions, in mapping order, and what they add up to. */
+static ms_region_t *ms_regions, *ms_regions_tail;
+static size_t ms_mapped;		/* words in all regions */
+static size_t ms_nregions;
+
+/* The region TLABs and large requests are bumped out of first. */
+static ms_region_t *alloc_region;
+
+/* GET-DATA's slots (gc-ms.h): a table of the regions by slot, each
+   region holding as many consecutive slots as it has chunks.  Grown
+   by replacing the table; a reader that still holds the old one
+   finds its regions there, so the old tables are kept. */
+typedef struct { size_t n; ms_region_t *r[]; } ms_slot_table_t;
+static size_t ms_slots_ptr;		/* ms_slot_table_t *, published */
+
+/* The copying collector's destination span (ms_evacuate_begin). */
+static size_t evac_chunks;
+
+#define BM_WORDS(r)	(((r)->chunks * MS_REGION_WORDS + 63) / 64)
+#define BM_IDX(r, p)	((size_t)((p) - (r)->start))
+#define BM_SET(bm, i)	((bm)[(i)/64] |=  (1ULL << ((i) % 64)))
+#define BM_CLR(bm, i)	((bm)[(i)/64] &= ~(1ULL << ((i) % 64)))
+#define BM_TEST(bm, i)	((bm)[(i)/64] &   (1ULL << ((i) % 64)))
 
 /* Objstart bits are set by the locked slow paths and the collector in
    words they may share, so those updates are atomic with threads; the
    TLAB fast path on every thread sets them with no lock, in words
    that are the TLAB's alone (TLAB_ALIGN), with a plain store. */
+static inline void
+ms_objstart_set(ms_region_t *r, ref_t *p)
+{
+    size_t i = BM_IDX(r, p);
+
 #ifdef THREADS
-#define OBJSTART_SET(i) \
-    ((void)OAK_ATOMIC_FETCH_OR_U64(&objstart_bitmap[(i)/64], 1ULL << ((i) % 64)))
+    (void)OAK_ATOMIC_FETCH_OR_U64(&r->objstart[i / 64], 1ULL << (i % 64));
 #else
-#define OBJSTART_SET(i) BM_SET(objstart_bitmap, (i))
+    BM_SET(r->objstart, i);
 #endif
+}
+
+static void
+ms_fatal(const char *what, size_t words)
+{
+    fprintf(stderr, "\nFatal error: %s (%zu words; %zu words mapped in %zu"
+	    " regions).\n", what, words, ms_mapped, ms_nregions);
+    exit(EXIT_FAILURE);
+}
+
+/* BYTES of memory aligned to the chunk size, zeroed, or NULL. */
+static void *
+ms_map_aligned(size_t bytes)
+{
+#ifdef _WIN32
+    void *p = _aligned_malloc(bytes, MS_REGION_BYTES);
+
+    if (p)
+	memset(p, 0, bytes);
+    return p;
+#else
+    size_t len = bytes + MS_REGION_BYTES;
+    char *p = mmap(NULL, len, PROT_READ | PROT_WRITE,
+		   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    uintptr_t a;
+    size_t head, tail;
+
+    if (p == MAP_FAILED)
+	return NULL;
+    a = ((uintptr_t)p + MS_REGION_BYTES - 1) & ~(uintptr_t)(MS_REGION_BYTES - 1);
+    head = (size_t)(a - (uintptr_t)p);
+    tail = len - head - bytes;
+    if (head)
+	munmap(p, head);
+    if (tail)
+	munmap((char *)a + bytes, tail);
+    return (void *)a;
+#endif
+}
+
+static void
+ms_unmap_aligned(void *p, size_t bytes)
+{
+#ifdef _WIN32
+    (void)bytes;
+    _aligned_free(p);
+#else
+    munmap(p, bytes);
+#endif
+}
+
+/* Every chunk of R in the lookup table maps to VALUE (NULL to clear).
+   A reader (the marker, running concurrently) sees either the old
+   entry or the new one. */
+static void
+ms_table_set(ms_region_t *r, ms_region_t *value)
+{
+    uintptr_t c = (uintptr_t)r->start >> MS_REGION_LOG2_BYTES;
+    size_t k;
+
+    for (k = 0; k < r->chunks; k++, c++) {
+	size_t *l2 = (size_t *)ms_region_l1[c >> MS_L2_BITS];
+
+	if (l2 == NULL) {
+	    l2 = (size_t *)xmalloc(MS_L2_SIZE * sizeof(size_t));
+	    memset(l2, 0, MS_L2_SIZE * sizeof(size_t));
+	    OAK_ATOMIC_STORE_REF(&ms_region_l1[c >> MS_L2_BITS], (size_t)l2);
+	}
+	OAK_ATOMIC_STORE_REF(&l2[c & (MS_L2_SIZE - 1)], (size_t)value);
+    }
+}
+
+static size_t
+ms_slot_alloc(ms_region_t *r)
+{
+    ms_slot_table_t *t = (ms_slot_table_t *)ms_slots_ptr;
+    size_t n = t ? t->n : 0, i, k, run = 0;
+
+    for (i = 0; i < n; i++) {
+	run = t->r[i] ? 0 : run + 1;
+	if (run == r->chunks) {
+	    i = i + 1 - run;
+	    goto found;
+	}
+    }
+    {
+	size_t want = n * 2;
+	ms_slot_table_t *bigger;
+
+	if (want < n + r->chunks)
+	    want = n + r->chunks;
+	if (want < 64)
+	    want = 64;
+	bigger = (ms_slot_table_t *)xmalloc(sizeof *bigger
+					    + want * sizeof(ms_region_t *));
+	bigger->n = want;
+	memset(bigger->r, 0, want * sizeof(ms_region_t *));
+	if (t)
+	    memcpy(bigger->r, t->r, n * sizeof(ms_region_t *));
+	OAK_ATOMIC_STORE_REF(&ms_slots_ptr, (size_t)bigger);
+	t = bigger;
+	i = n;
+    }
+found:
+    for (k = 0; k < r->chunks; k++)
+	t->r[i + k] = r;
+    return i;
+}
+
+static void
+ms_slot_free(ms_region_t *r)
+{
+    ms_slot_table_t *t = (ms_slot_table_t *)ms_slots_ptr;
+    size_t k;
+
+    for (k = 0; k < r->chunks; k++)
+	t->r[r->slot + k] = NULL;
+}
+
+/* A region over the CHUNKS chunks at MEM (aligned, zeroed): its
+   struct and bitmaps, its slots, its table entries, on the list. */
+static ms_region_t *
+ms_region_new(void *mem, size_t chunks)
+{
+    size_t words = chunks * MS_REGION_WORDS;
+    ms_region_t *r = (ms_region_t *)xmalloc(sizeof *r);
+    size_t bm;
+
+    memset(r, 0, sizeof *r);
+    r->start = r->top = r->sweep_top = (ref_t *)mem;
+    r->end = r->start + words;
+    r->chunks = chunks;
+    bm = BM_WORDS(r) * sizeof(uint64_t);
+    r->objstart = (uint64_t *)xmalloc(bm);
+    r->mark = (uint64_t *)xmalloc(bm);
+    memset(r->objstart, 0, bm);
+    memset(r->mark, 0, bm);
+    r->slot = ms_slot_alloc(r);
+    ms_table_set(r, r);
+    if (ms_regions_tail)
+	ms_regions_tail->next = r;
+    else
+	ms_regions = r;
+    ms_regions_tail = r;
+    ms_mapped += words;
+    ms_nregions++;
+    return r;
+}
+
+/* Map a region of CHUNKS chunks.  Called under alloc_lock, or with
+   the world stopped. */
+static ms_region_t *
+ms_region_map(size_t chunks)
+{
+    size_t words = chunks * MS_REGION_WORDS;
+    void *mem;
+
+#ifdef MAX_NEW_SPACE_SIZE
+    if (ms_mapped + words > MAX_NEW_SPACE_SIZE)
+	ms_fatal("the heap would exceed MAX_NEW_SPACE_SIZE", words);
+#endif
+    mem = ms_map_aligned(chunks * MS_REGION_BYTES);
+    if (mem == NULL)
+	ms_fatal("cannot map a region", words);
+#if MS_ADDR_BITS < OAK_WORD_SIZE
+    if ((uintptr_t)mem >> MS_ADDR_BITS)
+	ms_fatal("a region was mapped beyond the address range the"
+		 " lookup table covers", words);
+#endif
+    if (trace_gc > 1)
+	fprintf(stderr, "; MS-GC: mapped a region of %zu chunk%s"
+		" (%zu words mapped in %zu regions, budget %zu).\n",
+		chunks, chunks == 1 ? "" : "s", ms_mapped + words,
+		ms_nregions + 1, (size_t)e_next_newspace_size);
+    return ms_region_new(mem, chunks);
+}
+
+static void
+ms_region_free(ms_region_t *r)
+{
+    free(r->objstart);
+    free(r->mark);
+#ifdef OAK_GC_VERIFY
+    free(r->verify_snap);
+    free(r->verify_born);
+#endif
+    free(r);
+}
+
+/* Unmap R, which nothing refers into.  Under alloc_lock, no sweep in
+   progress and no marker running. */
+static void
+ms_region_unmap(ms_region_t *r)
+{
+    ms_region_t **pp = &ms_regions, *prev = NULL;
+
+    while (*pp != r) {
+	prev = *pp;
+	pp = &(*pp)->next;
+    }
+    *pp = r->next;
+    if (ms_regions_tail == r)
+	ms_regions_tail = prev;
+    if (alloc_region == r)
+	alloc_region = NULL;
+    ms_table_set(r, NULL);
+    ms_slot_free(r);
+    ms_mapped -= r->chunks * MS_REGION_WORDS;
+    ms_nregions--;
+    if (trace_gc > 1)
+	fprintf(stderr, "; MS-GC: unmapped a region of %zu chunk%s"
+		" (%zu words mapped in %zu regions, budget %zu).\n",
+		r->chunks, r->chunks == 1 ? "" : "s", ms_mapped,
+		ms_nregions, (size_t)e_next_newspace_size);
+    ms_unmap_aligned(r->start, r->chunks * MS_REGION_BYTES);
+    ms_region_free(r);
+}
+
+size_t
+ms_mapped_words(void)
+{
+    return ms_mapped;
+}
+
+size_t
+ms_allocated_words(void)
+{
+    size_t n = 0;
+    ms_region_t *r;
+
+    for (r = ms_regions; r; r = r->next)
+	n += (size_t)(r->top - r->start);
+    return n;
+}
+
+size_t
+ms_region_count(void)
+{
+    return ms_nregions;
+}
+
+ssize_t
+ms_get_data(const ref_t *p)
+{
+    ms_region_t *r = ms_region_of(p);
+
+    if (r == NULL)
+	return -1;
+    return (ssize_t)(r->slot * MS_REGION_WORDS + (size_t)(p - r->start));
+}
+
+ref_t *
+ms_crunch(size_t i)
+{
+    ms_slot_table_t *t = (ms_slot_table_t *)OAK_ATOMIC_LOAD_REF(&ms_slots_ptr);
+    size_t j = i / MS_REGION_WORDS;
+    ms_region_t *r;
+    ref_t *p;
+
+    if (t == NULL || j >= t->n || (r = t->r[j]) == NULL)
+	return NULL;
+    p = r->start + (i - r->slot * MS_REGION_WORDS);
+    return p < r->end ? p : NULL;
+}
+
+/* Whether a region may be mapped: within the budget.  The budget is
+   e_next_newspace_size (LOAD-REG/STORE-REG next-newspace-size), set
+   after every cycle to the copying collector's rule, never below the
+   configured heap size (--size-heap, original_newspace_size). */
+#define MS_RECLAIM_FACTOR 3
+
+static bool
+ms_may_map(void)
+{
+    return ms_mapped < (size_t)e_next_newspace_size;
+}
+
+/* Words of the objects the mark traced this cycle: the live data, less
+   what was born black meanwhile. */
+static size_t marked_words;
+
+static void
+ms_set_budget(size_t amount)
+{
+    size_t want = MS_RECLAIM_FACTOR * marked_words + amount;
+
+    if (want < original_newspace_size)
+	want = original_newspace_size;
+#ifdef MAX_NEW_SPACE_SIZE
+    if (want > MAX_NEW_SPACE_SIZE)
+	want = MAX_NEW_SPACE_SIZE;
+#endif
+    if (trace_gc > 1 && want != (size_t)e_next_newspace_size)
+	fprintf(stderr, "; MS-GC: %zu words live in %zu mapped: "
+		"budget %zu -> %zu.\n", marked_words, ms_mapped,
+		(size_t)e_next_newspace_size, want);
+    e_next_newspace_size = want;
+}
 
 
 /* ------------------------------------------------------------------ */
@@ -129,7 +460,10 @@ ms_class_max_words(int sc)
 /*
  * Each free-list entry occupies the dead object's memory:
  *   word[0] = next pointer (ref_t* cast to ref_t), 0 = end of list
- *   The entry size is the original object's size (known from objstart bitmap).
+ *   word[1] = the entry's size in words (class 0 entries have none)
+ * An entry lies within one region, below its sweep_top; the sweep
+ * that made it has passed it entirely (the sweeps, below), so the
+ * allocator may use any entry on the lists.
  *
  * free_list_heads[sc] points to the first entry in class sc, or NULL.
  */
@@ -139,33 +473,30 @@ static ref_t *free_list_heads[NUM_SIZE_CLASSES];
 /* Total words on free lists (for statistics / GC triggering). */
 static size_t free_list_total_words;
 
-/* Words of the objects the mark traced this cycle: the live data, less
-   what was born black meanwhile.  The heap grows when they crowd it
-   (ms_crowded, the copying collector's own rule). */
-static size_t marked_words;
-#define MS_RECLAIM_FACTOR 3
-
-/* The lazy sweep's state (defined with it, below). */
-static size_t lazy_sweep_cursor;
-static bool   lazy_sweep_active;
-
 /* A run of dead words onto its free list (the sweeps, below). */
 static void ms_sweep_run_end(ref_t **run_start, size_t *run_len);
 
-/* Words from OBJ to the next objstart bit, or to word LIMIT. */
-static size_t
-ms_objstart_extent_to(ref_t *obj, size_t limit)
-{
-    size_t idx = BM_IDX(obj);
-    size_t next = idx + 1;
-
-    while (next < limit && !BM_TEST(objstart_bitmap, next))
-	next++;
-    return (next > limit ? limit : next) - idx;
-}
 #define TLAB_MIN_FREE 257	/* a free run this big can be a TLAB */
 static bool tlab_free_none;
 
+#ifdef THREADS
+static void ms_born_record(ref_t *p, size_t words);
+#endif
+
+/* An entry's size field, checked: a zero would loop the allocator,
+   and in a debugging build an entry running past its region is a
+   corrupt list. */
+static inline bool
+ms_entry_ok(ref_t *p, size_t size)
+{
+#ifdef FAST
+    return size != 0;
+#else
+    ms_region_t *r;
+
+    return size != 0 && (r = ms_region_of(p)) != NULL && p + size <= r->end;
+#endif
+}
 
 ref_t *
 ms_free_list_alloc(size_t n_words)
@@ -179,24 +510,26 @@ ms_free_list_alloc(size_t n_words)
 	ref_t *p = *prev;
 	while (p) {
 	    size_t actual_size = (sc == 0) ? 1 : (size_t)p[1];
-	    /* Validate actual_size to guard against corrupt free list entries. */
-	    if (actual_size == 0 || actual_size > new_space.size ||
-		p + actual_size > new_space.end) {
+	    if (!ms_entry_ok(p, actual_size)) {
 		prev = (ref_t **)p;
 		p = (ref_t *)(*p);
 		continue;
 	    }
 	    if (actual_size >= n_words) {
 		*prev = (ref_t *)(*p);
-		OBJSTART_SET(BM_IDX(p));
+		ms_objstart_set(ms_region_of(p), p);
 		free_list_total_words -= actual_size;
 
 		/* Born-black: during concurrent mark, objects allocated
-		   from the free list (below sweep_limit) must have their
-		   mark bit set so sweep doesn't reclaim them. */
-		if (OAK_UNLIKELY(
-			gc_phase >= GC_PHASE_CONCURRENT_MARK))
+		   from the free list (below sweep_top) must have their
+		   mark bit set so sweep doesn't reclaim them, and are
+		   scanned at the remark. */
+		if (OAK_UNLIKELY(gc_phase >= GC_PHASE_CONCURRENT_MARK)) {
 		    ms_mark_alloc(p);
+#ifdef THREADS
+		    ms_born_record(p, n_words);
+#endif
+		}
 #if defined(THREADS) && defined(OAK_GC_VERIFY)
 		ms_verify_log_alloc(p, 3, n_words);
 #endif
@@ -219,11 +552,7 @@ ms_free_list_alloc(size_t n_words)
     /* The exact class is empty: split the first entry of a larger
        class, and put the rest back on the list for its size.  Without
        this, a request whose class has run dry starts a collection
-       however much else is free.  An entry can run on past the lazy
-       sweep's cursor into a block not yet swept, and a rest there
-       would get an objstart bit the sweep would then put on a list a
-       second time, so the rest has to lie behind the cursor (or no
-       sweep be under way).  Each cycle starts the lists afresh. */
+       however much else is free.  Each cycle starts the lists afresh. */
     for (int c = sc + 1; c < NUM_SIZE_CLASSES; c++) {
 	ref_t **prev = &free_list_heads[c];
 	ref_t *p = *prev;
@@ -231,22 +560,20 @@ ms_free_list_alloc(size_t n_words)
 	while (p) {
 	    size_t actual_size = (size_t)p[1];
 
-	    if (actual_size == 0 || actual_size > new_space.size ||
-		p + actual_size > new_space.end) {
+	    if (!ms_entry_ok(p, actual_size)) {
 		prev = (ref_t **)p;
 		p = (ref_t *)(*p);
 		continue;
 	    }
-	    if (actual_size > n_words
-		&& (!lazy_sweep_active
-		    || BM_IDX(p + actual_size) <= lazy_sweep_cursor)) {
+	    if (actual_size > n_words) {
 		ref_t *rest = p + n_words;
 		size_t rest_size = actual_size - n_words;
 		int rc = ms_size_class(rest_size);
+		ms_region_t *r = ms_region_of(p);
 
 		*prev = (ref_t *)(*p);
-		OBJSTART_SET(BM_IDX(p));
-		OBJSTART_SET(BM_IDX(rest));
+		ms_objstart_set(r, p);
+		ms_objstart_set(r, rest);
 		rest[0] = (ref_t)free_list_heads[rc];
 		if (rest_size >= 2)
 		    rest[1] = (ref_t)rest_size;
@@ -255,8 +582,12 @@ ms_free_list_alloc(size_t n_words)
 		if (rest_size >= TLAB_MIN_FREE)
 		    tlab_free_none = false;
 
-		if (OAK_UNLIKELY(gc_phase >= GC_PHASE_CONCURRENT_MARK))
+		if (OAK_UNLIKELY(gc_phase >= GC_PHASE_CONCURRENT_MARK)) {
 		    ms_mark_alloc(p);
+#ifdef THREADS
+		    ms_born_record(p, n_words);
+#endif
+		}
 #if defined(THREADS) && defined(OAK_GC_VERIFY)
 		ms_verify_log_alloc(p, 4, n_words);
 #endif
@@ -270,78 +601,105 @@ ms_free_list_alloc(size_t n_words)
 }
 
 
-/* After a cycle: is the live data crowding the heap?  The copying
-   collector's rule (gc.c, RECLAIM_FACTOR): grow when it takes more
-   than a third.  Without this the heap never grew unless a request
-   went unmet, and a program with a few hundred K words live cycled
-   many times a second, each cycle scanning spatic and sweeping the
-   whole heap.  True sets the next size (a copying collection into it
-   follows, which also compacts). */
-static bool
-ms_crowded(size_t amount)
-{
-    size_t want = MS_RECLAIM_FACTOR * marked_words + amount;
+/* ------------------------------------------------------------------ */
+/*  Bump areas: the regions' virgin tails                              */
+/* ------------------------------------------------------------------ */
 
-#ifdef MAX_NEW_SPACE_SIZE
-    if (want > MAX_NEW_SPACE_SIZE)
-	want = MAX_NEW_SPACE_SIZE;
-#endif
-    if (want <= new_space.size)
-	return false;
-    if (trace_gc > 1)
-	fprintf(stderr, "; MS-GC: %zu words live in a heap of %zu: "
-		"growing to %zu.\n", marked_words, new_space.size, want);
-    original_newspace_size = want;
-    e_next_newspace_size = want;
-    return true;
+/* A TLAB begins and ends on a bitmap word's boundary (64 words), so
+   its objstart bits are in words no other thread touches, and the
+   fast path sets them with a plain store (MS_TLAB_OBJSTART) -- the
+   atomic ms_objstart_set is for the shared words the slow paths and
+   the collector write.  The words skipped to align a start are zeroed
+   and given an objstart bit: a dead filler for the next sweep. */
+#define TLAB_ALIGN 64
+
+static ref_t *
+ms_align_up(ms_region_t *r, ref_t *p)
+{
+    size_t off = BM_IDX(r, p) % TLAB_ALIGN;
+
+    return off == 0 ? p : p + (TLAB_ALIGN - off);
 }
 
-/* Whether a request of N words can be met without collecting: from
-   the bump region, or by a free-list entry (of its class or a larger
-   one, see the split above) big enough for it.  Total free words
-   say nothing about that: the lists could hold any amount in pieces
-   all smaller than N. */
-static bool
-ms_space_for(size_t n_words)
+static void
+ms_filler(ms_region_t *r, ref_t *p, size_t words)
 {
-    int sc = ms_size_class(n_words);
+    if (words == 0)
+	return;
+    memset(p, 0, words * sizeof(ref_t));
+    ms_objstart_set(r, p);
+}
 
-    /* The same tests as the allocator's, exactly: a request this says
-       fits must then be met, or the caller would collect for ever. */
-    if (n_words < (size_t)(new_space.end - free_point))
-	return true;
-    for (int c = sc; c < NUM_SIZE_CLASSES; c++) {
-	ref_t *p = free_list_heads[c];
-	while (p) {
-	    size_t actual_size = (c == 0) ? 1 : (size_t)p[1];
-	    if (actual_size == 0 || actual_size > new_space.size ||
-		p + actual_size > new_space.end) {
-		p = (ref_t *)(*p);
-		continue;
-	    }
-	    if (c == sc
-		? actual_size >= n_words
-		: (actual_size > n_words
-		   && (!lazy_sweep_active
-		       || BM_IDX(p + actual_size) <= lazy_sweep_cursor)))
-		return true;
-	    p = (ref_t *)(*p);
+/* Words available in R's virgin tail, from an aligned start if asked. */
+static size_t
+ms_virgin_room(ms_region_t *r, bool aligned)
+{
+    ref_t *start = aligned ? ms_align_up(r, r->top) : r->top;
+
+    return start < r->end ? (size_t)(r->end - start) : 0;
+}
+
+/* WORDS out of R's virgin tail. */
+static ref_t *
+ms_virgin_take(ms_region_t *r, size_t words, bool aligned)
+{
+    ref_t *start = aligned ? ms_align_up(r, r->top) : r->top;
+
+    if (r->top == r->start)
+	r->empty_cycles = 0;
+    ms_filler(r, r->top, (size_t)(start - r->top));
+    r->top = start + words;
+    return start;
+}
+
+/* A region with WORDS of virgin room: the cursor region, else the
+   first on the list, which becomes the cursor. */
+static ms_region_t *
+ms_region_with_room(size_t words, bool aligned)
+{
+    ms_region_t *r = alloc_region;
+
+    if (r && ms_virgin_room(r, aligned) >= words)
+	return r;
+    for (r = ms_regions; r; r = r->next)
+	if (ms_virgin_room(r, aligned) >= words) {
+	    alloc_region = r;
+	    return r;
 	}
+    return NULL;
+}
+
+/* A new region with room for WORDS, the cursor from now on. */
+static ms_region_t *
+ms_map_for(size_t words)
+{
+    size_t chunks = (words + MS_REGION_WORDS - 1) / MS_REGION_WORDS;
+
+    alloc_region = ms_region_map(chunks);
+    return alloc_region;
+}
+
+/* WORDS from a virgin tail: a region with room, else a new region
+   within the budget, or regardless of it when FORCE. */
+static ref_t *
+ms_virgin_alloc(size_t words, bool aligned, bool force)
+{
+    ms_region_t *r = ms_region_with_room(words, aligned);
+
+    if (r == NULL) {
+	if (!force && !ms_may_map())
+	    return NULL;
+	r = ms_map_for(words);
     }
-    return false;
+    return ms_virgin_take(r, words, aligned);
 }
 
 void
 ms_bump_alloc_notify(ref_t *p, size_t n_words)
 {
-    OBJSTART_SET(BM_IDX(p));
+    ms_objstart_set(ms_region_of(p), p);
     (void)n_words;
 }
-
-
-/* The TLAB fast path's objstart bit is ms_bump_alloc_notify_tlab in
-   gc-ms.h: a plain store, the bitmap word being the TLAB's own
-   (TLAB_ALIGN). */
 
 
 /* ------------------------------------------------------------------ */
@@ -351,69 +709,54 @@ ms_bump_alloc_notify(ref_t *p, size_t n_words)
 /* With threads a TLAB per thread; without, the one at index 0 is the
    allocator's bump cursor, so that ALLOCATE's fast path is the same
    few instructions in both builds (data.h). */
-#include "threads.h"
 
 ref_t *tlab_cursor_array[MS_TLAB_COUNT];
 ref_t *tlab_end_array[MS_TLAB_COUNT];
-
-/* A TLAB begins and ends on a bitmap word's boundary (64 words), so
-   its objstart bits are in words no other thread touches, and the
-   fast path sets them with a plain store (ms_bump_alloc_notify) --
-   the atomic OBJSTART_SET is for the shared words the slow paths and
-   the collector write.  The words skipped to align a start are zeroed
-   and given an objstart bit: a dead filler for the next sweep. */
-#define TLAB_ALIGN 64
-
-static ref_t *
-ms_tlab_align_up(ref_t *p)
-{
-    size_t off = (size_t)(p - new_space.start) % TLAB_ALIGN;
-
-    return off == 0 ? p : p + (TLAB_ALIGN - off);
-}
+ref_t *tlab_base_array[MS_TLAB_COUNT];
+uint64_t *tlab_bm_array[MS_TLAB_COUNT];
 
 static void
-ms_tlab_filler(ref_t *p, size_t words)
+ms_tlab_install(int idx, ms_region_t *r, ref_t *start, ref_t *end)
 {
-    if (words == 0)
-	return;
-    memset(p, 0, words * sizeof(ref_t));
-    OBJSTART_SET(BM_IDX(p));
+    tlab_base_array[idx] = start;
+    tlab_bm_array[idx] = &r->objstart[BM_IDX(r, start) / 64];
+    tlab_cursor_array[idx] = start;
+    tlab_end_array[idx] = end;
 }
 
-/*
- * Carve a TLAB from the global bump pointer.
- * Must be called with alloc_lock held.
- * Returns the start of the new TLAB, or NULL if insufficient space.
- * Sets *out_end to one past the last word of the TLAB.
- */
+/* A TLAB out of a virgin tail: TLAB_SIZE words from a region with
+   that much, else what a region has, down to TLAB_MIN_FREE or the
+   request, else from a new region (within the budget, or regardless
+   when FORCE). */
 static ref_t *
-ms_tlab_refill(size_t min_words, ref_t **out_end)
+ms_tlab_from_virgin(size_t min_words, bool force,
+		    ms_region_t **out_r, ref_t **out_end)
 {
-    size_t tlab_words = TLAB_SIZE;
-    ref_t *start = ms_tlab_align_up(free_point);
-    size_t gap = (size_t)(start - free_point);
+    size_t least = min_words > TLAB_MIN_FREE ? min_words : TLAB_MIN_FREE;
+    size_t words = TLAB_SIZE;
+    ms_region_t *r = ms_region_with_room(TLAB_SIZE, true);
+    ref_t *start;
 
-    if (tlab_words < min_words)
-	tlab_words = (min_words + TLAB_ALIGN - 1) / TLAB_ALIGN * TLAB_ALIGN;
-
-    if (gap + tlab_words >= (size_t)(new_space.end - free_point))
-	return NULL;
-
-    ms_tlab_filler(free_point, gap);
-    free_point = start + tlab_words;
-    *out_end = free_point;
+    if (r == NULL && (r = ms_region_with_room(least, true)) != NULL)
+	words = ms_virgin_room(r, true);
+    if (r == NULL) {
+	if (!force && !ms_may_map())
+	    return NULL;
+	r = ms_map_for(TLAB_SIZE);
+    }
+    start = ms_virgin_take(r, words, true);
+    *out_r = r;
+    *out_end = start + words;
     return start;
 }
 
 /* A TLAB out of a free-list entry: the biggest-class entry of at
-   least TLAB_MIN_FREE words behind the lazy sweep's cursor (an entry
-   can run on into an unswept block, whose objects the sweep would
-   then free), trimmed to aligned edges, the trimmings going back on
-   the lists.  Not during a concurrent mark: objects allocated below
-   sweep_limit then must be born black, which the fast path does not
-   do (and the cycle began by retiring every TLAB; refills come from
-   the bump region, above sweep_limit, until it ends). */
+   least TLAB_MIN_FREE words, trimmed to aligned edges, the trimmings
+   going back on the lists.  Not during a concurrent mark: objects
+   allocated below sweep_top then must be born black, which the fast
+   path does not do (and the cycle began by retiring every TLAB;
+   refills come from the virgin tails, above sweep_top, until it
+   ends). */
 /* No free run served last time, and none has been added since: the
    search would find nothing again (cleared by the sweeps and the
    split).  TLAB_MIN_FREE is the least size of every entry in the
@@ -421,7 +764,7 @@ ms_tlab_refill(size_t min_words, ref_t **out_end)
 static bool tlab_free_none = true;
 
 static ref_t *
-ms_tlab_from_free(size_t min_words, ref_t **out_end)
+ms_tlab_from_free(size_t min_words, ms_region_t **out_r, ref_t **out_end)
 {
     size_t need = min_words + 2 * TLAB_ALIGN;
 
@@ -436,18 +779,16 @@ ms_tlab_from_free(size_t min_words, ref_t **out_end)
 	while (p) {
 	    size_t actual_size = (size_t)p[1];
 
-	    if (actual_size == 0 || actual_size > new_space.size ||
-		p + actual_size > new_space.end) {
+	    if (!ms_entry_ok(p, actual_size)) {
 		prev = (ref_t **)p;
 		p = (ref_t *)(*p);
 		continue;
 	    }
-	    if (actual_size >= need
-		&& (!lazy_sweep_active
-		    || BM_IDX(p + actual_size) <= lazy_sweep_cursor)) {
-		ref_t *start = ms_tlab_align_up(p);
+	    if (actual_size >= need) {
+		ms_region_t *r = ms_region_of(p);
+		ref_t *start = ms_align_up(r, p);
 		ref_t *end = p + actual_size;
-		size_t tail = (size_t)(end - new_space.start) % TLAB_ALIGN;
+		size_t tail = BM_IDX(r, end) % TLAB_ALIGN;
 		size_t head = (size_t)(start - p);
 
 		*prev = (ref_t *)(*p);
@@ -461,10 +802,10 @@ ms_tlab_from_free(size_t min_words, ref_t **out_end)
 		    ref_t *t = end;
 		    size_t len = tail;
 
-		    ms_tlab_filler(t, 0);
-		    OBJSTART_SET(BM_IDX(t));
+		    ms_objstart_set(r, t);
 		    ms_sweep_run_end(&t, &len);
 		}
+		*out_r = r;
 		*out_end = end;
 		return start;
 	    }
@@ -477,29 +818,62 @@ ms_tlab_from_free(size_t min_words, ref_t **out_end)
 }
 
 
+/* Whether a request of N words can be met without collecting: by a
+   free-list entry (of its class or a larger one, see the split above)
+   big enough for it, from a region's virgin tail, or from a region
+   the budget allows mapping.  Total free words say nothing about
+   that: the lists could hold any amount in pieces all smaller than
+   N.  The same tests as the allocator's, exactly: a request this says
+   fits must then be met, or the caller would collect for ever. */
+static bool
+ms_space_for(size_t n_words)
+{
+    int sc = ms_size_class(n_words);
+    ms_region_t *r;
+
+    for (int c = sc; c < NUM_SIZE_CLASSES; c++) {
+	ref_t *p = free_list_heads[c];
+	while (p) {
+	    size_t actual_size = (c == 0) ? 1 : (size_t)p[1];
+	    if (!ms_entry_ok(p, actual_size)) {
+		p = (ref_t *)(*p);
+		continue;
+	    }
+	    if (c == sc ? actual_size >= n_words : actual_size > n_words)
+		return true;
+	    p = (ref_t *)(*p);
+	}
+    }
+    for (r = ms_regions; r; r = r->next)
+	if (ms_virgin_room(r, false) >= n_words)
+	    return true;
+    return ms_may_map();
+}
+
+
 ref_t *
-ms_alloc_slow_locked(size_t n_words,
-		     ref_t **tlab_cursor_p, ref_t **tlab_end_p)
+ms_alloc_slow_locked(size_t n_words, int idx)
 {
     ref_t *p;
 
     /* 1. A small request wants a TLAB, so that the ones after it take
        no lock: out of a big free entry, sweeping for one if need be,
-       else out of the bump region. */
+       else out of a virgin tail. */
     if (n_words <= TLAB_SIZE) {
+	ms_region_t *r;
 	ref_t *new_end, *new_start;
 
 	for (;;) {
-	    new_start = ms_tlab_from_free(n_words, &new_end);
+	    new_start = ms_tlab_from_free(n_words, &r, &new_end);
 	    if (new_start || !ms_lazy_sweep_one())
 		break;
 	}
 	if (!new_start)
-	    new_start = ms_tlab_refill(n_words, &new_end);
+	    new_start = ms_tlab_from_virgin(n_words, false, &r, &new_end);
 	if (new_start) {
-	    *tlab_cursor_p = new_start + n_words;
-	    *tlab_end_p = new_end;
-	    ms_bump_alloc_notify(new_start, n_words);
+	    ms_tlab_install(idx, r, new_start, new_end);
+	    tlab_cursor_array[idx] = new_start + n_words;
+	    MS_TLAB_OBJSTART(idx, new_start);
 	    return new_start;
 	}
     }
@@ -516,10 +890,9 @@ ms_alloc_slow_locked(size_t n_words,
 	    return p;
     }
 
-    /* 3. Try global bump pointer (large allocs or TLAB refill failed). */
-    if (n_words < (size_t)(new_space.end - free_point)) {
-	p = free_point;
-	free_point += n_words;
+    /* 3. A virgin tail, or a new region within the budget. */
+    p = ms_virgin_alloc(n_words, false, false);
+    if (p) {
 	ms_bump_alloc_notify(p, n_words);
 	return p;
     }
@@ -527,6 +900,34 @@ ms_alloc_slow_locked(size_t n_words,
     return NULL;  /* GC needed */
 }
 
+
+/* After this thread's own cycle has left nothing big enough: the heap
+   grows past its budget, which follows.  There is no copying
+   fallback. */
+static ref_t *
+ms_alloc_beyond_budget(size_t n_words, int idx, const char *reason)
+{
+    ref_t *p;
+
+    if (trace_gc > 1)
+	fprintf(stderr, "; MS-GC: nothing big enough after the cycle"
+		" (%s): growing past the budget.\n", reason);
+    if (n_words <= TLAB_SIZE) {
+	ms_region_t *r;
+	ref_t *end;
+
+	p = ms_tlab_from_virgin(n_words, true, &r, &end);
+	ms_tlab_install(idx, r, p, end);
+	tlab_cursor_array[idx] = p + n_words;
+	MS_TLAB_OBJSTART(idx, p);
+    } else {
+	p = ms_virgin_alloc(n_words, false, true);
+	ms_bump_alloc_notify(p, n_words);
+    }
+    if (ms_mapped > (size_t)e_next_newspace_size)
+	e_next_newspace_size = ms_mapped;
+    return p;
+}
 
 /* ALLOCATE's slow path, out of line (data.h). */
 ref_t *
@@ -541,34 +942,21 @@ ms_allocate_slow(size_t words, char *reason)
 	    wait_for_gc();
     }
 #endif
-    p = ms_alloc_slow_locked(words, &tlab_cursor_array[idx],
-			     &tlab_end_array[idx]);
-    /* ms_collect either runs a cycle as the coordinator -- and when
-       that leaves no room for the request, the copying collector,
-       growing the heap -- or, with threads, when another thread's
-       cycle is under way, waits for it; after a wait the retry can
-       still fail, so go round again.  The copying collector is never
-       called from here after a wait: run by a thread that is not the
-       coordinator while a cycle is in progress, it would skip its
-       handshake and move objects under the marker. */
+    p = ms_alloc_slow_locked(words, idx);
+    /* ms_collect either runs a cycle as the coordinator or, with
+       threads, when another thread's cycle is under way, waits for
+       it; after a wait the retry can still fail, so go round again.
+       After our own cycle, a request still unmet maps a region past
+       the budget. */
     while (!p) {
 	ms_collect(false, reason, words);
-	p = ms_alloc_slow_locked(words, &tlab_cursor_array[idx],
-				 &tlab_end_array[idx]);
+	p = ms_alloc_slow_locked(words, idx);
 #ifdef THREADS
-	if (!p && ms_collect_was_coordinator()) {
+	if (!p && ms_collect_was_coordinator())
 #else
-	if (!p) {
+	if (!p)
 #endif
-	    /* Our own cycle, and still nothing big enough: the copying
-	       collector, which grows the heap.  Safe here, unlike after
-	       a wait: a cycle needs alloc_lock to start, and this thread
-	       holds it, so none is under way. */
-	    gc(false, true, reason, words);
-	    p = free_point;
-	    free_point += words;
-	    ms_bump_alloc_notify(p, words);
-	}
+	    p = ms_alloc_beyond_budget(words, idx, reason);
     }
 #if defined(THREADS) && defined(OAK_GC_VERIFY)
     ms_verify_log_alloc(p, 2, words);
@@ -582,17 +970,18 @@ ms_allocate_slow(size_t words, char *reason)
 void
 ms_tlab_retire(ref_t *cursor, ref_t *end)
 {
+    size_t remaining;
+
     if (!cursor || cursor >= end)
 	return;
-
-    size_t remaining = (size_t)(end - cursor);
+    remaining = (size_t)(end - cursor);
 
     /* Zero the unused region so it doesn't confuse the mark phase
        (zeroed words are fixnum 0, not pointers). */
     memset(cursor, 0, remaining * sizeof(ref_t));
 
     /* Set an objstart bit so the sweep can find and reclaim it. */
-    OBJSTART_SET(BM_IDX(cursor));
+    ms_objstart_set(ms_region_of(cursor), cursor);
 }
 
 
@@ -612,6 +1001,8 @@ ms_tlab_retire_all(void)
 	ms_tlab_retire(tlab_cursor_array[i], tlab_end_array[i]);
 	tlab_cursor_array[i] = NULL;
 	tlab_end_array[i] = NULL;
+	tlab_base_array[i] = NULL;
+	tlab_bm_array[i] = NULL;
     }
 }
 
@@ -702,15 +1093,10 @@ satb_flush_all(void)
 
 
 /* ------------------------------------------------------------------ */
-/*  Concurrent marking state (Phase 4)                                 */
+/*  Concurrent marking state                                           */
 /* ------------------------------------------------------------------ */
 
 volatile int gc_phase = GC_PHASE_IDLE;
-
-/* Sweep limit: only sweep objects that existed before the mark phase
-   started.  Objects allocated during concurrent mark (above this
-   address) are implicitly live and will not be swept. */
-static ref_t *sweep_limit;
 
 #ifdef THREADS
 volatile int gc_concurrent_in_progress = 0;
@@ -718,8 +1104,7 @@ volatile int gc_concurrent_in_progress = 0;
 /* Whether the calling thread's last ms_collect ran the cycle itself
    (as opposed to waiting for another thread's).  Per thread: a single
    flag let a thread that had only waited see the one another thread's
-   cycle had set, and run the copying collector under that cycle's
-   mark. */
+   cycle had set. */
 static bool ms_collect_coordinated[MAX_THREAD_COUNT];
 
 bool
@@ -790,41 +1175,59 @@ stw_release(int my_index_val)
     set_gc_flag(false);   /* gc_pending=false, unlocks gc_lock */
 }
 
+/* The objects allocated from free lists during the concurrent mark:
+   born black, below their regions' sweep_top, and scanned at the
+   remark like what the TLABs allocated above it (a reference they
+   hold may be the last to an object the snapshot held only weakly). */
+static struct ms_born { ref_t *p; size_t words; } *born_list;
+static size_t born_count, born_cap;
+
+static void
+ms_born_record(ref_t *p, size_t words)
+{
+    if (born_count >= born_cap) {
+	born_cap = born_cap ? born_cap * 2 : 256;
+	born_list = (struct ms_born *)realloc(born_list,
+					      born_cap * sizeof(*born_list));
+	if (!born_list) {
+	    fprintf(stderr, "gc-ms: born list realloc failed\n");
+	    exit(EXIT_FAILURE);
+	}
+    }
+    born_list[born_count].p = p;
+    born_list[born_count].words = words;
+    born_count++;
+}
 #endif /* THREADS */
 
-
-#if defined(THREADS) && defined(OAK_GC_VERIFY)
-/* Verify mode: the objects born black this cycle. */
-static uint64_t *ms_verify_born;
-/* Verify mode: everything reachable at the snapshot (initial mark). */
-static uint64_t *ms_verify_snap;
-#endif
 
 /* Set mark bit for born-black allocation during concurrent mark. */
 void
 ms_mark_alloc(ref_t *p)
 {
-    if (!mark_bitmap)
+    ms_region_t *r = ms_region_of(p);
+    size_t idx;
+
+    if (r == NULL)
 	return;
-    if (p >= new_space.start && p < new_space.end) {
-	size_t idx = BM_IDX(p);
+    idx = BM_IDX(r, p);
 #if defined(THREADS) && defined(OAK_GC_VERIFY)
-	if (ms_verify_born)
-	    OAK_ATOMIC_FETCH_OR_U64(&ms_verify_born[idx / 64],
-				    1ULL << (idx % 64));
+    if (r->verify_born == NULL) {
+	r->verify_born = (uint64_t *)xmalloc(BM_WORDS(r) * sizeof(uint64_t));
+	memset(r->verify_born, 0, BM_WORDS(r) * sizeof(uint64_t));
+    }
+    OAK_ATOMIC_FETCH_OR_U64(&r->verify_born[idx / 64], 1ULL << (idx % 64));
 #endif
 #ifdef THREADS
-	OAK_ATOMIC_FETCH_OR_U64(&mark_bitmap[idx / 64],
-				1ULL << (idx % 64));
+    OAK_ATOMIC_FETCH_OR_U64(&r->mark[idx / 64], 1ULL << (idx % 64));
 #else
-	BM_SET(mark_bitmap, idx);
+    BM_SET(r->mark, idx);
 #endif
-    }
 }
 
 
 /* ------------------------------------------------------------------ */
-/*  Deferred objstart recording for copying GC fallback                */
+/*  Deferred objstart recording for the dump compaction                */
 /* ------------------------------------------------------------------ */
 
 static ref_t **deferred_objstarts;
@@ -855,24 +1258,18 @@ ms_record_transport(ref_t *new_place)
    bitmap.  This is the authoritative record of allocation boundaries:
    a naked cell (from MAKE-CELL) holds an arbitrary value in word[0],
    which a type-directed length lookup would happily read as a type
-   pointer and derive a length from the *next* object's memory. */
+   pointer and derive a length from the *next* object's memory.  The
+   region's top bounds it: beyond lies the virgin tail. */
 static size_t
-ms_objstart_extent(ref_t *obj)
+ms_objstart_extent(ms_region_t *r, ref_t *obj)
 {
-    ref_t *limit = free_point;
-    size_t heap_words;
-    size_t idx, next;
+    size_t limit = BM_IDX(r, r->top);
+    size_t idx = BM_IDX(r, obj), next;
 
-    if (limit > new_space.end)
-	limit = new_space.end;
-    heap_words = (size_t)(limit - new_space.start);
-
-    idx = BM_IDX(obj);
-    if (idx + 1 >= heap_words)
+    if (idx + 1 >= limit)
 	return 1;
-
     next = idx + 1;
-    while (next < heap_words && !BM_TEST(objstart_bitmap, next))
+    while (next < limit && !BM_TEST(r->objstart, next))
 	next++;
     return next - idx;
 }
@@ -883,27 +1280,51 @@ ms_objstart_extent(ref_t *obj)
 /* ------------------------------------------------------------------ */
 
 static ref_t *
-find_object_start(ref_t *addr)
+find_object_start(ms_region_t *r, ref_t *addr)
 {
-    if (!ms_is_heap_ptr(addr))
-	return NULL;
-
-    size_t idx = BM_IDX(addr);
+    size_t idx = BM_IDX(r, addr);
     size_t w = idx / 64;
     int bit = (int)(idx % 64);
 
     /* Mask: keep bits 0..bit (at or below the target). */
-    uint64_t word = objstart_bitmap[w] & ((2ULL << bit) - 1);
+    uint64_t word = r->objstart[w] & ((2ULL << bit) - 1);
 
     /* Scan backward through bitmap words. */
     while (word == 0) {
 	if (w == 0) return NULL;
 	w--;
-	word = objstart_bitmap[w];
+	word = r->objstart[w];
     }
 
     int highest = 63 - CLZ64(word);
-    return new_space.start + w * 64 + highest;
+    return r->start + w * 64 + highest;
+}
+
+/* The region and the object a reference lands in, or NULL: spatic
+   (one block, rejected first: nearly every pointer in a world image
+   is one), the stacks, C data and garbage give NULL.  A locative, or
+   a pointer not on an object start, is taken to its containing
+   object: MAKE-LAMBDA allocates the operation and its method as one
+   object, and the method is referred to on its own (e_current_method,
+   context frames), often after the operation has become garbage. */
+static inline ms_region_t *
+ms_mark_target(ref_t ref, ref_t **objp)
+{
+    ref_t *p = ANY_TO_PTR(ref);
+    ms_region_t *r;
+
+    if (SPATIC_PTR(p))
+	return NULL;
+    r = ms_region_of(p);
+    if (r == NULL)
+	return NULL;
+    if (TAG_IS(ref, LOC_TAG) || !BM_TEST(r->objstart, BM_IDX(r, p))) {
+	p = find_object_start(r, p);
+	if (p == NULL)
+	    return NULL;
+    }
+    *objp = p;
+    return r;
 }
 
 
@@ -949,41 +1370,25 @@ mark_stack_pop(void)
 
 
 /*
- * Mark an object in new_space and push it onto the mark stack
+ * Mark an object in the heap and push it onto the mark stack
  * if not already marked.  For spatic objects, do nothing (they
  * are permanent and always considered live).
  */
 static void
-ms_mark_ref(ref_t r)
+ms_mark_ref(ref_t ref)
 {
-    if (!(r & PTR_MASK))
+    ms_region_t *r;
+    ref_t *p;
+    size_t idx;
+
+    if (!(ref & PTR_MASK))
 	return;   /* fixnum or immediate — not a pointer */
-
-    ref_t *p = ANY_TO_PTR(r);
-
-    if (TAG_IS(r, LOC_TAG)) {
-	/* Locative: find the containing object and mark that. */
-	if (!NEW_PTR(p))
-	    return;   /* spatic or outside heap */
-	p = find_object_start(p);
-	if (!p) return;
-    } else {
-	/* PTR_TAG reference. */
-	if (!NEW_PTR(p))
-	    return;   /* spatic — always live */
-	/* A pointer can be interior too: MAKE-LAMBDA allocates the
-	   operation and its method as one object, and the method is
-	   referred to on its own (e_current_method, context frames),
-	   often after the operation has become garbage. */
-	if (!BM_TEST(objstart_bitmap, BM_IDX(p))) {
-	    p = find_object_start(p);
-	    if (!p) return;
-	}
-    }
-
-    size_t idx = BM_IDX(p);
-    if (!BM_TEST(mark_bitmap, idx)) {
-	BM_SET(mark_bitmap, idx);
+    r = ms_mark_target(ref, &p);
+    if (r == NULL)
+	return;
+    idx = BM_IDX(r, p);
+    if (!BM_TEST(r->mark, idx)) {
+	BM_SET(r->mark, idx);
 	mark_stack_push(p);
     }
 }
@@ -998,13 +1403,9 @@ ms_trace(void)
 {
     while (mark_stack_top > 0) {
 	ref_t *obj = mark_stack_pop();
-	size_t len = ms_objstart_extent(obj);
+	size_t len = ms_objstart_extent(ms_region_of(obj), obj);
 
-	/* Sanity: clamp length so we don't read past the heap. */
-	if (obj + len > new_space.end)
-	    len = (size_t)(new_space.end - obj);
 	marked_words += len;
-
 	for (size_t i = 0; i < len; i++) {
 	    ref_t val = obj[i];
 	    if (val & PTR_MASK)
@@ -1022,31 +1423,21 @@ ms_trace(void)
  * be atomic.
  */
 static void
-ms_mark_ref_concurrent(ref_t r)
+ms_mark_ref_concurrent(ref_t ref)
 {
-    if (!(r & PTR_MASK))
+    ms_region_t *r;
+    ref_t *p;
+    size_t idx;
+    uint64_t bit, old;
+
+    if (!(ref & PTR_MASK))
 	return;
-
-    ref_t *p = ANY_TO_PTR(r);
-
-    if (TAG_IS(r, LOC_TAG)) {
-	if (!NEW_PTR(p))
-	    return;
-	p = find_object_start(p);
-	if (!p) return;
-    } else {
-	if (!NEW_PTR(p))
-	    return;
-	/* Interior pointers, as in ms_mark_ref. */
-	if (!BM_TEST(objstart_bitmap, BM_IDX(p))) {
-	    p = find_object_start(p);
-	    if (!p) return;
-	}
-    }
-
-    size_t idx = BM_IDX(p);
-    uint64_t bit = 1ULL << (idx % 64);
-    uint64_t old = OAK_ATOMIC_FETCH_OR_U64(&mark_bitmap[idx / 64], bit);
+    r = ms_mark_target(ref, &p);
+    if (r == NULL)
+	return;
+    idx = BM_IDX(r, p);
+    bit = 1ULL << (idx % 64);
+    old = OAK_ATOMIC_FETCH_OR_U64(&r->mark[idx / 64], bit);
     if (!(old & bit))
 	mark_stack_push(p);
 }
@@ -1062,18 +1453,37 @@ ms_trace_concurrent(void)
 {
     while (mark_stack_top > 0) {
 	ref_t *obj = mark_stack_pop();
-	size_t len = ms_objstart_extent(obj);
+	size_t len = ms_objstart_extent(ms_region_of(obj), obj);
 
-	if (obj + len > new_space.end)
-	    len = (size_t)(new_space.end - obj);
 	marked_words += len;
-
 	for (size_t i = 0; i < len; i++) {
 	    ref_t val = obj[i];
 	    if (val & PTR_MASK)
 		ms_mark_ref_concurrent(val);
 	}
     }
+}
+
+/* What was allocated during the concurrent mark -- every region's
+   words above its sweep_top, and the born list -- scanned for
+   references at the remark (STW).  These objects are black without
+   having been traced, and may hold the last reference to an object
+   the snapshot held only weakly (wp_to_ref during the mark). */
+static void
+ms_scan_born(void)
+{
+    ms_region_t *r;
+    ref_t *p;
+    size_t k;
+
+    for (r = ms_regions; r; r = r->next)
+	for (p = r->sweep_top; p < r->top; p++)
+	    if (*p & PTR_MASK)
+		ms_mark_ref(*p);
+    for (k = 0; k < born_count; k++)
+	for (p = born_list[k].p; p < born_list[k].p + born_list[k].words; p++)
+	    if (*p & PTR_MASK)
+		ms_mark_ref(*p);
 }
 #endif /* THREADS */
 
@@ -1082,10 +1492,10 @@ ms_trace_concurrent(void)
 /*
  * Verify mode (-DOAK_GC_VERIFY): at the end of the remark pause, with
  * the world still stopped, mark the heap again from scratch and
- * compare.  An object the fresh mark reaches below sweep_limit that
- * the concurrent mark missed would be swept while live: a missing
- * write barrier or born-black.  Each one is reported with the object
- * that refers to it, then kept, so the run can go on.
+ * compare.  An object the fresh mark reaches below its region's
+ * sweep_top that the concurrent mark missed would be swept while
+ * live: a missing write barrier or born-black.  Each one is reported
+ * with the object that refers to it, then kept, so the run can go on.
  */
 static unsigned long ms_verify_cycles, ms_verify_missed_total;
 static int ms_verify_from_marked;
@@ -1158,18 +1568,6 @@ ms_verify_stw_alloc(int idx, const char *how)
 }
 static void ms_mark_roots(void);
 
-static ref_t *
-ms_verify_target(ref_t r)
-{
-    ref_t *p = ANY_TO_PTR(r);
-
-    if (!NEW_PTR(p))
-	return NULL;
-    if (TAG_IS(r, LOC_TAG) || !BM_TEST(objstart_bitmap, BM_IDX(p)))
-	p = find_object_start(p);
-    return p;
-}
-
 static const char *
 ms_verify_type_name(ref_t type)
 {
@@ -1185,23 +1583,26 @@ ms_verify_type_name(ref_t type)
 static void
 ms_verify_report(const char *what, ref_t *from, size_t field, ref_t *obj)
 {
-    size_t len = ms_objstart_extent(obj);
+    ms_region_t *r = ms_region_of(obj);
+    size_t len = ms_objstart_extent(r, obj);
 
     fprintf(stderr, "; GC VERIFY: missed %p %s in-snapshot %d (%zu words: %#lx %#lx %#lx)",
 	    (void *)obj, ms_verify_type_name(obj[0]),
-	    ms_verify_snap ? BM_TEST(ms_verify_snap, BM_IDX(obj)) != 0 : -1,
+	    r->verify_snap ? BM_TEST(r->verify_snap, BM_IDX(r, obj)) != 0 : -1,
 	    len, (unsigned long)obj[0],
 	    (unsigned long)(len > 1 ? obj[1] : 0),
 	    (unsigned long)(len > 2 ? obj[2] : 0));
     if (from) {
+	ms_region_t *fr = ms_region_of(from);
+
 	fprintf(stderr, " via field %zu of %p %s (%zu words, marked %d,"
-		" above sweep_limit %d)",
+		" above sweep_top %d)",
 		field, (void *)from, ms_verify_type_name(from[0]),
-		ms_objstart_extent(from), ms_verify_from_marked,
-		from >= sweep_limit);
-	if (ms_verify_born)
-	    fprintf(stderr, " born-black %d",
-		    BM_TEST(ms_verify_born, BM_IDX(from)) != 0);
+		ms_objstart_extent(fr, from), ms_verify_from_marked,
+		from >= fr->sweep_top);
+	fprintf(stderr, " born-black %d",
+		fr->verify_born
+		? BM_TEST(fr->verify_born, BM_IDX(fr, from)) != 0 : 0);
     } else
 	fprintf(stderr, " from %s", what);
     fprintf(stderr, "\n");
@@ -1210,43 +1611,90 @@ ms_verify_report(const char *what, ref_t *from, size_t field, ref_t *obj)
 	ms_verify_find_alloc(from);
 }
 
+/* Verify mode: the regions' verify bitmaps for this cycle. */
+static void
+ms_verify_cycle_begin(void)
+{
+    ms_region_t *r;
+
+    if (!ms_vlog)
+	ms_vlog = calloc(VLOG_SIZE, sizeof(*ms_vlog));
+    for (r = ms_regions; r; r = r->next) {
+	size_t bytes = BM_WORDS(r) * sizeof(uint64_t);
+
+	free(r->verify_born);
+	r->verify_born = (uint64_t *)xmalloc(bytes);
+	memset(r->verify_born, 0, bytes);
+	free(r->verify_snap);
+	r->verify_snap = NULL;
+    }
+}
+
+/* Verify mode: the marks so far become the snapshot (then cleared). */
+static void
+ms_verify_take_snapshot(void)
+{
+    ms_region_t *r;
+
+    for (r = ms_regions; r; r = r->next) {
+	size_t bytes = BM_WORDS(r) * sizeof(uint64_t);
+
+	r->verify_snap = (uint64_t *)xmalloc(bytes);
+	memcpy(r->verify_snap, r->mark, bytes);
+	memset(r->mark, 0, bytes);
+    }
+}
+
 static void
 ms_verify_marks(void)
 {
-    size_t bytes = bitmap_words * sizeof(uint64_t);
-    uint64_t *done = (uint64_t *)xmalloc(bytes);
-    size_t limit = (size_t)(sweep_limit - new_space.start);
-    unsigned long missed = 0, reported = 0;
-    ref_t *p;
+    unsigned long missed = 0, reported = 0, via_field;
+    ms_region_t *r;
+    size_t nr = 0, k;
+    uint64_t **done;
 
-    memcpy(done, mark_bitmap, bytes);
-    memset(mark_bitmap, 0, bytes);
+    /* Each region's concurrent result, then its marks cleared. */
+    for (r = ms_regions; r; r = r->next)
+	nr++;
+    done = (uint64_t **)xmalloc((nr ? nr : 1) * sizeof(uint64_t *));
+    for (r = ms_regions, k = 0; r; r = r->next, k++) {
+	size_t bytes = BM_WORDS(r) * sizeof(uint64_t);
+
+	done[k] = (uint64_t *)xmalloc(bytes);
+	memcpy(done[k], r->mark, bytes);
+	memset(r->mark, 0, bytes);
+    }
 
     /* What the remark treats as live: the roots, and everything
-       allocated above sweep_limit (scanned, never swept). */
+       allocated during the mark (scanned, never swept). */
     ms_mark_roots();
-    for (p = sweep_limit; p < free_point; p++)
-	if (*p & PTR_MASK)
-	    ms_mark_ref(*p);
+    ms_scan_born();
 
     while (mark_stack_top > 0) {
 	ref_t *obj = mark_stack_pop();
-	size_t len = ms_objstart_extent(obj);
+	ms_region_t *oreg = ms_region_of(obj);
+	size_t len = ms_objstart_extent(oreg, obj);
 
-	if (obj + len > new_space.end)
-	    len = (size_t)(new_space.end - obj);
 	for (size_t i = 0; i < len; i++) {
 	    ref_t val = obj[i];
 	    ref_t *t;
-	    size_t idx;
+	    ms_region_t *tr;
+	    size_t idx, tk;
 
-	    if (!(val & PTR_MASK) || !(t = ms_verify_target(val)))
+	    if (!(val & PTR_MASK) || !(tr = ms_mark_target(val, &t)))
 		continue;
-	    idx = BM_IDX(t);
-	    if (idx < limit && !BM_TEST(done, idx) && !BM_TEST(mark_bitmap, idx)
-		&& reported < 20) {
+	    idx = BM_IDX(tr, t);
+	    for (r = ms_regions, tk = 0; r != tr; r = r->next, tk++)
+		;
+	    if (idx < BM_IDX(tr, tr->sweep_top) && !BM_TEST(done[tk], idx)
+		&& !BM_TEST(tr->mark, idx) && reported < 20) {
+		size_t oi;
+
+		for (r = ms_regions, oi = 0; r != oreg; r = r->next, oi++)
+		    ;
 		ms_verify_from_marked =
-		    obj >= sweep_limit || BM_TEST(done, BM_IDX(obj)) != 0;
+		    obj >= oreg->sweep_top
+		    || BM_TEST(done[oi], BM_IDX(oreg, obj)) != 0;
 		ms_verify_report(NULL, obj, i, t);
 		reported++;
 	    }
@@ -1256,22 +1704,26 @@ ms_verify_marks(void)
 
     /* Report the rest only if none was reached through a field: those
        were reached straight from the roots. */
-    unsigned long via_field = reported;
+    via_field = reported;
+    for (r = ms_regions, k = 0; r; r = r->next, k++) {
+	size_t limit = BM_IDX(r, r->sweep_top);
 
-    for (size_t w = 0; w < bitmap_words; w++) {
-	uint64_t lost = mark_bitmap[w] & ~done[w];
-	while (lost) {
-	    size_t idx = w * 64 + CTZ64(lost);
-	    lost &= lost - 1;
-	    if (idx >= limit)
-		break;
-	    if (!via_field && reported < 20) {
-		ms_verify_report("the roots", NULL, 0, new_space.start + idx);
-		reported++;
+	for (size_t w = 0; w < BM_WORDS(r); w++) {
+	    uint64_t lost = r->mark[w] & ~done[k][w];
+	    while (lost) {
+		size_t idx = w * 64 + CTZ64(lost);
+		lost &= lost - 1;
+		if (idx >= limit)
+		    break;
+		if (!via_field && reported < 20) {
+		    ms_verify_report("the roots", NULL, 0, r->start + idx);
+		    reported++;
+		}
+		missed++;
 	    }
-	    missed++;
+	    r->mark[w] |= done[k][w];
 	}
-	mark_bitmap[w] |= done[w];
+	free(done[k]);
     }
     free(done);
 
@@ -1315,12 +1767,12 @@ ms_mark_roots(void)
 {
     ref_t *p;
 
-/* A root is worth a call only if it points into new space: nearly
-   every word of spatic and of the stacks is a fixnum or points into
-   spatic, and this is the collector's one pass over them. */
+/* A root is worth a call only if it is a pointer not into spatic:
+   nearly every word of spatic and of the stacks is a fixnum or points
+   into spatic, and this is the collector's one pass over them. */
 #define MS_ROOT(r)							\
     do { ref_t _r = (r);						\
-	 if ((_r & PTR_MASK) && NEW_PTR(ANY_TO_PTR(_r)))		\
+	 if ((_r & PTR_MASK) && !SPATIC_PTR(ANY_TO_PTR(_r)))		\
 	     ms_mark_ref(_r); } while (0)
 
 #ifdef THREADS
@@ -1380,12 +1832,35 @@ ms_mark_roots(void)
 	ms_mark_ref(context_stack.segment);
     }
 
-    /* Scan spatic space: any pointer from spatic into new_space is a root. */
+    /* Scan spatic space: any pointer from spatic into the heap is a root. */
     for (p = spatic.start; p < spatic.end; p++)
 	MS_ROOT(*p);
 
 #undef FORTHREADS
 #undef MS_ROOT
+}
+
+/* Before a cycle: every region's marks cleared.  Under alloc_lock,
+   so the list is stable; a region mapped after this starts with none
+   either. */
+static void
+ms_clear_marks(void)
+{
+    ms_region_t *r;
+
+    for (r = ms_regions; r; r = r->next)
+	memset(r->mark, 0, BM_WORDS(r) * sizeof(uint64_t));
+}
+
+/* The cycle's snapshot: every region's sweep_top is its top.  With
+   the world stopped (or one thread). */
+static void
+ms_snapshot_tops(void)
+{
+    ms_region_t *r;
+
+    for (r = ms_regions; r; r = r->next)
+	r->sweep_top = r->top;
 }
 
 
@@ -1425,76 +1900,29 @@ ms_sweep_run_end(ref_t **run_start, size_t *run_len)
     *run_len = 0;
 }
 
-#ifndef THREADS
-static size_t
-ms_sweep(void)
-{
-    size_t reclaimed = 0;
-
-    /* Clear all free lists. */
-    for (int i = 0; i < NUM_SIZE_CLASSES; i++)
-	free_list_heads[i] = NULL;
-    free_list_total_words = 0;
-
-    /* Walk the heap using the objstart bitmap.  Only sweep up to
-       sweep_limit — objects allocated during concurrent mark (above
-       sweep_limit) are implicitly live and must not be swept. */
-    ref_t *limit = sweep_limit ? sweep_limit : free_point;
-    size_t heap_words = (size_t)(limit - new_space.start);
-    size_t bm_words = (heap_words + 63) / 64;
-    ref_t *run_start = NULL;
-    size_t run_len = 0;
-
-    for (size_t w = 0; w < bm_words; w++) {
-	uint64_t os_word = objstart_bitmap[w];
-	if (os_word == 0) continue;
-
-	while (os_word != 0) {
-	    int bit = CTZ64(os_word);
-	    os_word &= os_word - 1;   /* clear lowest set bit */
-
-	    size_t idx = w * 64 + bit;
-	    if (idx >= heap_words) break;
-
-	    ref_t *obj = new_space.start + idx;
-
-	    /* An object extends to the next objstart bit (not to what
-	       its type says: a naked cell's word[0] can look like a
-	       type).  So a run of dead objects extends from its first
-	       to the next live one, and only that end is looked for. */
-	    if (BM_TEST(mark_bitmap, idx)) {
-		/* Live: clear mark for next cycle. */
-		BM_CLR(mark_bitmap, idx);
-		if (run_start) {
-		    run_len = (size_t)(obj - run_start);
-		    reclaimed += run_len;
-		    ms_sweep_run_end(&run_start, &run_len);
-		}
-	    } else if (run_start) {
-		BM_CLR(objstart_bitmap, idx);	/* into the run */
-	    } else {
-		run_start = obj;
-	    }
-	}
-    }
-    if (run_start) {
-	run_len = ms_objstart_extent_to(run_start, heap_words);
-	reclaimed += run_len;
-	ms_sweep_run_end(&run_start, &run_len);
-    }
-
-    return reclaimed;
-}
-#endif /* !THREADS */
-
 
 /* ------------------------------------------------------------------ */
-/*  Lazy sweep (Phase 5)                                               */
+/*  Lazy sweep                                                         */
 /* ------------------------------------------------------------------ */
 
-static size_t lazy_sweep_cursor;   /* word index into heap */
-static size_t lazy_sweep_end;      /* word index the sweep stops at */
-static bool   lazy_sweep_active;   /* true when blocks remain to sweep */
+/* The sweep goes region by region in SWEEP_BLOCK_SIZE-word blocks,
+   each block one call under alloc_lock, between the regions' start
+   and their sweep_top; what was allocated above sweep_top (during
+   the mark, or since) carries no mark bit and must not be swept.  A
+   run of dead objects open at a block's end carries over to the
+   next block, so an entry never extends past the cursor and the
+   allocator may use any entry on the lists.  A region found with
+   nothing live and nothing allocated since the snapshot is reset to
+   virgin in one step, with no entries, and a region empty for
+   MS_EMPTY_CYCLES sweeps in a row is unmapped when the heap is over
+   its budget. */
+static ms_region_t *sweep_region;	/* being swept, or NULL */
+static size_t sweep_cursor;		/* word index into it */
+static ref_t *sweep_run;		/* the open run of dead objects */
+static size_t sweep_dead;		/* dead words found in it so far */
+static bool   lazy_sweep_active;	/* true when regions remain to sweep */
+
+#define MS_EMPTY_CYCLES 2
 
 void
 ms_prepare_lazy_sweep(void)
@@ -1504,18 +1932,61 @@ ms_prepare_lazy_sweep(void)
     for (int i = 0; i < NUM_SIZE_CLASSES; i++)
 	free_list_heads[i] = NULL;
     free_list_total_words = 0;
+    tlab_free_none = true;
 
-    lazy_sweep_cursor = 0;
-    /* The sweep is bounded by the cycle's snapshot for good: what
-       other threads allocate above it while the sweep goes on lazily
-       (and what they allocated during the concurrent mark) carries no
-       mark bit, so a sweep that ran up to free_point would free it
-       live. */
-    lazy_sweep_end = (size_t)((sweep_limit ? sweep_limit : free_point)
-			      - new_space.start);
+    sweep_region = ms_regions;
+    sweep_cursor = 0;
+    sweep_run = NULL;
+    sweep_dead = 0;
     lazy_sweep_active = true;
 }
 
+/* Nothing marked below sweep_top, nothing allocated above it. */
+static bool
+ms_region_all_dead(ms_region_t *r)
+{
+    size_t n = BM_IDX(r, r->sweep_top), w = n / 64, i;
+
+    if (r->top != r->sweep_top)
+	return false;
+    for (i = 0; i < w; i++)
+	if (r->mark[i])
+	    return false;
+    if (n % 64 && (r->mark[w] & ((1ULL << (n % 64)) - 1)))
+	return false;
+    return true;
+}
+
+/* All dead: virgin again, in one step. */
+static void
+ms_region_reset(ms_region_t *r)
+{
+    size_t bytes = (BM_IDX(r, r->top) + 63) / 64 * sizeof(uint64_t);
+
+    memset(r->objstart, 0, bytes);
+    memset(r->mark, 0, bytes);
+    r->top = r->sweep_top = r->start;
+    r->live_words = 0;
+    r->empty_cycles++;
+}
+
+/* Unmap empty regions beyond the budget (hysteresis: empty for
+   MS_EMPTY_CYCLES sweeps), the biggest first.  No sweep in progress. */
+static void
+ms_unmap_surplus(void)
+{
+    while (ms_mapped > (size_t)e_next_newspace_size) {
+	ms_region_t *r, *best = NULL;
+
+	for (r = ms_regions; r; r = r->next)
+	    if (r->top == r->start && r->empty_cycles >= MS_EMPTY_CYCLES
+		&& (best == NULL || r->chunks > best->chunks))
+		best = r;
+	if (best == NULL)
+	    break;
+	ms_region_unmap(best);
+    }
+}
 
 bool
 ms_lazy_sweep_one(void)
@@ -1523,63 +1994,92 @@ ms_lazy_sweep_one(void)
     if (!lazy_sweep_active)
 	return false;
 
-    size_t heap_words = lazy_sweep_end;
+    for (;;) {
+	ms_region_t *r = sweep_region;
+	size_t limit, start, end, start_w, end_w;
 
-    if (lazy_sweep_cursor >= heap_words) {
-	lazy_sweep_active = false;
-	return false;
-    }
+	if (r == NULL) {
+	    lazy_sweep_active = false;
+	    ms_unmap_surplus();
+	    return false;
+	}
+	limit = BM_IDX(r, r->sweep_top);
+	if (sweep_cursor == 0) {
+	    if (limit == 0) {
+		/* Nothing from before the cycle: empty then, and still
+		   if nothing has been allocated into it since. */
+		if (r->top == r->start)
+		    r->empty_cycles++;
+		else
+		    r->empty_cycles = 0;
+		sweep_region = r->next;
+		continue;
+	    }
+	    if (ms_region_all_dead(r)) {
+		ms_region_reset(r);
+		sweep_region = r->next;
+		return true;
+	    }
+	    sweep_dead = 0;
+	}
 
-    size_t start = lazy_sweep_cursor;
-    size_t end = start + SWEEP_BLOCK_SIZE;
-    if (end > heap_words)
-	end = heap_words;
-    lazy_sweep_cursor = end;
+	/* One block of R: walk objstart bits in [start, end). */
+	start = sweep_cursor;
+	end = start + SWEEP_BLOCK_SIZE;
+	if (end > limit)
+	    end = limit;
+	sweep_cursor = end;
+	start_w = start / 64;
+	end_w = (end + 63) / 64;
 
-    /* Walk objstart bits in [start, end). */
-    size_t start_w = start / 64;
-    size_t end_w = (end + 63) / 64;
-    ref_t *run_start = NULL;
-    size_t run_len = 0;
+	for (size_t w = start_w; w < end_w; w++) {
+	    uint64_t os_word = r->objstart[w];
+	    if (os_word == 0) continue;
 
-    for (size_t w = start_w; w < end_w; w++) {
-	uint64_t os_word = objstart_bitmap[w];
-	if (os_word == 0) continue;
+	    while (os_word != 0) {
+		int bit = CTZ64(os_word);
+		os_word &= os_word - 1;
 
-	while (os_word != 0) {
-	    int bit = CTZ64(os_word);
-	    os_word &= os_word - 1;
+		size_t idx = w * 64 + bit;
+		if (idx < start || idx >= end) continue;
 
-	    size_t idx = w * 64 + bit;
-	    if (idx < start || idx >= end) continue;
+		ref_t *obj = r->start + idx;
 
-	    ref_t *obj = new_space.start + idx;
-
-	    /* As in ms_sweep: a run of dead objects, from its first to
-	       the next live one.  The last run's end may lie past this
-	       block, in one not yet swept: the entry is made anyway
-	       (the allocator keeps off such an entry until the sweep
-	       has passed it). */
-	    if (BM_TEST(mark_bitmap, idx)) {
-		BM_CLR(mark_bitmap, idx);
-		if (run_start) {
-		    run_len = (size_t)(obj - run_start);
-		    ms_sweep_run_end(&run_start, &run_len);
+		/* An object extends to the next objstart bit (not to
+		   what its type says: a naked cell's word[0] can look
+		   like a type).  So a run of dead objects extends from
+		   its first to the next live one, and only that end is
+		   looked for. */
+		if (BM_TEST(r->mark, idx)) {
+		    /* Live: clear mark for next cycle. */
+		    BM_CLR(r->mark, idx);
+		    if (sweep_run) {
+			size_t run_len = (size_t)(obj - sweep_run);
+			sweep_dead += run_len;
+			ms_sweep_run_end(&sweep_run, &run_len);
+		    }
+		} else if (sweep_run) {
+		    BM_CLR(r->objstart, idx);	/* into the run */
+		} else {
+		    sweep_run = obj;
 		}
-	    } else if (run_start) {
-		BM_CLR(objstart_bitmap, idx);
-	    } else {
-		run_start = obj;
 	    }
 	}
+	if (end >= limit) {
+	    /* The region's end: close the run at sweep_top. */
+	    if (sweep_run) {
+		size_t run_len = (size_t)(r->sweep_top - sweep_run);
+		sweep_dead += run_len;
+		ms_sweep_run_end(&sweep_run, &run_len);
+	    }
+	    r->live_words = limit - sweep_dead;
+	    r->empty_cycles = 0;
+	    sweep_region = r->next;
+	    sweep_cursor = 0;
+	}
+	tlab_free_none = false;
+	return true;
     }
-    if (run_start) {
-	run_len = ms_objstart_extent_to(run_start, heap_words);
-	ms_sweep_run_end(&run_start, &run_len);
-    }
-    tlab_free_none = false;	/* an entry that straddled the cursor may not now */
-
-    return true;
 }
 
 
@@ -1602,23 +2102,18 @@ ms_post_gc_wp(void)
     long i;
 
     for (i = 0; i < wp_index; i++) {
-	ref_t r = wp_table[1 + i];
-	if (r & PTR_MASK) {
-	    ref_t *p = ANY_TO_PTR(r);
-	    if (NEW_PTR(p)) {
-		size_t idx = BM_IDX(p);
+	ref_t ref = wp_table[1 + i];
+	if (ref & PTR_MASK) {
+	    ref_t *p = ANY_TO_PTR(ref);
+	    ms_region_t *r = ms_region_of(p);
+
+	    if (r != NULL) {
 		/* For locatives, find the object start. */
-		if (TAG_IS(r, LOC_TAG)) {
-		    ref_t *obj = find_object_start(p);
-		    if (!obj || !BM_TEST(mark_bitmap, BM_IDX(obj))) {
-			wp_table[1 + i] = e_nil;
-			count++;
-		    }
-		} else {
-		    if (!BM_TEST(mark_bitmap, idx)) {
-			wp_table[1 + i] = e_nil;
-			count++;
-		    }
+		if (TAG_IS(ref, LOC_TAG))
+		    p = find_object_start(r, p);
+		if (!p || !BM_TEST(r->mark, BM_IDX(r, p))) {
+		    wp_table[1 + i] = e_nil;
+		    count++;
 		}
 	    }
 	}
@@ -1681,14 +2176,13 @@ ms_collect(bool pre_dump, char *reason, size_t amount)
 #endif
 
     /* Finish any lazy sweep remaining from the previous cycle.
-       This must happen before we clear the mark bitmap. */
+       This must happen before we clear the mark bitmaps. */
     ms_lazy_sweep_finish();
 
     /* For world dumps, use the copying GC which produces a contiguous
        heap suitable for serialization.  Note that we have deliberately
-       not claimed gc_concurrent_in_progress: that flag tells gc() that
-       the mutators are already parked, and here they are not, so it has
-       to run its own stop-the-world handshake. */
+       not claimed gc_concurrent_in_progress: the mutators are not
+       parked, so it has to run its own stop-the-world handshake. */
     if (pre_dump) {
 	gc(pre_dump, true, reason, amount);
 	return;
@@ -1703,17 +2197,16 @@ ms_collect(bool pre_dump, char *reason, size_t amount)
     gc_stats_begin(&cycle, GC_EV_MARK_SWEEP);
 #endif
 
-    old_used = (long)(free_point - new_space.start) -
-	(long)free_list_total_words;
+    old_used = (long)ms_allocated_words() - (long)free_list_total_words;
 
     if (trace_gc == 1)
 	fprintf(stderr, "\n;MS-GC");
     if (trace_gc > 1)
 	fprintf(stderr, "\n; Mark-sweep GC due to %s.\n", reason);
 
-    /* Save the current free_point as the sweep limit.  Objects
-       allocated above this point during concurrent mark are
-       implicitly live and will not be swept.
+    /* The cycle's snapshot: every region's sweep_top is its top, and
+       its marks are cleared.  Objects allocated above sweep_top during
+       the mark are implicitly live and will not be swept.
 
        With threads, both this snapshot and the TLAB retirement happen
        inside the initial-mark pause below instead of here: the TLAB
@@ -1724,26 +2217,26 @@ ms_collect(bool pre_dump, char *reason, size_t amount)
        slot reads as zero. */
 #ifndef THREADS
     ms_tlab_retire_all();
-    sweep_limit = free_point;
+    ms_snapshot_tops();
 #endif
 
     /* --- Mark phase --- */
     if (trace_gc > 1) {
-	fprintf(stderr, "; Marking... [heap=%zu, used=%ld, free_list=%zu]",
-		new_space.size, (long)(free_point - new_space.start),
+	fprintf(stderr, "; Marking... [heap=%zu words in %zu regions,"
+		" used=%ld, free_list=%zu]",
+		ms_mapped, ms_nregions, old_used + (long)free_list_total_words,
 		free_list_total_words);
 	fflush(stderr);
     }
 
-    memset(mark_bitmap, 0, bitmap_words * sizeof(uint64_t));
+    ms_clear_marks();
     mark_stack_init();
     marked_words = 0;
+#ifdef THREADS
+    born_count = 0;
+#endif
 #if defined(THREADS) && defined(OAK_GC_VERIFY)
-    if (!ms_vlog)
-	ms_vlog = calloc(VLOG_SIZE, sizeof(*ms_vlog));
-    free(ms_verify_born);
-    ms_verify_born = (uint64_t *)xmalloc(bitmap_words * sizeof(uint64_t));
-    memset(ms_verify_born, 0, bitmap_words * sizeof(uint64_t));
+    ms_verify_cycle_begin();
 #endif
 
     /* Disable crash recovery during GC so that any SIGSEGV from bad
@@ -1775,20 +2268,16 @@ ms_collect(bool pre_dump, char *reason, size_t amount)
 	    fprintf(stderr, "\n; STW initial mark...");
 
 	/* The world is stopped, so no mutator can be inside the TLAB
-	   fast path.  Retire the TLABs and take the sweep_limit
-	   snapshot now. */
+	   fast path.  Retire the TLABs and take the snapshot now. */
 	ms_tlab_retire_all();
-	sweep_limit = free_point;
+	ms_snapshot_tops();
 
 	ms_mark_roots();
 #ifdef OAK_GC_VERIFY
 	/* Trace the whole snapshot now into a copy, then start the
 	   real mark over from the roots. */
 	ms_trace();
-	free(ms_verify_snap);
-	ms_verify_snap = (uint64_t *)xmalloc(bitmap_words * sizeof(uint64_t));
-	memcpy(ms_verify_snap, mark_bitmap, bitmap_words * sizeof(uint64_t));
-	memset(mark_bitmap, 0, bitmap_words * sizeof(uint64_t));
+	ms_verify_take_snapshot();
 	ms_mark_roots();
 #endif
 	if (trace_gc > 1) { fprintf(stderr, " roots"); fflush(stderr); }
@@ -1841,17 +2330,10 @@ ms_collect(bool pre_dump, char *reason, size_t amount)
 	   by SATB barriers. */
 	ms_mark_roots();
 
-	/* Scan objects allocated during concurrent mark.  These
-	   are above sweep_limit and won't be swept, but they may
-	   contain pointers to old objects that need marking. */
-	{
-	    ref_t *p;
-	    for (p = sweep_limit; p < free_point; p++) {
-		ref_t val = *p;
-		if (val & PTR_MASK)
-		    ms_mark_ref(val);
-	    }
-	}
+	/* Scan what was allocated during the concurrent mark: black
+	   without a trace, it may hold pointers to old objects that
+	   need marking. */
+	ms_scan_born();
 
 	/* Process all newly discovered references. */
 	ms_trace();
@@ -1867,7 +2349,7 @@ ms_collect(bool pre_dump, char *reason, size_t amount)
 	satb_flush_all();
     }
 #else
-    /* Single-threaded: STW mark as before. */
+    /* Single-threaded: STW mark. */
     ms_mark_roots();
     if (trace_gc > 1) { fprintf(stderr, " roots"); fflush(stderr); }
     ms_trace();
@@ -1896,36 +2378,33 @@ ms_collect(bool pre_dump, char *reason, size_t amount)
     mark_stack = NULL;
     mark_stack_size = 0;
 
+    /* The budget for the next cycle, from what the mark found. */
+    ms_set_budget(amount);
+
+    /* Prepare lazy sweep: clear free lists and set the sweep cursor
+       to the first region.  Blocks will be swept on demand by
+       allocating threads (ms_lazy_sweep_one). */
+    ms_prepare_lazy_sweep();
+
+    if (trace_gc > 1)
+	fprintf(stderr, "; Lazy sweep prepared (%zu regions).\n", ms_nregions);
+
+    /* Sweep enough blocks now to satisfy the requested amount, so that
+       the caller's retry finds room (or the budget's). */
+    {
+	while (!ms_space_for(amount) && ms_lazy_sweep_one()) {
+	    /* keep sweeping */
+	}
+	if (trace_gc > 1 && free_list_total_words > 0)
+	    fprintf(stderr, "; Eagerly swept %zu words.\n",
+		    free_list_total_words);
+    }
+
+    gc_phase = GC_PHASE_IDLE;
+
 #ifdef THREADS
     {
 	int my_index_val = *(int *)oak_tls_get(index_key);
-
-	/* Prepare lazy sweep: clear free lists and set the sweep
-	   cursor to the start of the heap.  Blocks will be swept
-	   on demand by allocating threads (ms_lazy_sweep_one). */
-	ms_prepare_lazy_sweep();
-
-	if (trace_gc > 1)
-	    fprintf(stderr, "; Lazy sweep prepared (%zu words to sweep).\n",
-		    (size_t)((sweep_limit ? sweep_limit : free_point)
-			     - new_space.start));
-
-	/* Sweep enough blocks now to satisfy the requested amount.
-	   This avoids the caller falling through to the copying GC
-	   fallback when free lists are still empty. */
-	{
-	    size_t swept_so_far = 0;
-	    while (!ms_space_for(amount) && ms_lazy_sweep_one()) {
-		/* keep sweeping */
-	    }
-	    swept_so_far = free_list_total_words;
-
-	    if (trace_gc > 1 && swept_so_far > 0)
-		fprintf(stderr, "; Eagerly swept %zu words.\n",
-			swept_so_far);
-	}
-
-	gc_phase = GC_PHASE_IDLE;
 
 	/* Release all threads from the remark STW pause. */
 #ifdef OAK_GC_VERIFY
@@ -1940,128 +2419,29 @@ ms_collect(bool pre_dump, char *reason, size_t amount)
 
 	/* Re-acquire alloc_lock — ALLOCATE_PROT expects us to hold it. */
 	oak_mutex_lock(&alloc_lock);
-
-	/* Check if we need the copying GC fallback. */
-	{
-	    size_t free_space = free_list_total_words +
-		(size_t)(new_space.end - free_point);
-
-	    if (trace_gc == 1)
-		fprintf(stderr, ":%ld%%",
-			old_used > 0
-			? (100 * (long)free_list_total_words) / old_used
-			: 0);
-	    if (trace_gc > 1)
-		fprintf(stderr, "; MS-GC complete.  %zu free (%zu list + %zu bump).\n",
-			free_space, free_list_total_words,
-			(size_t)(new_space.end - free_point));
-
-	    if (!ms_space_for(amount)) {
-		if (trace_gc > 1)
-		    fprintf(stderr,
-			    "; MS-GC: insufficient space after collection, "
-			    "falling back to copying GC.\n");
-
-		/* Finish any remaining lazy sweep before copying GC. */
-		ms_lazy_sweep_finish();
-		sweep_limit = NULL;
-
-		{
-		    long new_used = old_used - (long)free_list_total_words;
-		    if (new_used < 0) new_used = 0;
-		    size_t live = (size_t)new_used + amount;
-		    size_t want = 3 * live;
-		    if (want > original_newspace_size) {
-			original_newspace_size = want;
-			e_next_newspace_size = want;
-		    }
-		}
-
-		/* The mutators were released by stw_release() above, so
-		   the object-relocating copying collector must do its own
-		   stop-the-world handshake.  Drop the coordinator flag
-		   (without broadcasting: threads parked in
-		   ms_wait_concurrent_gc still have their gc_ready flags
-		   set, which is exactly what the handshake needs). */
-		gc_concurrent_in_progress = 0;
-		gc(false, true, "mark-sweep fallback", amount);
-		gc_concurrent_in_progress = 1;
-	    }
-	    else if (ms_crowded(amount)) {
-		/* As above, into the bigger space; spatic stays. */
-		ms_lazy_sweep_finish();
-		sweep_limit = NULL;
-		gc_concurrent_in_progress = 0;
-		gc(false, false, "mark-sweep growth", amount);
-		gc_concurrent_in_progress = 1;
-	    }
-	}
-
-	sweep_limit = NULL;
-
-	if (trace_gc == 1)
-	    fprintf(stderr, "\n");
-
-	/* Signal any threads waiting for the concurrent GC to finish. */
-	oak_mutex_lock(&gc_concurrent_lock);
-	gc_concurrent_in_progress = 0;
-	oak_cond_broadcast(&gc_concurrent_done_cv);
-	oak_mutex_unlock(&gc_concurrent_lock);
-	gc_stats_end(&cycle, GC_EV_CYCLE, reason);
     }
+#endif
+
+    if (trace_gc == 1)
+	fprintf(stderr, ":%ld%%",
+		old_used > 0
+		? (100 * (long)free_list_total_words) / old_used : 0);
+    if (trace_gc > 1)
+	fprintf(stderr, "; MS-GC complete.  %zu free on the lists,"
+		" %zu words mapped in %zu regions, budget %zu.\n",
+		free_list_total_words, ms_mapped, ms_nregions,
+		(size_t)e_next_newspace_size);
+    if (trace_gc == 1)
+	fprintf(stderr, "\n");
+
+#ifdef THREADS
+    /* Signal any threads waiting for the concurrent GC to finish. */
+    oak_mutex_lock(&gc_concurrent_lock);
+    gc_concurrent_in_progress = 0;
+    oak_cond_broadcast(&gc_concurrent_done_cv);
+    oak_mutex_unlock(&gc_concurrent_lock);
+    gc_stats_end(&cycle, GC_EV_CYCLE, reason);
 #else
-    /* Single-threaded: full STW sweep. */
-    if (trace_gc > 1)
-	fprintf(stderr, "; Sweeping...");
-
-    size_t reclaimed = ms_sweep();
-
-    if (trace_gc > 1)
-	fprintf(stderr, " %zu words reclaimed.\n", reclaimed);
-
-    gc_phase = GC_PHASE_IDLE;
-    sweep_limit = NULL;
-
-    /* --- Post-GC sizing --- */
-    {
-	long new_used = old_used - (long)reclaimed;
-	if (new_used < 0) new_used = 0;
-	size_t free_space = free_list_total_words +
-	    (size_t)(new_space.end - free_point);
-
-	if (trace_gc == 1)
-	    fprintf(stderr, ":%ld%%",
-		    old_used > 0 ? (100 * (long)reclaimed) / old_used : 0);
-	if (trace_gc > 1)
-	    fprintf(stderr, "; MS-GC complete.  %ld used, %zu free (%zu list + %zu bump).\n",
-		    (long)new_used, free_space,
-		    free_list_total_words,
-		    (size_t)(new_space.end - free_point));
-
-	/* If nothing big enough is free, expand the heap. */
-	if (!ms_space_for(amount)) {
-	    if (trace_gc > 1)
-		fprintf(stderr,
-			"; MS-GC: insufficient space after collection, "
-			"falling back to copying GC.\n");
-
-	    {
-		size_t live = (size_t)new_used + amount;
-		size_t want = 3 * live;
-		if (want > original_newspace_size) {
-		    original_newspace_size = want;
-		    e_next_newspace_size = want;
-		}
-	    }
-
-	    gc(false, true, "mark-sweep fallback", amount);
-	}
-	else if (ms_crowded(amount))
-	    gc(false, false, "mark-sweep growth", amount);
-
-	if (trace_gc == 1)
-	    fprintf(stderr, "\n");
-    }
     {
 	double ms = gc_stats_end(&cycle, GC_EV_MARK_SWEEP, reason);
 	if (trace_gc > 1)
@@ -2071,92 +2451,136 @@ ms_collect(bool pre_dump, char *reason, size_t amount)
 }
 
 
-#ifdef THREADS
 /* The GC and FULL-GC instructions: a collection asked for by the
    program.  ms_collect wants the allocator lock, and either runs the
-   cycle or joins the one in progress; calling gc() from here would
-   run the copying collector under another thread's marker. */
+   cycle or, with threads, joins the one in progress; the copying
+   collector is not used (in a threads build it would run under
+   another thread's marker, and in both it would copy the heap). */
 void
 ms_collect_explicit(const char *reason)
 {
+#ifdef THREADS
     while (oak_mutex_trylock(&alloc_lock) != 0) {
 	if (gc_pending)
 	    wait_for_gc();
 	else
 	    oak_thread_yield();
     }
-    ms_collect(false, (char *)reason, 0);
-    oak_mutex_unlock(&alloc_lock);
-}
 #endif
+    ms_collect(false, (char *)reason, 0);
+#ifdef THREADS
+    oak_mutex_unlock(&alloc_lock);
+#endif
+}
 
 
 /* ------------------------------------------------------------------ */
-/*  Initialization                                                     */
+/*  Initialization, and the dump compaction's hooks                    */
 /* ------------------------------------------------------------------ */
 
-void
-ms_init(void)
+/* Everything that referred into the regions: the TLABs, the free
+   lists, the sweep, the born list. */
+static void
+ms_forget_heap(void)
 {
-    size_t heap_words = new_space.size;
-    bitmap_words = (heap_words + 63) / 64;
-
-    objstart_bitmap = (uint64_t *)xmalloc(bitmap_words * sizeof(uint64_t));
-    mark_bitmap = (uint64_t *)xmalloc(bitmap_words * sizeof(uint64_t));
-
-    memset(objstart_bitmap, 0, bitmap_words * sizeof(uint64_t));
-    memset(mark_bitmap, 0, bitmap_words * sizeof(uint64_t));
-
+    for (int i = 0; i < MS_TLAB_COUNT; i++) {
+	tlab_cursor_array[i] = NULL;
+	tlab_end_array[i] = NULL;
+	tlab_base_array[i] = NULL;
+	tlab_bm_array[i] = NULL;
+    }
     for (int i = 0; i < NUM_SIZE_CLASSES; i++)
 	free_list_heads[i] = NULL;
     free_list_total_words = 0;
+    tlab_free_none = true;
+    lazy_sweep_active = false;
+    sweep_region = NULL;
+    sweep_cursor = 0;
+    sweep_run = NULL;
+#ifdef THREADS
+    born_count = 0;
+#endif
+    alloc_region = NULL;
 }
 
 void
 ms_destroy(void)
 {
-    if (objstart_bitmap) { free(objstart_bitmap); objstart_bitmap = NULL; }
-    if (mark_bitmap) { free(mark_bitmap); mark_bitmap = NULL; }
-    bitmap_words = 0;
+    while (ms_regions)
+	ms_region_unmap(ms_regions);
+    ms_forget_heap();
 }
 
 void
-ms_reinit(void)
+ms_init(void)
 {
     ms_destroy();
-    ms_init();
-
-    /* The heap has been replaced, so every thread-local allocation
-       buffer points into the freed one. */
-    for (int i = 0; i < MS_TLAB_COUNT; i++) {
-	tlab_cursor_array[i] = NULL;
-	tlab_end_array[i] = NULL;
-    }
-
-    /* Likewise any sweep that was still in progress. */
-    lazy_sweep_active = false;
-    lazy_sweep_cursor = 0;
-    sweep_limit = NULL;
-
-    /* Apply objstart bits recorded during the copying GC's transport
-       phase.  Without this, objects copied by gc() would have no
-       objstart bits and be invisible to ms_sweep. */
-    for (size_t i = 0; i < deferred_count; i++) {
-	ref_t *p = deferred_objstarts[i];
-	if (p >= new_space.start && p < new_space.end)
-	    OBJSTART_SET(BM_IDX(p));
-    }
-    if (deferred_objstarts) {
-	free(deferred_objstarts);
-	deferred_objstarts = NULL;
-    }
-    deferred_count = 0;
-    deferred_cap = 0;
+    e_next_newspace_size = original_newspace_size;
 }
 
-
-bool
-ms_is_heap_ptr(const ref_t *p)
+void
+ms_evacuate_begin(bool full)
 {
-    return p >= new_space.start && p < new_space.end;
+    size_t need = ms_mapped + (full ? spatic.size : 0), chunks;
+    void *mem;
+
+    if (need == 0)
+	need = 1;
+    chunks = (need + MS_REGION_WORDS - 1) / MS_REGION_WORDS;
+    /* The world is stopped: the TLABs' tails are zeroed, and the
+       copying collector reads objects by their types. */
+    ms_tlab_retire_all();
+    mem = ms_map_aligned(chunks * MS_REGION_BYTES);
+    if (mem == NULL)
+	ms_fatal("cannot map the dump compaction's destination",
+		 chunks * MS_REGION_WORDS);
+#if MS_ADDR_BITS < OAK_WORD_SIZE
+    if ((uintptr_t)mem >> MS_ADDR_BITS)
+	ms_fatal("a region was mapped beyond the address range the"
+		 " lookup table covers", chunks * MS_REGION_WORDS);
+#endif
+    new_space.start = (ref_t *)mem;
+    new_space.size = chunks * MS_REGION_WORDS;
+    new_space.end = new_space.start + new_space.size;
+    free_point = new_space.start;
+    evac_chunks = chunks;
+    deferred_count = 0;
+}
+
+void
+ms_evacuate_end(void)
+{
+    ms_region_t *r;
+    size_t want;
+
+    /* The old regions go; the destination span is the heap, one
+       region, with the objstart bits of what was transported into
+       it. */
+    ms_destroy();
+    r = ms_region_new(new_space.start, evac_chunks);
+    r->top = r->sweep_top = free_point;
+    for (size_t i = 0; i < deferred_count; i++) {
+	ref_t *p = deferred_objstarts[i];
+	if (p >= r->start && p < r->top)
+	    BM_SET(r->objstart, BM_IDX(r, p));
+    }
+    free(deferred_objstarts);
+    deferred_objstarts = NULL;
+    deferred_count = 0;
+    deferred_cap = 0;
+    alloc_region = r;
+
+    /* The budget, from a perfect count of the live data. */
+    want = MS_RECLAIM_FACTOR * (size_t)(r->top - r->start);
+    if (want < original_newspace_size)
+	want = original_newspace_size;
+#ifdef MAX_NEW_SPACE_SIZE
+    if (want > MAX_NEW_SPACE_SIZE)
+	want = MAX_NEW_SPACE_SIZE;
+#endif
+    e_next_newspace_size = want;
+    if (trace_gc > 1)
+	fprintf(stderr, "; MS-GC: the heap is the compacted span: %zu words"
+		" live in %zu mapped, budget %zu.\n",
+		(size_t)(r->top - r->start), ms_mapped, want);
 }

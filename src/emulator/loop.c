@@ -557,7 +557,24 @@ loop(ref_t initial_tos)
 	      if (x & PTR_MASK)
 		{
 		  ref_t *p = (x & 1) ? REF_TO_PTR(x) : LOC_TO_PTR(x);
+#ifdef USE_MARK_SWEEP
+		  /* A heap address counts on from spatic by its
+		     region's slots (gc-ms.h). */
+		  ssize_t d = SPATIC_PTR(p) ? -1 : ms_get_data(p);
 
+		  PEEKVAL() =
+		    INT_TO_REF(
+			       SPATIC_PTR(p) ?
+			       p - spatic.start :
+			       d >= 0 ?
+			       d + (ssize_t)spatic.size :
+			       (	/* This is one weird reference: */
+				printf("GET-DATA of "),
+				printref(stdout, x),
+				printf("\n"),
+				-(ssize_t)p - 1)
+			       );
+#else
 		  PEEKVAL() =
 		    INT_TO_REF(
 			       SPATIC_PTR(p) ?
@@ -570,6 +587,7 @@ loop(ref_t initial_tos)
 				printf("\n"),
 				-(ssize_t)p - 1)
 			       );
+#endif
 		}
 	      else
 		PEEKVAL() = (x & ~TAG_MASKL) | INT_TAG;
@@ -591,12 +609,22 @@ loop(ref_t initial_tos)
 		    TRAP1_IF(i < 0, 2);
 		    if (i < (ssize_t)spatic.size)
 		      z = PTR_TO_LOC(spatic.start + i);
+#ifdef USE_MARK_SWEEP
+		    else
+		      {
+			ref_t *hp = ms_crunch((size_t)(i - (ssize_t)spatic.size));
+
+			TRAP1_IF(hp == NULL, 2);
+			z = PTR_TO_LOC(hp);
+		      }
+#else
 		    else if (i < (ssize_t)(spatic.size + new_space.size))
 		      z = PTR_TO_LOC(new_space.start + (i - spatic.size));
 		    else
 		      {
 			TRAP1(2);
 		      }
+#endif
 		  }
 		else
 		  z = x;
@@ -1058,7 +1086,7 @@ loop(ref_t initial_tos)
 
 	    case 51:		/* GC */
 	      UNLOCALIZE_ALL();
-#if defined(THREADS) && defined(USE_MARK_SWEEP)
+#ifdef USE_MARK_SWEEP
 	      ms_collect_explicit("explicit call");
 #else
 	      gc(false, false, "explicit call", 0);
@@ -1248,7 +1276,9 @@ loop(ref_t initial_tos)
 
 	    case 64:		/* FULL-GC */
 	      UNLOCALIZE_ALL();
-#if defined(THREADS) && defined(USE_MARK_SWEEP)
+#ifdef USE_MARK_SWEEP
+	      /* The mark-sweep collector never merges the heap into
+		 spatic; a full collection is an ordinary cycle. */
 	      ms_collect_explicit("explicit call");
 #else
 	      gc(false, true, "explicit call", 0);
@@ -1385,20 +1415,24 @@ loop(ref_t initial_tos)
 
 		/* Free old heap spaces */
 		free_space(&spatic);
+#ifdef USE_MARK_SWEEP
+		ms_destroy();
+#else
 		free_space(&new_space);
+#endif
 
 		/* Load the new world (allocates new spatic) */
 		read_world(s);
 		free(s);
 
 		/* Allocate new working space */
+#ifdef USE_MARK_SWEEP
+		ms_init();
+#else
 		new_space.size = e_next_newspace_size
 		  = original_newspace_size;
 		alloc_space(&new_space, new_space.size);
 		free_point = new_space.start;
-
-#ifdef USE_MARK_SWEEP
-		ms_reinit();
 #endif
 
 		/* The switches on the command line were meant for the

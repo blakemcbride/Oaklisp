@@ -557,6 +557,8 @@ void free_registers (void *arg)
   ms_tlab_retire(tlab_cursor_array[i], tlab_end_array[i]);
   tlab_cursor_array[i] = NULL;
   tlab_end_array[i] = NULL;
+  tlab_base_array[i] = NULL;
+  tlab_bm_array[i] = NULL;
 #endif
 
   oak_mutex_unlock(&gc_lock);

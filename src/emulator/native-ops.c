@@ -201,10 +201,21 @@ oak_rt_crunch(ref_t ** spp)
 	return false;
       if (i < (ssize_t)spatic.size)
 	z = PTR_TO_LOC(spatic.start + i);
+#ifdef USE_MARK_SWEEP
+      else
+	{
+	  ref_t *hp = ms_crunch((size_t)(i - (ssize_t)spatic.size));
+
+	  if (hp == NULL)
+	    return false;
+	  z = PTR_TO_LOC(hp);
+	}
+#else
       else if (i < (ssize_t)(spatic.size + new_space.size))
 	z = PTR_TO_LOC(new_space.start + (i - spatic.size));
       else
 	return false;
+#endif
     }
   else
     z = x;
@@ -222,13 +233,23 @@ oak_rt_get_data(ref_t * sp)
   if (x & PTR_MASK)
     {
       ref_t *p = (x & 1) ? REF_TO_PTR(x) : LOC_TO_PTR(x);
+#ifdef USE_MARK_SWEEP
+      ssize_t d = SPATIC_PTR(p) ? -1 : ms_get_data(p);
 
+      sp[0] =
+	INT_TO_REF(SPATIC_PTR(p) ? p - spatic.start
+		   : d >= 0 ? d + (ssize_t)spatic.size
+		   : (printf("GET-DATA of "),
+		      printref(stdout, x),
+		      printf("\n"), -(ssize_t)p - 1));
+#else
       sp[0] =
 	INT_TO_REF(SPATIC_PTR(p) ? p - spatic.start
 		   : NEW_PTR(p) ? (p - new_space.start) + spatic.size
 		   : (printf("GET-DATA of "),
 		      printref(stdout, x),
 		      printf("\n"), -(ssize_t)p - 1));
+#endif
     }
   else
     sp[0] = (x & ~TAG_MASKL) | INT_TAG;
@@ -683,7 +704,7 @@ oak_rt_continue(void)
 void
 oak_rt_gc(int full)
 {
-#if defined(THREADS) && defined(USE_MARK_SWEEP)
+#ifdef USE_MARK_SWEEP
   (void)full;
   ms_collect_explicit("explicit call");
 #else
@@ -740,15 +761,20 @@ oak_rt_load_world(ref_t ** spp)
 
   THREADY(oak_mutex_lock(&dump_lock));
   free_space(&spatic);
+#ifdef USE_MARK_SWEEP
+  ms_destroy();
+#else
   free_space(&new_space);
+#endif
   read_world(s);
   free(s);
 
+#ifdef USE_MARK_SWEEP
+  ms_init();
+#else
   new_space.size = e_next_newspace_size = original_newspace_size;
   alloc_space(&new_space, new_space.size);
   free_point = new_space.start;
-#ifdef USE_MARK_SWEEP
-  ms_reinit();
 #endif
   clear_program_args();
 

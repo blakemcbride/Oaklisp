@@ -355,29 +355,38 @@ compilations can run at once in futures), and make-thread starts OS
 threads of its own; see Threads.md.  Unused, the option costs little:
 the mark-sweep collector by itself (a bump allocation into a
 thread-local buffer, a sweep that makes one free entry of each run of
-dead objects, a heap four times the default build's) runs the
-benchmarks at the default build's speed or better, and the thread
+dead objects, a heap of 1 MB regions mapped on demand within a budget
+that starts at four times the default build's) runs the benchmarks
+within a few percent of the default build's speed, and the thread
 support (per-thread registers, the lock-free allocation fast path,
-the guarded sections) costs up to 20% on top.  Measured with "make
+the guarded sections) costs up to 30% on top.  Measured with "make
 bench" on the same world, FAST builds pinned to one core (ratio of CPU
 time to the default build):
 
 	                  -DTHREADS   -DUSE_MARK_SWEEP   both (--enable-threads)
-	tak                  1.15           1.04              1.02
-	fib                  1.10           1.00              1.03
-	bignum               1.18           0.88              0.90
-	sort                 1.10           1.01              1.08
-	cons                 1.30           0.91              0.97
-	strings              1.22           0.98              1.20
-	hash                 1.09           1.00              1.12
-	dispatch             1.06           0.96              0.99
-	eval                 1.17           0.99              1.07
-	format               1.15           0.97              1.13
-	compile              1.22           0.96              1.11
+	tak                  1.15           1.05              1.11
+	fib                  1.10           1.05              1.04
+	bignum               1.18           0.92              1.06
+	sort                 1.10           1.04              1.10
+	cons                 1.30           0.94              0.98
+	strings              1.22           1.18              1.31
+	hash                 1.09           1.01              1.13
+	dispatch             1.06           1.02              1.08
+	eval                 1.17           1.06              1.14
+	format               1.15           1.10              1.07
+	compile              1.22           1.00              1.15
+
+These ratios move with the interpreter's code layout as much as with
+the collector: between the region-heap commit and the one before it,
+the --enable-threads build slowed by 4 to 9% on every benchmark, tak,
+fib and dispatch included, which never allocate, and the same sources
+built with "-falign-labels=16 -falign-jumps=32 -falign-loops=32" ran
+every benchmark at or under the earlier times.  Take the table as
+bounds, not as the cost of any one feature.
 
 With threads in use, "tests/bench.sh -p 4" (four copies of tak, each
 on an OS thread, against the same on one thread, wall clock) runs
-3.7 times faster, in bytecode and natively alike.
+3.9 times faster, in bytecode and natively alike.
 
 Running Oaklisp
 ===============
@@ -448,5 +457,7 @@ Troubleshooting
 
 Out of memory with --size-heap
     The argument is in units of 1024 refs.  On 64-bit, each ref is 8
-    bytes, so --size-heap 4096 means ~32 GB.  The default (~1 MB) is
+    bytes, so --size-heap 4096 means 32 MB.  The default (1 MB; 4 MB
+    with the mark-sweep collector, whose heap is mapped up to the
+    size as needed and grows past it only when the live data does) is
     fine for most use.

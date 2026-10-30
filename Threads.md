@@ -53,7 +53,7 @@ Key files and `#ifdef THREADS` sections:
 | `data.h` | Per-thread register macros, the per-thread alarm clock in `register_set_t`, `ALLOCATE_PROT` (the TLAB fast path), GC buffer arrays |
 | `loop.c` | Opcodes 67-72, `POLL_GC_SIGNALS()`, the method cache's striped seqlock reads, the NATIVE instruction's hand-over |
 | `gc.c` | `FORTHREADS` macro, per-thread root scanning, the stop-the-world handshake |
-| `gc-ms.c`, `gc-ms.h` | Concurrent mark-sweep: TLABs, SATB barrier buffers, the coalescing sweep, the heap growth rule, verify mode |
+| `gc-ms.c`, `gc-ms.h` | Concurrent mark-sweep: the region heap and its lookup table, TLABs, SATB barrier buffers, the coalescing sweep, the budget, verify mode |
 | `oaklisp.c`, `embed-native.c` | The two entry points: thread 0 through `oak_thread0_init`, the thread entry (`loop` or the native call driver) |
 | `stacks.c` | Thread index retrieval in `init_stacks()`, a thread's exit on context underflow |
 | `dispatch.h`, `dispatch.c` | `oak_mcache_read`/`oak_mcache_fill`: the operations' method caches under their striped sequence counts, for the interpreter and native code |
@@ -75,11 +75,15 @@ in the interpreter and `oak_thread_index_var` elsewhere):
 
 Global shared state:
 
-    Heap (new_space, old_space)     Protected by alloc_lock
-    free_point, new_space.end       Modified under alloc_lock
+    The regions (ms_regions, the     Mapped and unmapped under alloc_lock
+      lookup table)                    or with the world stopped; looked
+                                       up without a lock (ms_region_of)
+    A region's top and bitmaps      Modified under alloc_lock; the TLAB
+                                       fast path writes its own bitmap words
     gc_pending, gc_ready[]          GC coordination flags
-    objstart_bitmap, mark_bitmap    GC bitmaps
     free_list_heads[]               Segregated free lists
+    new_space, free_point           The dump compaction's destination
+                                       (gc.c), with the world stopped
 
 GC coordination: one thread sets `gc_pending`, all others reach a
 safepoint (the interpreter polls every instruction, native code at
@@ -90,7 +94,8 @@ snapshotted at the start of a collection, so a thread created during
 it is never read half-initialized, and a thread that has exited is
 skipped.  The mark phase runs concurrently with two brief pauses
 (initial mark and remark); the sweep is lazy, during allocation; the
-copying collector runs only to grow the heap (see GC.md).
+heap grows and shrinks by mapping and unmapping regions, and the
+copying collector runs only to compact it for a dump (see GC.md).
 
 Thread-related opcodes:
 
@@ -222,8 +227,10 @@ Thread Safety
 **C emulator:**
 
 - `signal_poll_flag` -- `volatile sig_atomic_t`, delivered by thread 0
-- `alloc_lock` -- the allocation slow path, `free_point`,
-  `new_space.end`, STORE-REG of `free-ptr` and `cons-limit`
+- `alloc_lock` -- the allocation slow path, the regions' tops, list
+  and lookup table, mapping and unmapping; STORE-REG of `free-ptr`
+  and `cons-limit` (the copying collector's bump pointer and limit,
+  meaningless with mark-sweep)
 - `gc_lock` -- held for the length of a collection; `wait_for_gc`,
   parking and the blocking-call brackets leave their parked state
   under it, so a stop-the-world that counted a thread stays stopped
@@ -278,16 +285,18 @@ Performance
 
 - **TLABs** (under `USE_MARK_SWEEP + THREADS`): Most allocations use
   a per-thread bump pointer with no lock.  Only TLAB refill and large
-  allocations acquire `alloc_lock`; a TLAB comes out of the bump
-  region or out of a big free-list entry (the sweep makes one entry
-  of each run of dead objects), so a heap of short-lived objects is
-  allocated from without the lock in steady state too.
+  allocations acquire `alloc_lock`; a TLAB comes out of a big
+  free-list entry (the sweep makes one entry of each run of dead
+  objects) or a region's virgin tail, so a heap of short-lived objects
+  is allocated from without the lock in steady state too.
 - **Concurrent GC** (under `USE_MARK_SWEEP + THREADS`): The mark phase
   runs mostly concurrently (only two brief STW pauses for initial mark
-  and remark), and sweep runs lazily during allocation.  The copying GC
-  fallback remains STW but is only triggered for heap expansion, which
-  follows the copying collector's rule (live data over a third of the
-  heap) and starts from a heap four times the default build's.
+  and remark), and sweep runs lazily during allocation.  The heap is
+  a set of 1 MB regions mapped on demand within a budget (three times
+  the live data, never below the configured size, which starts at
+  four times the default build's) and unmapped when they sweep empty;
+  there is no copying fallback, and the copying collector runs only
+  to compact the heap for a dump.
 - **Guards**: a guarded section (`%guard`, `with-mutex`) costs the
   mutex's compare-and-swap (`%test-and-set-locative` is one CAS
   instruction with threads) and a winding pushed through one method
@@ -409,7 +418,9 @@ Not required for the current thread support:
   that incremental
 - **Locks per stream**: `print` to a shared stream from several
   threads without interleaving (only `format` is atomic per call)
-- **No allocation stalls during marking** and **no copying fallback**:
-  GCEnhancements.md
+- **No allocation stalls during marking**: GCEnhancements.md (the
+  copying fallback is gone, its Phase 2; a thread out of memory
+  during a cycle maps a region within the budget and parks only
+  beyond it)
 - **Parallel marking**: Multiple GC worker threads share the mark
   stack, reducing mark phase latency on multi-core systems

@@ -31,10 +31,22 @@ print_pc(instr_t *e_progc)
   if (SPATIC_PTR((ref_t *) e_progc))
     fprintf(stdout, "%7ld[spatic] ",
 	    (long)((char *)e_progc - (char *)spatic.start));
+#ifdef USE_MARK_SWEEP
+  else
+    {
+      /* As GET-DATA counts a heap address, in bytes. */
+      ref_t *w = (ref_t *) ((uintptr_t) e_progc & ~(uintptr_t) (sizeof(ref_t) - 1));
+
+      fprintf(stdout, "%7ld[region] ",
+	      (long)(sizeof(ref_t) * (ms_get_data(w) + (ssize_t)spatic.size)
+		     + ((uintptr_t) e_progc & (sizeof(ref_t) - 1))));
+    }
+#else
   else
     fprintf(stdout, "%7ld[new   ] ",
 	    (long)((char *)e_progc - (char *)new_space.start
 		   + sizeof(ref_t) * spatic.size));
+#endif
 }
 
 /* ARG_FIELD runs to 255 and OP_FIELD to 63, but the tables generated

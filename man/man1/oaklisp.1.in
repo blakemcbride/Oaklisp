@@ -67,7 +67,9 @@ synonym for \-\-dump
 .BR
 .TP
 .B \-\-size-heap n
-n is in kilo-refs, default 128
+n is in kilo-refs, default 128 (512 with the mark-sweep collector,
+whose heap is mapped up to n as needed and grows past it only when
+the live data does)
 .TP
 .B \-\-size-val-stk n
 value stack buffer, n is in refs

@@ -61,11 +61,12 @@ typedef struct {
 extern space_t new_space, old_space, spatic;
 extern ref_t *free_point;
 
-/* Size of first newspace, in K words.  The mark-sweep heap is one
-   region that grows only by a copying collection (gc-ms.c,
-   ms_crowded), and every cycle scans spatic and the roots and marks
-   the live data, so it starts four times bigger: the same program
-   then cycles a quarter as often. */
+/* Size of first newspace, in K words.  For the mark-sweep collector
+   it is the heap's budget (gc-ms.c): regions are mapped as needed up
+   to it, and it is set after every cycle to three times the live
+   data, never below this.  Every cycle scans spatic and the roots and
+   marks the live data, so it starts four times bigger: the same
+   program then cycles a quarter as often. */
 #ifdef USE_MARK_SWEEP
 #define DEFAULT_NEWSPACE 512
 #else
@@ -398,7 +399,14 @@ if ((highcrap != 0x0) && (highcrap != 0x7)) {code;} }
 #define SPACE_PTR(s,p)	((s).start<=(p) && (p)<(s).end)
 #define NEW_PTR(r)      SPACE_PTR(new_space,(r))
 #define SPATIC_PTR(r)	SPACE_PTR(spatic,(r))
+/* With the mark-sweep collector the copying collector runs only to
+   compact the heap for a dump, and old space is then every region
+   (gc-ms.h); new_space is its destination either way. */
+#ifdef USE_MARK_SWEEP
+#define OLD_PTR(r) (ms_old_ptr(r)||(full_gc&&SPACE_PTR(spatic,(r))))
+#else
 #define OLD_PTR(r) (SPACE_PTR(old_space,(r))||(full_gc&&SPACE_PTR(spatic,(r))))
+#endif
 
 
 
@@ -478,7 +486,7 @@ extern void ms_verify_log_alloc(ref_t *p, int path, size_t words);
     /* TLAB fast path — no lock needed. */				\
     (p) = tlab_cursor_array[_tlab_idx];					\
     tlab_cursor_array[_tlab_idx] += (words);				\
-    MS_TLAB_OBJSTART(p);						\
+    MS_TLAB_OBJSTART(_tlab_idx, p);					\
     VERIFY_LOG_ALLOC((p), 1, (words))					\
   } else {								\
     before;								\

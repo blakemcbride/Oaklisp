@@ -138,11 +138,19 @@ printref(FILE * fd, ref_t refin)
 	  i = p - new_space.start + spatic.size;
 	  suffix = 'n';
 	}
+#ifdef USE_MARK_SWEEP
+      else if (ms_region_of(p))
+	{
+	  i = ms_get_data(p) + spatic.size;
+	  suffix = 'r';
+	}
+#else
       else if (OLD_PTR(p))
 	{
 	  i = p - old_space.start + spatic.size;
 	  suffix = 'o';
 	}
+#endif
       else
 	i = (long)p >> 2;
 
@@ -478,43 +486,32 @@ gc(bool pre_dump, bool full_gc, char *reason, size_t amount)
   int *my_index_p;
   gc_timer_t handshake;
 
-#ifdef USE_MARK_SWEEP
-  /* When called from ms_collect during a concurrent GC cycle,
-     threads are already parked — skip our own synchronization. */
-  if (gc_concurrent_in_progress) {
-    my_index_p = oak_tls_get(index_key);
-    my_index = *my_index_p;
-    gc_thread_count = next_index;
-    gc_stats_begin(&pause, GC_EV_COPY);
-  } else {
-#endif
-    my_index_p = oak_tls_get(index_key);
-    my_index = *my_index_p;
-    gc_ready[my_index] = 1;
-    set_gc_flag (true);
-    gc_stats_begin(&pause, GC_EV_COPY);
-    gc_stats_begin(&handshake, GC_EV_HANDSHAKE);
-    /* Snapshot next_index so thread creation during GC cannot cause
-       us to read uninitialized gc_ready[] slots. */
-    gc_thread_count = next_index;
+  /* With the mark-sweep collector this runs only for a dump, never
+     inside a cycle, so the handshake is always its own. */
+  my_index_p = oak_tls_get(index_key);
+  my_index = *my_index_p;
+  gc_ready[my_index] = 1;
+  set_gc_flag (true);
+  gc_stats_begin(&pause, GC_EV_COPY);
+  gc_stats_begin(&handshake, GC_EV_HANDSHAKE);
+  /* Snapshot next_index so thread creation during GC cannot cause
+     us to read uninitialized gc_ready[] slots. */
+  gc_thread_count = next_index;
 
-    /* The flags are written by the other threads, so read them as
-       volatile: nothing in this loop would make the compiler reload
-       them. */
-    while (ready == false) {
-      ready = true;
-      for (i = 0; i < gc_thread_count; i++) {
-	if (((volatile int *)gc_ready)[i] == 0 && !gc_thread_dead[i]) {
-	    ready = false;
-	    oak_thread_yield();
-	    break;
-	}
+  /* The flags are written by the other threads, so read them as
+     volatile: nothing in this loop would make the compiler reload
+     them. */
+  while (ready == false) {
+    ready = true;
+    for (i = 0; i < gc_thread_count; i++) {
+      if (((volatile int *)gc_ready)[i] == 0 && !gc_thread_dead[i]) {
+	  ready = false;
+	  oak_thread_yield();
+	  break;
       }
     }
-    gc_stats_end(&handshake, GC_EV_HANDSHAKE, reason);
-#ifdef USE_MARK_SWEEP
   }
-#endif
+  gc_stats_end(&handshake, GC_EV_HANDSHAKE, reason);
 #else
   gc_stats_begin(&pause, GC_EV_COPY);
 #endif
@@ -522,7 +519,9 @@ gc(bool pre_dump, bool full_gc, char *reason, size_t amount)
   /* The full_gc flag is also a global to avoid ugly parameter passing. */
   set_external_full_gc(full_gc);
 
+#ifndef USE_MARK_SWEEP
 gc_top:
+#endif
   if (trace_gc == 1)
     fprintf(stderr, "\n;GC");
   if (trace_gc > 1)
@@ -540,6 +539,17 @@ gc_top:
   if (trace_gc > 1)
     fprintf(stderr, "; Flipping...");
 
+#ifdef USE_MARK_SWEEP
+  /* The dump compaction: the regions are old space, the destination
+     one contiguous span big enough for all of them (gc-ms.c). */
+  old_taken = ms_allocated_words();
+  old_spatic_taken = spatic.size;
+
+  if (trace_gc > 2)
+    fprintf(stderr, "old taken: %ld", old_taken);
+
+  ms_evacuate_begin(full_gc);
+#else
   old_taken = free_point - new_space.start;
   old_spatic_taken = spatic.size;
   old_space = new_space;
@@ -554,6 +564,7 @@ gc_top:
 
   alloc_space(&new_space, new_space.size);
   free_point = new_space.start;
+#endif
 
 
   transport_count = 0;
@@ -750,8 +761,12 @@ gc_top:
   /* Hopefully there are no more references into old space.  This holds
      for a pre-dump collection too: everything reachable from e_nil and
      e_boot_code has been transported, and the stacks are deliberately
-     discarded, so old space can be released either way. */
+     discarded, so old space can be released either way.  (With the
+     mark-sweep collector the old regions go in ms_evacuate_end,
+     below.) */
+#ifndef USE_MARK_SWEEP
   free_space(&old_space);
+#endif
 
   if (!pre_dump && full_gc)
     free_space(&spatic);
@@ -800,7 +815,10 @@ gc_top:
 		new_taken, reclaimed, percent_reclaimed);
       }
 
-    /* Make the next new space bigger if the current was too small. */
+#ifndef USE_MARK_SWEEP
+    /* Make the next new space bigger if the current was too small.
+       (The mark-sweep collector sets its budget in ms_evacuate_end,
+       and never merges new space into spatic.) */
     if (!full_gc && !pre_dump
 	&& (RECLAIM_FACTOR * new_taken + amount > new_space.size))
       {
@@ -877,6 +895,7 @@ gc_top:
 	alloc_space(&new_space, new_space.size);
 	free_point = new_space.start;
       }
+#endif /* !USE_MARK_SWEEP */
 
     if (trace_gc == 1)
       fprintf(stderr, "\n");
@@ -889,24 +908,17 @@ gc_top:
   oak_native_flush_sites();
 
 #ifdef USE_MARK_SWEEP
-  /* The mark-sweep bitmaps, free lists and TLABs still describe the
-     space just evacuated.  Rebuild them before the other threads are
-     released: they would otherwise allocate from TLABs in it and set
-     bits in bitmaps about to be freed. */
-  ms_reinit();
+  /* The regions just evacuated go, and the span is the heap, before
+     the other threads are released: they would otherwise allocate
+     from TLABs in the old regions. */
+  ms_evacuate_end();
 #endif
 
 #ifdef THREADS
-#ifdef USE_MARK_SWEEP
-    if (!gc_concurrent_in_progress) {
-#endif
-      my_index_p = oak_tls_get(index_key);
-      my_index = *my_index_p;
-      gc_ready[my_index] = 0;
-      set_gc_flag (false);
-#ifdef USE_MARK_SWEEP
-    }
-#endif
+  my_index_p = oak_tls_get(index_key);
+  my_index = *my_index_p;
+  gc_ready[my_index] = 0;
+  set_gc_flag (false);
 #endif
   {
     double ms = gc_stats_end(&pause, GC_EV_COPY, reason);
