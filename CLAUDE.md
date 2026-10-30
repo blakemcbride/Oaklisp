@@ -388,9 +388,14 @@ runtime: `make -C src/world native-world` first.
   vector, shared in the .oa by the assembler's block memoization),
   cross-file and into the runtime in executables (extern functions,
   guarded by operation pins a generated link-time prelude binds), and
-  type-proven generic calls through `%method-for`/`%bp-offset-for`
-  (closed world assumed for those).  Redefinition misses the guards
-  and falls back.  Small single-definition never-assigned functions
+  type-proven generic calls through `%native-method-for` (the method
+  only while it is still the compiled one) and `%bp-offset-for`
+  (closed world assumed for those).  `(nth v i)` and `(set! (nth v i)
+  x)` get an inline fast path for simple vectors.  Pins that depend
+  only on world bindings the program never defines, assigns or passes
+  around go in an early prelude baked before the program, so its
+  top-level code takes the guards; the rest in the prelude baked
+  after it.  Redefinition misses the guards and falls back.  Small single-definition never-assigned functions
   inline across files (their bodies travel in the `.ois`); the
   abstract-stack inference drops tag checks on proven operands,
   cross-file via the summaries' result types, and fuses a comparison

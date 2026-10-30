@@ -114,8 +114,15 @@ oak -- --load "$testdir/wp-a" --load "$testdir/wp-b" --exit 2>&1 \
   | grep -E '^(PASS|FAIL)' > wp.want
 grep -q '^FAIL' wp.want && fail "the emulator itself fails the wp programs"
 grep -cq '^PASS' wp.want || fail "no PASS lines from the wp programs"
+# The single-file programs too: their top-level code takes the guards
+# the early prelude binds before it runs.
+for p in arith bignum control data objects promises; do
+  check_exe $p.oak -w $p.oak
+done
 "$OAKC" -w wp-a.oak wp-b.oak -o wp-x >oakc.log 2>&1 \
   || { cat oakc.log; fail "oakc -w failed"; }
+grep -q 'link-time prelude' oakc.log \
+  || { cat oakc.log; fail "oakc -w compiled no link-time prelude"; }
 nm wp-x | grep -qE ' T loop$' && fail "wp-x links the interpreter"
 OAKWORLD=/nonexistent ./wp-x > wp-x.got.raw 2>&1 \
   || { head wp-x.got.raw; fail "wp-x exited nonzero"; }
@@ -137,6 +144,22 @@ echo "ok wp-ir-x ($(grep -c '^PASS' wp-ir-x.got) checks, whole program, lowered)
 out=$(OAKWORLD=/nonexistent ./tak-w-x) || fail "tak-w-x exited nonzero"
 test "$out" = 9 || fail "tak-w-x printed '$out', wanted 9"
 echo "ok tak-w-x (whole program)"
+
+# A program's own top-level ADD-METHOD on a world operation, for a type
+# whose calls resolve statically, is what runs, not the world's method:
+# in the program's top-level code, between the two preludes, and once
+# the late one has pinned the cells (the --eval runs after it).
+cat > wp-redef.oak <<'EOF'
+(add-method (upcase (string) self) 'mine)
+(define (f) (upcase "abc"))
+(print (f) standard-output)
+EOF
+"$OAKC" -w wp-redef.oak --eval '(print (f) standard-output)' \
+  -o wp-redef-x >oakc.log 2>&1 \
+  || { cat oakc.log; fail "oakc -w failed for wp-redef-x"; }
+out=$(OAKWORLD=/nonexistent ./wp-redef-x) || fail "wp-redef-x exited nonzero"
+test "$out" = MINEMINE || fail "wp-redef-x printed '$out', wanted MINEMINE"
+echo "ok wp-redef-x (whole program, method redefined)"
 
 # With threads: the thread API program (less its loads of the
 # examples) as straight C, its OS threads running the native call

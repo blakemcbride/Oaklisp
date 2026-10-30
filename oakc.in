@@ -159,11 +159,21 @@ if test $wp = yes; then
     compile_one "$stem" "$base" "(#*native-whole-program? #t) (#*native-force-prefix \"$prefix\") (#*native-summaries (native-read-summaries (list $sumlist)))"
   done
   cat "$work"/*.needs > "$work/prelude.oak" 2>/dev/null
-  if grep -q '^(define' "$work/prelude.oak"; then
+  if grep -qi '^(define' "$work/prelude.oak"; then
     echo "oakc: compiling the link-time prelude"
     compile_one "$work/prelude" "prelude" ""
     bases="$bases prelude:$work/prelude"
     sources="$sources $work/prelude.oak"
+  fi
+  # The early prelude binds the cells that depend only on world
+  # bindings the program leaves alone, before the program, so its own
+  # top-level code takes the guards too.
+  cat "$work"/*.early-needs > "$work/early-prelude.oak" 2>/dev/null
+  if grep -qi '^(define' "$work/early-prelude.oak"; then
+    echo "oakc: compiling the early link-time prelude"
+    compile_one "$work/early-prelude" "early-prelude" ""
+    bases="$bases early-prelude:$work/early-prelude"
+    sources="$work/early-prelude.oak $sources"
   fi
 fi
 

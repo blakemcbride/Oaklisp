@@ -128,11 +128,21 @@
 ;;;   reassignment just misses the guard.
 ;;; - A call to a generic operation with exactly one method, on a
 ;;;   concrete type, neither extended nor escaped anywhere in the
-;;;   program, becomes a guarded call: argument-type check against the
-;;;   prelude-bound type (%oakc-t-N), then a direct jump to the method
-;;;   (%oakc-m-N) with its bp offset (%oakc-o-N).  This one assumes
-;;;   the closed world --whole-program declares: no new methods at run
-;;;   time for those operations.
+;;;   program, becomes a guarded call: the first argument's type proven,
+;;;   a direct jump to the method (%oakc-m-N) with its bp offset
+;;;   (%oakc-o-N).  The prelude binds the method only while it is still
+;;;   the one compiled against (%NATIVE-METHOD-FOR), so a program's own
+;;;   top-level ADD-METHOD for the type misses the guard.  This one
+;;;   assumes the closed world --whole-program declares: no new methods
+;;;   at run time for those operations.
+;;; - (NTH V I) and (SET! (NTH V I) X) get an inline fast path for a
+;;;   simple vector (NATIVE-VECTOR-FAST).
+;;;
+;;; There are two preludes.  Cells that depend only on world bindings
+;;; the program neither defines, assigns nor passes around -- in its
+;;; functions or its top level -- are bound by the early prelude, baked
+;;; before the program, so the program's top-level code takes the
+;;; guards too; the rest by the prelude baked after it.
 
 (set! #*native-whole-program? #f)
 
@@ -184,6 +194,7 @@
 (define native-defines '())		; ((sym arity original-block) ...)
 (define native-assigns '())
 (define native-escaped-globals '())
+(define native-top-escaped-globals '())	; escapes in top-level code
 (define native-block-rtypes '())	; ((index . type-token) ...)
 (define native-extern-names '())
 (define native-prelude-needs '())
@@ -196,6 +207,7 @@
 (define native-fuse-count 0)
 (define native-inline-count 0)
 (define native-inline-label-count 0)
+(define native-vector-count 0)
 
 ;;; Cross-file inlining (whole-program mode): a small, self-contained
 ;;; function body -- stack operations, arithmetic, non-tail calls, its
@@ -416,11 +428,25 @@
 	  ((memq g (native-summary-field (cdr (car l)) 'escapes)) #t)
 	  (else (aux (cdr l))))))
 
+(define (native-globally-top-escaped? g)
+  (iterate aux ((l #*native-summaries))
+    (cond ((null? l) #f)
+	  ((memq g (native-summary-field (cdr (car l)) 'top-escapes)) #t)
+	  (else (aux (cdr l))))))
+
 ;;; A prelude cell: KIND is v (the operation a global holds at link
 ;;; time), m (a method), t (a type's value) or o (a bp offset); FORM
 ;;; is what the prelude binds it to.  Returns the new cell's name.
+;;;
+;;; EARLY? says FORM depends only on world bindings the program never
+;;; defines, assigns or passes around, in its functions or its top
+;;; level: the early prelude, baked before the program, binds those, so
+;;; the program's own top-level code takes the guards too.  The others
+;;; wait for the prelude baked after the program.  A form asked for
+;;; both ways stays late.  A site asks for all its cells one way, so a
+;;; guard never finds its operation cell bound and a method cell not.
 
-(define (native-prelude-cell kind form)
+(define (native-prelude-cell kind form early?)
   (iterate aux ((l native-prelude-needs))
     (cond ((null? l)
 	   (let ((sym (intern (format #f "%OAKC-~A-~A-~D"
@@ -428,25 +454,12 @@
 					native-prelude-count))))
 	     (set! native-prelude-count (+ native-prelude-count 1))
 	     (set! native-prelude-needs
-		   (cons (list sym form) native-prelude-needs))
+		   (cons (list sym form early?) native-prelude-needs))
 	     sym))
 	  ((equal? (cadr (car l)) form)	; one cell per pinned form
+	   (unless early? (set! (caddr (car l)) #f))
 	   (car (car l)))
 	  (else (aux (cdr l))))))
-
-;;; The native C function name recorded in the stub code vector CV, a
-;;; string, or #f when CV is not a native stub.  The name lives 5
-;;; words from the end (oak-native.h); %VREF indexes past the 2-word
-;;; header.
-
-(define (native-stub-name cv)
-  (let ((size ((%slot 1) cv)))		; total words; %VREF 0 is word 3
-    (and (fixnum? size)
-	 (> size 8)
-	 (let ((op (quotient (bit-and (nth cv 0) 255) 4)))
-	   (and (<= 35 op) (<= op 42)
-		(let ((name (%vref cv (- size 8))))
-		  (and (string? name) name)))))))
 
 ;;; The value the global G will have at link time: the contents of its
 ;;; cell in the compile locale, or a marker when unbound.
@@ -513,7 +526,7 @@
 		  (and prefix (fixnum? index) (not (< index 0))
 		       (list 'cross-pinned
 			     (format #f "~A_~D" prefix index)
-			     (native-prelude-cell 'v g)
+			     (native-prelude-cell 'v g #f)
 			     rtype)))))))))
 
 ;;; G as a world binding.  A lambda operation's native method is
@@ -532,7 +545,7 @@
 	       (let ((name (native-method-c-name m)))
 		 (and name
 		      (list 'cross-pinned name
-			    (native-prelude-cell 'v g) 'unknown)))
+			    (native-prelude-cell 'v g #t) 'unknown)))
 	       (let ((type-name (cdr (or (assq arg-token
 					       native-token-type-names)
 					 '(#f . #f)))))
@@ -544,18 +557,91 @@
 			     (name (and hit
 					(native-method-c-name (car hit)))))
 			(and name
-			     (list 'guarded name
-				   (native-prelude-cell 'v g)
-				   (native-prelude-cell
-				    'm (list '%method-for g type-name))
-				   (native-prelude-cell
-				    'o (list '%bp-offset-for g type-name))
-				   'unknown))))))))))
+			     ;; All of a site's cells are early or all
+			     ;; late: an early operation cell with its
+			     ;; method's still unbound would pass the guard.
+			     (let ((early?
+				    (not (or (native-globally-top-escaped? g)
+					     (native-program-defines? type-name)
+					     (native-globally-assigned?
+					      type-name)))))
+			       (list 'guarded name
+				     (native-prelude-cell 'v g early?)
+				     (native-prelude-cell
+				      'm (list '%native-method-for g type-name
+					       name)
+				      early?)
+				     (native-prelude-cell
+				      'o (list '%bp-offset-for g type-name)
+				      early?)
+				     'unknown)))))))))))
 
 (define (native-method-c-name m)
   (let* ((cv (%get-an-ivar %method m 'the-code))
-	 (name (native-stub-name cv)))
+	 (name (%native-stub-name cv)))
     (and name (#^string name))))
+
+;;; Vector access in whole-program builds.  A call (NTH V I), or the
+;;; call of (SETTER NTH) that (SET! (NTH V I) X) makes, gets an inline
+;;; fast path for a simple vector.  Its guard checks the operation on
+;;; the stack against the link-time one, that the methods NTH and %VREF
+;;; (or their setters) have for SIMPLE-VECTOR are still the compiled
+;;; ones (%NATIVE-METHOD-FOR, at link time), that V is exactly a simple
+;;; vector, and that I is a fixnum in bounds; then the element is read
+;;; or stored where %VREF's method would, through the bp offset it
+;;; gets.  Anything else -- another sequence, a bad index, a
+;;; redefinition -- takes the call, which does what it always did.
+;;; KIND is REF or SET; the answer is the prelude cells (OP M1 M2 TYPE
+;;; OFFSET), or #f.
+
+(define (native-program-defines? g)
+  (or (assq g native-defines)
+      (iterate aux ((l #*native-summaries))
+	(cond ((null? l) #f)
+	      ((assq g (native-summary-field (cdr (car l)) 'defines)) #t)
+	      (else (aux (cdr l)))))))
+
+;;; The type itself may be passed around: a method for it can only be
+;;; added through the operation, which must not escape.
+
+(define (native-vector-fast kind)
+  (and #*native-whole-program?
+       (every? (lambda (g)
+		 (not (or (native-program-defines? g)
+			  (native-globally-assigned? g))))
+	       '(nth %vref simple-vector))
+       (not (native-globally-escaped? 'nth))
+       (not (native-globally-escaped? '%vref))
+       (let ((sv (native-global-value 'simple-vector))
+	     (nth-op (native-global-value 'nth))
+	     (vref-op (native-global-value '%vref)))
+	 (and (is-a? sv type)
+	      (procedure? nth-op)
+	      (procedure? vref-op)
+	      (let* ((set? (eq? kind 'set))
+		     (op1 (if set? (setter nth-op) nth-op))
+		     (op2 (if set? (setter vref-op) vref-op))
+		     (h1 (%find-method-entry sv op1))
+		     (h2 (%find-method-entry sv op2))
+		     (n1 (and h1 (native-method-c-name (car h1))))
+		     (n2 (and h2 (native-method-c-name (car h2))))
+		     (f1 (if set? '(setter nth) 'nth))
+		     (f2 (if set? '(setter %vref) '%vref)))
+		(and n1 n2
+		     (let ((early? (not (or (native-globally-top-escaped? 'nth)
+					    (native-globally-top-escaped?
+					     '%vref)))))
+		       (list (native-prelude-cell 'v f1 early?)
+			     (native-prelude-cell
+			      'm (list '%native-method-for f1 'simple-vector n1)
+			      early?)
+			     (native-prelude-cell
+			      'm (list '%native-method-for f2 'simple-vector n2)
+			      early?)
+			     (native-prelude-cell 't 'simple-vector early?)
+			     (native-prelude-cell
+			      'o (list '%bp-offset-for f2 'simple-vector)
+			      early?)))))))))
 
 ;;; Scan the original file block, before translation, for the facts
 ;;; the summaries and the direct calls need: (LOAD-CODE B)(MAKE-LAMBDA)
@@ -572,7 +658,29 @@
   (set! native-defines '())
   (set! native-assigns '())
   (set! native-escaped-globals '())
-  (labels (((arity-of b)
+  (set! native-top-escaped-globals '())
+  (labels (((setter-called? r)
+	    ;; R follows a LOAD-GLO-CON of G: (SETTER G) is called and
+	    ;; its answer used at once as the operation of the next call,
+	    ;; as (SET! (G ...) X) compiles.  G's value only reaches
+	    ;; SETTER, so G does not escape.
+	    (and (pair? r)
+		 (eq? (car (car r)) 'load-glo-con)
+		 (eq? (cadr (car r)) 'setter)
+		 (pair? (cdr r))
+		 (equal? (cadr r) '(store-nargs 1))
+		 (pair? (cddr r))
+		 (eq? (car (caddr r)) 'funcall-cxt)
+		 (let* ((r3 (cdddr r))
+			(r3 (if (and (pair? r3) (eq? (car (car r3)) 'blt-stk))
+				(cdr r3)
+				r3)))
+		   (and (pair? r3)
+			(eq? (car (car r3)) 'store-nargs)
+			(pair? (cdr r3))
+			(memq (car (cadr r3))
+			      '(funcall-cxt funcall-cxt-br funcall-tail))))))
+	   ((arity-of b)
 	    (destructure* ('code ivars2 instrs2) b
 	      ivars2
 	      (if (and (pair? instrs2)
@@ -619,13 +727,16 @@
 					   (eq? (car (car r)) 'store-nargs))
 				      (cdr r)
 				      r)))
-			 (unless (or top?
-				     (and (pair? r2)
+			 (unless (or (and (pair? r2)
 					  (memq (car (car r2))
 						'(funcall-cxt funcall-cxt-br
-						    funcall-tail))))
-			   (set! native-escaped-globals
-				 (cons (cadr i) native-escaped-globals))))
+						    funcall-tail)))
+				     (setter-called? r))
+			   (if top?
+			       (set! native-top-escaped-globals
+				     (cons (cadr i) native-top-escaped-globals))
+			       (set! native-escaped-globals
+				     (cons (cadr i) native-escaped-globals)))))
 		       (loop (cdr l)))
 		      (else (loop (cdr l))))))))))
     (walk block #t)))
@@ -726,10 +837,41 @@
 			     (co (constant-index 'load-glo ocell)))
 			 (emit "x = sp[0];")
 			 (emit (format #f "if (x == *LOC_TO_PTR(ON_CONST(C~D))" cv))
+			 (emit (format #f "    && (y = *LOC_TO_PTR(ON_CONST(C~D)), TAG_IS(y, PTR_TAG))" cm))
 			 (emit "    && sp - value_stack.bp >= 1 && !ON_PENDING())")
-			 (emit (format #f "  { y = *LOC_TO_PTR(ON_CONST(C~D));" cm))
-			 (emit (format #f "    e_bp = REF_TO_PTR(sp[-1]) + REF_TO_INT(*LOC_TO_PTR(ON_CONST(C~D)));" co))
+			 (emit (format #f "  { e_bp = REF_TO_PTR(sp[-1]) + REF_TO_INT(*LOC_TO_PTR(ON_CONST(C~D)));" co))
 			 (emit (format #f "    ON_DIRECT_JUMP(y, ON_DC_FN_~D); }" serial))))))))
+
+	       ;; The inline fast path of a vector access (see
+	       ;; NATIVE-VECTOR-FAST), before the call it can replace;
+	       ;; DONE is the C that continues after the call.  The
+	       ;; operation is on top, the vector and the index under it,
+	       ;; and for a store the value under those, which is what
+	       ;; the store answers.
+	       ((vector-fast cells set? done)
+		(destructure* (vop m1 m2 typ off) cells
+		  (let ((cv (constant-index 'load-glo vop))
+			(c1 (constant-index 'load-glo m1))
+			(c2 (constant-index 'load-glo m2))
+			(ct (constant-index 'load-glo typ))
+			(co (constant-index 'load-glo off)))
+		    (set! native-vector-count (+ native-vector-count 1))
+		    (emit (if set? "ON_NEED(3);" "ON_NEED(2);"))
+		    (emit "x = sp[0];")
+		    (emit (format #f "if (x == *LOC_TO_PTR(ON_CONST(C~D))" cv))
+		    (emit (format #f "    && TAG_IS(*LOC_TO_PTR(ON_CONST(C~D)), PTR_TAG)" c1))
+		    (emit (format #f "    && TAG_IS(*LOC_TO_PTR(ON_CONST(C~D)), PTR_TAG)" c2))
+		    (emit "    && (y = sp[-1], TAG_IS(y, PTR_TAG))")
+		    (emit (format #f "    && REF_SLOT(y, 0) == *LOC_TO_PTR(ON_CONST(C~D))" ct))
+		    (emit "    && TAG_IS(sp[-2], INT_TAG) && (a = REF_TO_INT(sp[-2])) >= 0")
+		    (emit "    && a < REF_TO_INT(REF_SLOT(y, 1)) - REF_TO_INT(REF_SLOT(REF_SLOT(y, 0), 1)))")
+		    (if set?
+			(block
+			  (emit (format #f "  { ON_STORE(REF_TO_PTR(y) + REF_TO_INT(*LOC_TO_PTR(ON_CONST(C~D))) + a, sp[-3]);" co))
+			  (emit (format #f "    sp -= 3; ~A }" done)))
+			(block
+			  (emit (format #f "  { sp[-2] = REF_TO_PTR(y)[REF_TO_INT(*LOC_TO_PTR(ON_CONST(C~D))) + a];" co))
+			  (emit (format #f "    sp -= 2; ~A }" done)))))))
 
 	       ;; The C-locals lowering's bookkeeping (#*native-ir?).
 	       ;; The top (TEMPS) logical stack cells live in C locals,
@@ -1045,7 +1187,22 @@
 			       glo-sym nargs-now
 			       (native-astack-ref astack 1))))
 		 (direct? (and callsite? glo-sym (not excluded?)))
-		 (rtype (cond ((not target) 'unknown)
+		 ;; A vector access with an inline fast path: (NTH V I),
+		 ;; or the call of what (SETTER NTH) answered.
+		 (vkind (and callsite? (not excluded?) (not target)
+			     (cond ((and (eq? glo-sym 'nth) (eqv? nargs-now 2))
+				    'ref)
+				   ((and (equal? top0 '(setter-of . nth))
+					 (eqv? nargs-now 3))
+				    'set)
+				   (else #f))))
+		 (vfast (and vkind (native-vector-fast vkind)))
+		 (rtype (cond ((and callsite? #*native-whole-program?
+				    (eq? glo-sym 'setter) (eqv? nargs-now 1)
+				    (equal? (native-astack-ref astack 1)
+					    '(glo . nth)))
+			       '(setter-of . nth))
+			      ((not target) 'unknown)
 			      ((eq? (car target) 'same) (caddr target))
 			      ((eq? (car target) 'cross-pinned)
 			       (nth target 3))
@@ -1234,18 +1391,25 @@
 	       (emit (format #f "e_nargs = ~D;" (cadr instr))))
 	      ((funcall-cxt)
 	       (let ((k (new-resume)))
+		 (when vfast
+		   (vector-fast vfast (eq? vkind 'set) (format #f "goto r~D;" k)))
 		 (emit (format #f "ON_PUSH_CONTEXT(~D);" k))
 		 (cond (target (direct-call target))
 		       (direct? (site-call)))
 		 (emit "ON_FUNCALL;")
 		 (place k)))
 	      ((funcall-cxt-br)
+	       (when vfast
+		 (vector-fast vfast (eq? vkind 'set)
+			      (format #f "goto L_~A;" (native-c-label (cadr instr)))))
 	       (emit (format #f "ON_PUSH_CONTEXT(~D);"
 			     (label-resume (cadr instr))))
 	       (cond (target (direct-call target))
 		     (direct? (site-call)))
 	       (emit "ON_FUNCALL;"))
 	      ((funcall-tail)
+	       (when vfast
+		 (vector-fast vfast (eq? vkind 'set) "ON_RETURN;"))
 	       (cond (target (direct-call target))
 		     (direct? (site-call)))
 	       (emit "ON_FUNCALL;"))
@@ -1693,6 +1857,7 @@
   (set! native-fuse-count 0)
   (set! native-inline-count 0)
   (set! native-inline-label-count 0)
+  (set! native-vector-count 0)
   (native-prescan-file-block block)
   (let ((count 0)
 	(kept 0)
@@ -1753,12 +1918,12 @@
 		  count kept
 		  (if (zero? (+ native-direct-count native-guarded-count
 				native-elision-count native-fuse-count
-				native-inline-count))
+				native-inline-count native-vector-count))
 		      ""
-		      (format #f "; ~D direct and ~D guarded calls, ~D inlined, ~D checks elided, ~D branches fused"
+		      (format #f "; ~D direct and ~D guarded calls, ~D inlined, ~D vector accesses, ~D checks elided, ~D branches fused"
 			      native-direct-count native-guarded-count
-			      native-inline-count native-elision-count
-			      native-fuse-count))))
+			      native-inline-count native-vector-count
+			      native-elision-count native-fuse-count))))
 	(when (and (> #*compiler-noisiness 1)
 		   (not (null? native-escape-counts)))
 	  (format #t "~&Escapes to the emulator: ~S~%" native-escape-counts))
@@ -1810,6 +1975,7 @@
 		       native-defines))
 	    (cons 'assigns native-assigns)
 	    (cons 'escapes native-escaped-globals)
+	    (cons 'top-escapes native-top-escaped-globals)
 	    (cons 'bodies
 		  (iterate aux ((l native-defines) (acc '()))
 		    (if (null? l)
@@ -1822,18 +1988,22 @@
 	   s)
     (format s "~%")))
 
-;;; The link-time prelude's share from this file, FILE.needs: one
-;;; DEFINE per cell the guards read.  oakc gathers every file's into
-;;; prelude.oak, compiled and baked after the program, so the cells
+;;; The link-time preludes' share from this file: one DEFINE per cell
+;;; the guards read.  oakc gathers every file's BASE.needs into
+;;; prelude.oak, compiled and baked after the program, so those cells
 ;;; fill once everything is defined; a call before that just misses
-;;; its guard.
+;;; its guard.  BASE.early-needs holds the early cells (see
+;;; NATIVE-PRELUDE-CELL), which oakc bakes before the program.
 
-(define (native-write-needs file)
-  (with-open-file (s file out)
-    (format s ";;; Generated: the whole-program prelude's cells.~%")
-    (dolist (n (reverse native-prelude-needs))
-      (print (list 'define (car n) (cadr n)) s)
-      (format s "~%"))))
+(define (native-write-needs base)
+  (dolist (early? '(#f #t))
+    (with-open-file (s (append base (if early? ".early-needs" ".needs")) out)
+      (format s ";;; Generated: the whole-program ~Aprelude's cells.~%"
+	      (if early? "early " ""))
+      (dolist (n (reverse native-prelude-needs))
+	(when (eq? (caddr n) early?)
+	  (print (list 'define (car n) (cadr n)) s)
+	  (format s "~%"))))))
 
 ;;; Read the other files' summaries for the whole-program pass.
 
@@ -1968,7 +2138,7 @@
 		 (native-write-c-file (append base ".c") prefix text
 				      (length name-instrs))
 		 (native-write-summary (append base ".ois") prefix)
-		 (native-write-needs (append base ".needs"))
+		 (native-write-needs base)
 		 (or #*native-emit-only?
 		     (native-cc (append base ".c") (append base ".so"))
 		     (block

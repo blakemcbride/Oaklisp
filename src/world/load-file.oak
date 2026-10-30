@@ -313,6 +313,34 @@
 	 (x (and hit (%assq (cdr hit) (get-bp-alist typ)))))
     (if x (cdr x) 0)))
 
+;;; The native C function name recorded in the stub code vector CV, a
+;;; string, or #f when CV is not a native stub.  The name lives 5
+;;; words from the end (oak-native.h); %VREF indexes past the 2-word
+;;; header.
+
+(define (%native-stub-name cv)
+  (let ((size ((%slot 1) cv)))		; total words; %VREF 0 is word 3
+    (and (fixnum? size)
+	 (> size 8)
+	 (let ((op (quotient (bit-and (nth cv 0) 255) 4)))
+	   (and (<= 35 op) (<= op 42)
+		(let ((name (%vref cv (- size 8))))
+		  (and (string? name) name)))))))
+
+;;; The method for a guarded call site, which jumps straight to NAME,
+;;; the C function the compiler found for OP on TYP: the method only
+;;; while its code is still that function's stub.  A program's own
+;;; top-level ADD-METHOD for TYP has replaced it by the time the
+;;; prelude runs; then the answer is 0, which the site's guard
+;;; rejects, and the call takes the generic path to the new method.
+
+(define (%native-method-for op typ name)
+  (let ((m (%method-for op typ)))
+    (if (equal? (%native-stub-name (%get-an-ivar %method m 'the-code))
+		name)
+	m
+	0)))
+
 ;;; Load the shared object holding natively compiled code (see
 ;;; native-compiler.oak).  When bootstrapping from an older world the
 ;;; Makefile loads the freshly compiled streams.oa before compiling
