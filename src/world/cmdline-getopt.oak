@@ -17,8 +17,8 @@
 
 ;;; Copyright (C) 1999 Barak A. Pearlmutter.
 
-;;; This can be made more sophisticated later, with command completion etc.
-;;; For now is is quite rudimentary.
+;;; A switch can be abbreviated to a unique prefix of its name, as the
+;;; emulator's can.
 
 (define (getopt options args)
   (let aux ((args args))
@@ -26,10 +26,17 @@
 	'()
 	(cond ((strip-dashes (car args))
 	       => (lambda (a)
-		    (cond ((ass equal? a options)
-			   => (lambda (o)
+		    (let ((matches (options-matching a options)))
+		      (cond ((and (pair? matches) (null? (cdr matches)))
+			     (let* ((o (car matches))
+				    (a (car o)))
 				(let ((n (cadr o))
 				      (f (caddr o)))
+				  (when (< (length (cdr args)) n)
+				    (format standard-error
+					    "~&error: switch ~A needs ~D argument~P"
+					    a n n)
+				    (exit 1))
 				  (let ((stuff (head (cdr args) n)))
 				    (catch-errors (general-error
 						   (lambda (err)
@@ -68,9 +75,27 @@
 						      (format standard-error "~%"))))
 						  (apply f stuff)))
 				  (aux (tail (cdr args) n)))))
-			  (else (format standard-error  "~&error: unknown switch: ~A" a)
-				(exit 1)))))
+			    (else (format standard-error
+					  (if (null? matches)
+					      "~&error: unknown switch: ~A"
+					      "~&error: ambiguous switch: ~A")
+					  a)
+				  (exit 1))))))
 	      (else args)))))
+
+;;; The option named A, or else every option whose name starts with A.
+
+(define (options-matching a options)
+  (cond ((ass equal? a options) => list)
+	(else
+	 (let ((n (length a)))
+	   (let next ((options options) (matches '()))
+	     (cond ((null? options) (reverse matches))
+		   ((let ((name (car (car options))))
+		      (and (<= n (length name))
+			   (equal? a (subseq name 0 n))))
+		    (next (cdr options) (cons (car options) matches)))
+		   (else (next (cdr options) matches))))))))
 
 (define (strip-dashes a)
   (let ((n (length a)))

@@ -131,7 +131,7 @@ usage(char *prog)
 	  "\t--trace-gc v         0=quiet, 3=very detailed; default=0\n"
 	  "\t--verbose-gc v       synonym for --trace-gc\n"
 	  "\t--gc-stats           report GC pauses and stalls at exit\n"
-	  "\t--trace-traps\n"
+	  "\t--trace-traps        trace tag traps\n"
 	  "\t--batch              disable trapping of SIGINT\n"
 	  "\t--native-module file load a natively compiled module\n"
 #ifdef HAVE_LIBREADLINE
