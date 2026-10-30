@@ -59,4 +59,4 @@ bench: all
 CLEANFILES = *.oa *.oa-tmp *.tmp *.bin *.cold *.sym header.txt
 clean-local:
 	rm -rf compile-me-check native-check native-parity standalone \
-	  stress-seq stress-par stress-*.out gc-stress
+	  stress-seq stress-par stress-*.out gc-stress api-native stress-native

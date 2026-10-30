@@ -624,7 +624,8 @@ check-cold-linkers: oakworld.bin new.cold $(TOOLFILES)
 CLEANFILES = guile.stamp
 
 clean-local: clean-world
-	rm -rf prebuilt-tmp fixpoint-check guile-check guile-cache
+	rm -rf prebuilt-tmp fixpoint-check native-fixpoint-check \
+	  threaded-fixpoint-check guile-check guile-cache
 
 # Remove the world saved by rebuild-world (kept by "make clean" so
 # that build-from-old-world can be repeated).

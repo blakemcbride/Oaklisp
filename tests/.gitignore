@@ -13,3 +13,5 @@ stress-*.out
 stress-seq/
 stress-par/
 gc-stress/
+api-native/
+stress-native/
