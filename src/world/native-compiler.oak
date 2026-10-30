@@ -136,7 +136,8 @@
 ;;;   assumes the closed world --whole-program declares: no new methods
 ;;;   at run time for those operations.
 ;;; - (NTH V I) and (SET! (NTH V I) X) get an inline fast path for a
-;;;   simple vector (NATIVE-VECTOR-FAST).
+;;;   simple vector (NATIVE-VECTOR-FAST), and a call of ^SUPER does
+;;;   ^SUPER-TAIL itself (NATIVE-SUPER-CELL).
 ;;;
 ;;; There are two preludes.  Cells that depend only on world bindings
 ;;; the program neither defines, assigns nor passes around -- in its
@@ -208,6 +209,7 @@
 (define native-inline-count 0)
 (define native-inline-label-count 0)
 (define native-vector-count 0)
+(define native-super-count 0)
 
 ;;; Cross-file inlining (whole-program mode): a small, self-contained
 ;;; function body -- stack operations, arithmetic, non-tail calls, its
@@ -601,6 +603,20 @@
 	      ((assq g (native-summary-field (cdr (car l)) 'defines)) #t)
 	      (else (aux (cdr l)))))))
 
+;;; ^SUPER in whole-program builds: a call (^SUPER TYPE OP SELF . ARGS)
+;;; of the world's ^SUPER does at the call site what ^SUPER's method
+;;; does -- drop the operation, take two from the argument count, and
+;;; ^SUPER-TAIL -- without the call into it.  The guard is the
+;;; operation on the stack against the link-time ^SUPER; the answer is
+;;; that cell, or #f.
+
+(define (native-super-cell)
+  (and #*native-whole-program?
+       (not (native-program-defines? '^super))
+       (not (native-globally-assigned? '^super))
+       (procedure? (native-global-value '^super))
+       (native-prelude-cell 'v '^super #t)))
+
 ;;; The type itself may be passed around: a method for it can only be
 ;;; added through the operation, which must not escape.
 
@@ -841,6 +857,18 @@
 			 (emit "    && sp - value_stack.bp >= 1 && !ON_PENDING())")
 			 (emit (format #f "  { e_bp = REF_TO_PTR(sp[-1]) + REF_TO_INT(*LOC_TO_PTR(ON_CONST(C~D)));" co))
 			 (emit (format #f "    ON_DIRECT_JUMP(y, ON_DC_FN_~D); }" serial))))))))
+
+	       ;; ^SUPER at the call site (see NATIVE-SUPER-CELL), after the
+	       ;; context push; KTRAP is where a failed method search's
+	       ;; trap returns, followed by the RETURN ^SUPER's own code
+	       ;; has there.
+	       ((super-inline cell nargs ktrap)
+		(let ((cv (constant-index 'load-glo cell)))
+		  (set! native-super-count (+ native-super-count 1))
+		  (emit "x = sp[0];")
+		  (emit (format #f "if (x == *LOC_TO_PTR(ON_CONST(C~D)) && !ON_PENDING())" cv))
+		  (emit (format #f "  { ON_POP(1); e_nargs = ~D; ON_SUPER_TAIL(~D); }"
+				(- nargs 2) ktrap))))
 
 	       ;; The inline fast path of a vector access (see
 	       ;; NATIVE-VECTOR-FAST), before the call it can replace;
@@ -1197,6 +1225,9 @@
 				    'set)
 				   (else #f))))
 		 (vfast (and vkind (native-vector-fast vkind)))
+		 (supr (and callsite? (not excluded?) (eq? glo-sym '^super)
+			    nargs-now (>= nargs-now 3)
+			    (native-super-cell)))
 		 (rtype (cond ((and callsite? #*native-whole-program?
 				    (eq? glo-sym 'setter) (eqv? nargs-now 1)
 				    (equal? (native-astack-ref astack 1)
@@ -1390,29 +1421,38 @@
 	      ((store-nargs)
 	       (emit (format #f "e_nargs = ~D;" (cadr instr))))
 	      ((funcall-cxt)
-	       (let ((k (new-resume)))
+	       (let ((k (new-resume))
+		     (ktrap (and supr (new-resume))))
 		 (when vfast
 		   (vector-fast vfast (eq? vkind 'set) (format #f "goto r~D;" k)))
 		 (emit (format #f "ON_PUSH_CONTEXT(~D);" k))
+		 (when supr (super-inline supr nargs-now ktrap))
 		 (cond (target (direct-call target))
 		       (direct? (site-call)))
 		 (emit "ON_FUNCALL;")
+		 (when supr (place ktrap) (emit "ON_RETURN;"))
 		 (place k)))
 	      ((funcall-cxt-br)
-	       (when vfast
-		 (vector-fast vfast (eq? vkind 'set)
-			      (format #f "goto L_~A;" (native-c-label (cadr instr)))))
-	       (emit (format #f "ON_PUSH_CONTEXT(~D);"
-			     (label-resume (cadr instr))))
-	       (cond (target (direct-call target))
-		     (direct? (site-call)))
-	       (emit "ON_FUNCALL;"))
+	       (let ((ktrap (and supr (new-resume))))
+		 (when vfast
+		   (vector-fast vfast (eq? vkind 'set)
+				(format #f "goto L_~A;" (native-c-label (cadr instr)))))
+		 (emit (format #f "ON_PUSH_CONTEXT(~D);"
+			       (label-resume (cadr instr))))
+		 (when supr (super-inline supr nargs-now ktrap))
+		 (cond (target (direct-call target))
+		       (direct? (site-call)))
+		 (emit "ON_FUNCALL;")
+		 (when supr (place ktrap) (emit "ON_RETURN;"))))
 	      ((funcall-tail)
-	       (when vfast
-		 (vector-fast vfast (eq? vkind 'set) "ON_RETURN;"))
-	       (cond (target (direct-call target))
-		     (direct? (site-call)))
-	       (emit "ON_FUNCALL;"))
+	       (let ((ktrap (and supr (new-resume))))
+		 (when vfast
+		   (vector-fast vfast (eq? vkind 'set) "ON_RETURN;"))
+		 (when supr (super-inline supr nargs-now ktrap))
+		 (cond (target (direct-call target))
+		       (direct? (site-call)))
+		 (emit "ON_FUNCALL;")
+		 (when supr (place ktrap) (emit "ON_RETURN;"))))
 	      ((push-cxt push-cxt-long)
 	       (emit (format #f "ON_PUSH_CONTEXT(~D);" (label-resume (cadr instr)))))
 
@@ -1858,6 +1898,7 @@
   (set! native-inline-count 0)
   (set! native-inline-label-count 0)
   (set! native-vector-count 0)
+  (set! native-super-count 0)
   (native-prescan-file-block block)
   (let ((count 0)
 	(kept 0)
@@ -1918,11 +1959,13 @@
 		  count kept
 		  (if (zero? (+ native-direct-count native-guarded-count
 				native-elision-count native-fuse-count
-				native-inline-count native-vector-count))
+				native-inline-count native-vector-count
+				native-super-count))
 		      ""
-		      (format #f "; ~D direct and ~D guarded calls, ~D inlined, ~D vector accesses, ~D checks elided, ~D branches fused"
+		      (format #f "; ~D direct and ~D guarded calls, ~D inlined, ~D vector accesses, ~D ^supers, ~D checks elided, ~D branches fused"
 			      native-direct-count native-guarded-count
 			      native-inline-count native-vector-count
+			      native-super-count
 			      native-elision-count native-fuse-count))))
 	(when (and (> #*compiler-noisiness 1)
 		   (not (null? native-escape-counts)))

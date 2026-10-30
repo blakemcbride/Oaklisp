@@ -391,7 +391,8 @@ runtime: `make -C src/world native-world` first.
   type-proven generic calls through `%native-method-for` (the method
   only while it is still the compiled one) and `%bp-offset-for`
   (closed world assumed for those).  `(nth v i)` and `(set! (nth v i)
-  x)` get an inline fast path for simple vectors.  Pins that depend
+  x)` get an inline fast path for simple vectors, and a call of
+  `^super` does `^SUPER-TAIL` at the call site.  Pins that depend
   only on world bindings the program never defines, assigns or passes
   around go in an early prelude baked before the program, so its
   top-level code takes the guards; the rest in the prelude baked
