@@ -258,18 +258,16 @@
   test-case
 )
 
-(define-instance remove-tests-for operation)
-;; @@FIXME: no way to remove table entries ?!?
 (add-method (remove-tests-for (<unit-tests>) self unit-name)
             (cond
              ((present? self unit-name)
-              => (lambda (probe) (remove-tests-for (cdr probe))))
+              => (lambda (probe)
+                   (remove-tests-for (cdr probe))
+                   (set! (present? self unit-name) #f)))
              (else
               (error "Unit ~a not found. Try (CREATE-TEST-SUITE UNIT-TESTS ~a setup-thunk teardown-thunk)"
                       unit-name unit-name)))
 )
-
-remove
 
 ;;; UNIT-TESTS global
 

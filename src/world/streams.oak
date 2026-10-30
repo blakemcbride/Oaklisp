@@ -115,6 +115,25 @@
 (add-method (write-char (freshline-hacking-mixin on-a-new-line) self char)
   (set! on-a-new-line (eq? char #\NEWLINE)))
 
+;;; Whether a FRESHLINE would write nothing.  FORMAT renders into a
+;;; string stream before writing it out (see format.oak), and starts
+;;; that stream in the destination's state so that ~& does what it
+;;; would have done on the destination.
+
+(define-instance %on-a-new-line? settable-operation)
+
+(add-method (%on-a-new-line? (freshline-hacking-mixin on-a-new-line) self)
+  on-a-new-line)
+
+(add-method ((setter %on-a-new-line?) (freshline-hacking-mixin on-a-new-line)
+	     self new-value)
+  (set! on-a-new-line new-value))
+
+;;; A stream that keeps no track always gets the newline.
+
+(add-method (%on-a-new-line? (output-stream) self)
+  #f)
+
 
 
 

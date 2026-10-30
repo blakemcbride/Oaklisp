@@ -31,8 +31,9 @@
 ;;; under *OUTPUT-MUTEX* (made by the thread infrastructure), so
 ;;; lines from several threads do not interleave; it is rendered to a
 ;;; string first, outside the mutex, since rendering may run anything.
-;;; Output by PRINT or WRITE-STRING straight to a shared stream is not
-;;; covered.
+;;; The string stream starts in the stream's freshline state, so ~&
+;;; acts as it would have on the stream when the call began.  Output by
+;;; PRINT or WRITE-STRING straight to a shared stream is not covered.
 
 (define *output-mutex* #f)
 
@@ -41,6 +42,7 @@
 		 (#^string (car arglist))))
       (format-locked (lambda (arglist)	; (stream control-string . args)
 		       (let ((s (make string-output-stream)))
+			 (set! (%on-a-new-line? s) (%on-a-new-line? (car arglist)))
 			 (apply format-to-stream (cons s (cdr arglist)))
 			 (%guard *output-mutex*
 				 (lambda ()

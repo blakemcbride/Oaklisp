@@ -159,7 +159,7 @@
 (add-method (history (<bank-account> master-password p-i-n) self passwd)
             (if (or (equal? passwd p-i-n)
                     (equal? passwd master-password))
-                (^super <bank-account-transaction-history> self history)
+                (^super <bank-account-transaction-history> history self)
                 (bad-password self passwd)))
 
 (add-method (add (<bank-account> balance) self amount)
