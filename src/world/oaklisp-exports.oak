@@ -156,6 +156,7 @@
 
     ;; Evaluation, loading, compiling, locales
     eval load compile-file cc
+    dump-world load-world
     locale variable? variable-here? macro? macro-here?
     frozen? frozen-here? export-sharing-cell
     system-locale oaklisp-locale user-locale compiler-locale

@@ -12,7 +12,7 @@
 \renewcommand{\headrulewidth}{0in}
 \rfoot{\small Page \thepage\ of \pageref{lastpage}}
 \cfoot{}
-\lfoot{\small rev. 09/17/26}
+\lfoot{\small rev. 10/30/26}
 
 \begin{document}
 
@@ -24,14 +24,14 @@
 {\large \bfseries Startup:}
 \smallskip
 \begin{verbatim}
-    oaklisp  [--world <file>]  [--dump <file>]  [-G]
+    oaklisp  [--world <file>]  [--dump <file>]  [--predump-gc 0|1]
 
 where:
         --world indicates what world to load. Default is oakworld.bin
                 that comes with the system
         --dump provides a file name where a new world will be dumped
                when the system exits
-        -G  option to perform a GC prior to dumping a world
+        --predump-gc  whether to GC before dumping a world (default 1)
 \end{verbatim}
 
 {\large \bfseries Exiting the system:}
@@ -94,11 +94,12 @@ Type & Comment & Example \\\hline
 null-type & null list \& false & nil or \#f or {\ttfamily \textquotesingle{}}() \\
 truths & true & t or \#t \\
 &&\\
-fixnum &  decimal & 48  \\
-\ \ \&  & binary & \#b1011 \\
-bignum & binary & \#2r1011 \\
+integer & decimal & 48  \\
+ & binary & \#b1011 \\
+ & binary (any radix 2--36) & \#2r1011 \\
  & octal & \#o755 \\
  & hex & \#xD5 \\
+ & fixnum or bignum by size & \\
 &&\\
 fraction & decimal & 2/3 \\
  & hex & \#xDE/FF \\
@@ -146,15 +147,15 @@ list & create a list & fast & no & (list {\ttfamily \textquotesingle{}}A {\ttfam
 append & append lists & slow & no & (append {\ttfamily \textquotesingle{}}(A B) {\ttfamily \textquotesingle{}}(D) {\ttfamily \textquotesingle{}}(G H)) & (A B D G H) \\
 length & & slow & no & (length {\ttfamily \textquotesingle{}}(A B C)) & 3 \\
 nth & & slow & no & (nth {\ttfamily \textquotesingle{}}(A B C) 1) & B \\
-first & same as (nth 0 x) &  &  & & \\
-second & same as (nth 1 x) &  &  & & \\
-third & same as (nth 2 x) &  &  & & \\
+first & same as (nth x 0) &  &  & & \\
+second & same as (nth x 1) &  &  & & \\
+third & same as (nth x 2) &  &  & & \\
 etc. & &  &  & & \\
  & & & & & \\
 last & & slow & no & (last {\ttfamily \textquotesingle{}}(A B C)) & (C) \\
  & & & & & \\
  & Given: & & & & \\
- & (setq lst {\ttfamily \textquotesingle{}}(A B C)) & & & & \\
+ & (define lst (list {\ttfamily \textquotesingle{}}A {\ttfamily \textquotesingle{}}B {\ttfamily \textquotesingle{}}C)) & & & & \\
  & replace car cell & fast & yes & (set! (car lst) {\ttfamily \textquotesingle{}}X) & (X B C) \\
  & replace cdr cell & fast & yes &  (set! (cdr lst) {\ttfamily \textquotesingle{}}X) & (A . X) \\
 \hline
@@ -392,7 +393,7 @@ Function & Description \\\hline
 (abs n) & Absolute value \\
 (1+ n) & \\
 (quotient a b) & integers only \\
-(minus n) & \\
+(- n) & negation \\
 (floor n) & \\
 (ceiling n) & \\
 (round n) & \\
@@ -479,7 +480,7 @@ macro needed only while compiling the file in which it is defined.
         (if (!= v 10)
             (block
                 (print v standard-output)
-                (newline)
+                (newline standard-output)
                 (loop (1+ v)))))
 \end{alltt}
 
@@ -490,7 +491,7 @@ macro needed only while compiling the file in which it is defined.
 
 \begin{alltt}
     (print x standard-output)
-    (newline)
+    (newline standard-output)
     (format <stream> <fmt> <arg1> <arg2> ...)
         <stream> = #T = standard-output
                    #F = return a string
