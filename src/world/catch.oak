@@ -59,15 +59,25 @@
 	   (bindings (if new? (car saved) saved))
 	   (saved-process (if new? (cdr saved) 0))
 	   (here (%load-process)))
-      (unless (or (eq? here saved-process)
-		  (eq? here 0)
-		  (eq? saved-process 0))
-	(unwind (current-windings) (current-wind-count)
-		(process-base-wind-count here))
-	(%store-process saved-process))
-      (unwind (current-windings) (current-wind-count) saved-wind-count)
-      (set-current-fluid-bindings bindings)
-      (%throw tag value))))
+      (cond ((and (or (eq? here saved-process)
+		      (eq? here 0)
+		      (eq? saved-process 0))
+		  (= (current-wind-count) saved-wind-count))
+	     ;; The common case: no other process's windings, and none
+	     ;; of this one's above the catch, so UNWIND would only
+	     ;; store the windings back as they are.
+	     (set-current-fluid-bindings bindings)
+	     (%throw tag value))
+	    (else
+	     (unless (or (eq? here saved-process)
+			 (eq? here 0)
+			 (eq? saved-process 0))
+	       (unwind (current-windings) (current-wind-count)
+		       (process-base-wind-count here))
+	       (%store-process saved-process))
+	     (unwind (current-windings) (current-wind-count) saved-wind-count)
+	     (set-current-fluid-bindings bindings)
+	     (%throw tag value))))))
 
 (define-constant %throw
   (add-method ((make-open-coded-operation '((throw)) 2 1)
