@@ -29,6 +29,7 @@
 
 void init_weakpointer_tables(void);
 void rebuild_wp_hashtable(void);
+void rebuild_wp_hashtable_locked(void);	/* the caller holds wp_lock */
 void ensure_wp_capacity(int n);
 ref_t ref_to_wp(ref_t r);
 extern unsigned long post_gc_wp(void);

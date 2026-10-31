@@ -1,0 +1,33 @@
+;;; Weak pointers to objects made while a concurrent mark may be
+;;; running, held only by an old object -- one the mark has traced
+;;; already, so the new objects are reached through nothing the
+;;; remark scans -- must still answer after the cycle while the
+;;; object is held (GC.md: ms_weak_alive counts an object allocated
+;;; since the snapshot as alive, marked or not).  Under --size-heap
+;;; 128 a cycle comes every few rounds and a mark spans several, so
+;;; some rounds' objects are made during a mark; a collector that
+;;; cleared their weak pointers at the remark failed a round in three
+;;; runs or so.  Without threads the mark stops the world and the
+;;; case cannot arise.
+
+(define (churn n)
+  (let loop ((i 0))
+    (if (< i n) (block (make-string 30) (loop (+ i 1))))))
+
+(define bad 0)
+(define rounds 3000)
+(define old-vec (make simple-vector 20))
+(define old-hs (make simple-vector 20))
+
+(dotimes (round rounds)
+  (dotimes (i 20)
+    (set! (nth old-vec i) (list 'o round i))
+    (set! (nth old-hs i) (object-hash (nth old-vec i))))
+  (churn 2000)
+  (dotimes (i 20)
+    (if (not (eq? (object-unhash (nth old-hs i)) (nth old-vec i)))
+	(set! bad (+ bad 1)))))
+
+(if (= bad 0)
+    (format #t "PASS weak-young~%")
+    (format #t "FAIL weak-young: ~D weak pointers cleared~%" bad))

@@ -200,7 +200,7 @@ free_wp_slot(int i)
 /* Rebuild the weak pointer hash table, and the list of reusable slots,
    from the information in the table that takes weak pointers to objects.
    The caller holds wp_lock. */
-static void
+void
 rebuild_wp_hashtable_locked(void)
 {
   long i;

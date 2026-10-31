@@ -55,4 +55,14 @@ if test -x "$OAKC" && test -f "$top_builddir/src/world/native/liboaknat.a"; then
 else
   echo "no native runtime (make -C src/world native-world); the executables are skipped"
 fi
+
+# Weak pointers to objects made during a mark, held only by an old
+# object (weak-young.oak).
+timeout 300 "$OAKLISP" --batch --size-heap 128 --world "$OAKWORLD" -- \
+  --locale system-locale --load "$testdir/weak-young" --exit > weak-young.out 2>&1
+if grep -q '^PASS weak-young' weak-young.out; then
+  echo "weak-young: pass"
+else
+  echo "weak-young: FAIL"; tail -3 weak-young.out; status=1
+fi
 exit $status

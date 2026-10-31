@@ -452,8 +452,18 @@ ms_crunch(size_t i)
 static bool
 ms_may_map(void)
 {
-    size_t limit = (size_t)e_next_newspace_size + ms_headroom;
+    size_t room = ms_headroom;
+    size_t limit;
 
+#ifdef THREADS
+    /* While a cycle runs the runway is at least half the budget,
+       whatever the headroom has learnt: the headroom sets when a
+       cycle is asked for, this what the mutators may still map before
+       the mark ends -- a wait costs them more than a region. */
+    if (gc_concurrent_in_progress && room < (size_t)e_next_newspace_size / 2)
+	room = (size_t)e_next_newspace_size / 2;
+#endif
+    limit = (size_t)e_next_newspace_size + room;
 #ifdef MAX_NEW_SPACE_SIZE
     if (limit > MAX_NEW_SPACE_SIZE)
 	limit = MAX_NEW_SPACE_SIZE;
@@ -636,6 +646,18 @@ static void ms_sweep_run_end(ref_t **run_start, size_t *run_len);
 #define TLAB_MIN_FREE 257	/* a free run this big can be a TLAB */
 static bool tlab_free_none;
 
+/* Whether an object allocated below its region's sweep_top must be
+   born black: during a concurrent mark (the sweep would free it
+   otherwise), and while the weak pointer table is being cleared
+   after one (the clearing, and a weak pointer's reader, test the
+   mark bits: a new object's weak pointer would be cleared). */
+#ifdef THREADS
+#define MS_BORN_BLACK() \
+    OAK_UNLIKELY(gc_phase >= GC_PHASE_CONCURRENT_MARK || gc_weak_clearing)
+#else
+#define MS_BORN_BLACK() OAK_UNLIKELY(gc_phase >= GC_PHASE_CONCURRENT_MARK)
+#endif
+
 /* An entry's size field, checked: a zero would loop the allocator,
    and in a debugging build an entry running past its region is a
    corrupt list. */
@@ -680,7 +702,7 @@ ms_free_list_alloc(size_t n_words)
 		/* Born-black: during concurrent mark, objects allocated
 		   from the free list (below sweep_top) must have their
 		   mark bit set so sweep doesn't reclaim them. */
-		if (OAK_UNLIKELY(gc_phase >= GC_PHASE_CONCURRENT_MARK))
+		if (MS_BORN_BLACK())
 		    ms_mark_alloc(p);
 #if defined(THREADS) && defined(OAK_GC_VERIFY)
 		ms_verify_log_alloc(p, 3, n_words);
@@ -737,7 +759,7 @@ ms_free_list_alloc(size_t n_words)
 		if (rest_size >= TLAB_MIN_FREE)
 		    tlab_free_none = false;
 
-		if (OAK_UNLIKELY(gc_phase >= GC_PHASE_CONCURRENT_MARK))
+		if (MS_BORN_BLACK())
 		    ms_mark_alloc(p);
 #if defined(THREADS) && defined(OAK_GC_VERIFY)
 		ms_verify_log_alloc(p, 4, n_words);
@@ -873,6 +895,12 @@ uint64_t *tlab_bm_array[MS_TLAB_COUNT];
 static void
 ms_tlab_install(int idx, ms_region_t *r, ref_t *start, ref_t *end)
 {
+    /* The unused tail of the TLAB being replaced is retired: zeroed,
+       and given an objstart bit, so that it is neither absorbed into
+       the extent of the object before it (a stale word there would
+       be taken for a reference) nor left for a sweep to count as that
+       object's. */
+    ms_tlab_retire(tlab_cursor_array[idx], tlab_end_array[idx]);
     tlab_base_array[idx] = start;
     tlab_bm_array[idx] = &r->objstart[BM_IDX(r, start) / 64];
     tlab_cursor_array[idx] = start;
@@ -981,7 +1009,7 @@ ms_tlab_from_free(size_t min_words, ms_region_t **out_r, ref_t **out_end)
 		    end = start + TLAB_SIZE;
 		}
 #ifdef THREADS
-		if (OAK_UNLIKELY(gc_phase >= GC_PHASE_CONCURRENT_MARK))
+		if (MS_BORN_BLACK())
 		    ms_blacken(r, start, end);
 #endif
 		ms_since_snapshot += (size_t)(end - start);
@@ -1218,12 +1246,14 @@ ms_tlab_retire_all(void)
 int gc_satb_active = 0;
 
 /*
- * The buffers grow on demand.  Dropping an entry would break the
- * snapshot-at-the-beginning invariant: an object whose last remaining
- * reference was overwritten during concurrent mark would never be
- * marked and would then be swept while still live.  A mutator can
- * easily overwrite more than SATB_BUFFER_SIZE pointer slots in one
- * mark phase, so the buffer has to be able to hold them all.
+ * Dropping an entry would break the snapshot-at-the-beginning
+ * invariant: an object whose last remaining reference was overwritten
+ * during concurrent mark would never be marked and would then be
+ * swept while still live.  A mutator can easily overwrite more than
+ * SATB_BUFFER_SIZE pointer slots in one mark phase, so with threads a
+ * full buffer is handed to the marker and a fresh one begun (without
+ * threads the one buffer grows; it is never used, the mark being
+ * stop-the-world there).
  *
  * Each buffer is private to one thread: only that thread appends to
  * it, and it is drained during a stop-the-world pause.
@@ -1261,44 +1291,61 @@ satb_room(ref_t **bufp, size_t count, size_t *sizep)
     *sizep = new_size;
 }
 
+#ifdef THREADS
+/* Full buffers, handed to the marker: it drains them concurrently
+   (ms_satb_drain_concurrent) between runs of the mark stack, so the
+   remark sees only each thread's last partial buffer. */
+static oak_mutex_t satb_lock = OAK_MUTEX_INITIALIZER;
+static struct satb_full { ref_t *buf; size_t count; struct satb_full *next; }
+    *satb_full_list;
+
+static void
+satb_append(ref_t v)
+{
+    int idx = *(int *)oak_tls_get(index_key);
+
+    if (satb_count_array[idx] >= satb_size_array[idx]) {
+	if (satb_buffer_array[idx] != NULL && satb_count_array[idx] > 0) {
+	    struct satb_full *full = (struct satb_full *)xmalloc(sizeof *full);
+
+	    full->buf = satb_buffer_array[idx];
+	    full->count = satb_count_array[idx];
+	    oak_mutex_lock(&satb_lock);
+	    full->next = satb_full_list;
+	    satb_full_list = full;
+	    oak_mutex_unlock(&satb_lock);
+	    satb_buffer_array[idx] = NULL;
+	    satb_size_array[idx] = 0;
+	}
+	satb_room(&satb_buffer_array[idx], 0, &satb_size_array[idx]);
+	satb_count_array[idx] = 0;
+    }
+    satb_buffer_array[idx][satb_count_array[idx]++] = v;
+}
+#else
+static void
+satb_append(ref_t v)
+{
+    satb_room(&satb_buffer, satb_count, &satb_size);
+    satb_buffer[satb_count++] = v;
+}
+#endif
+
 void
 satb_log_old(ref_t *addr)
 {
     ref_t old_val = *addr;
 
     /* Only log pointer-tagged values (skip fixnums and immediates). */
-    if (!(old_val & PTR_MASK))
-	return;
-
-#ifdef THREADS
-    {
-	int idx = *(int *)oak_tls_get(index_key);
-	satb_room(&satb_buffer_array[idx], satb_count_array[idx],
-		  &satb_size_array[idx]);
-	satb_buffer_array[idx][satb_count_array[idx]++] = old_val;
-    }
-#else
-    satb_room(&satb_buffer, satb_count, &satb_size);
-    satb_buffer[satb_count++] = old_val;
-#endif
+    if (old_val & PTR_MASK)
+	satb_append(old_val);
 }
 
 void
 satb_log_value(ref_t v)
 {
-    if (!(v & PTR_MASK))
-	return;
-#ifdef THREADS
-    {
-	int idx = *(int *)oak_tls_get(index_key);
-	satb_room(&satb_buffer_array[idx], satb_count_array[idx],
-		  &satb_size_array[idx]);
-	satb_buffer_array[idx][satb_count_array[idx]++] = v;
-    }
-#else
-    satb_room(&satb_buffer, satb_count, &satb_size);
-    satb_buffer[satb_count++] = v;
-#endif
+    if (v & PTR_MASK)
+	satb_append(v);
 }
 
 void
@@ -1319,6 +1366,7 @@ satb_flush_all(void)
 /* ------------------------------------------------------------------ */
 
 volatile int gc_phase = GC_PHASE_IDLE;
+volatile int gc_weak_clearing = 0;
 
 #ifdef THREADS
 /*
@@ -1354,6 +1402,7 @@ gc_safepoint_init(void)
     oak_mutex_init(&gc_concurrent_lock);
     oak_cond_init(&gc_concurrent_done_cv);
     oak_cond_init(&gc_request_cv);
+    oak_mutex_init(&satb_lock);
 #endif
 }
 
@@ -1785,19 +1834,66 @@ ms_mark_ref_concurrent(ref_t ref)
  * fields with atomic marking.  The mark stack is only accessed by
  * the GC coordinator thread.
  */
+/* The full SATB buffers handed over so far: marked, atomically, and
+   freed.  True if there were any. */
+static bool
+ms_satb_drain_concurrent(void)
+{
+    struct satb_full *list, *next;
+
+    oak_mutex_lock(&satb_lock);
+    list = satb_full_list;
+    satb_full_list = NULL;
+    oak_mutex_unlock(&satb_lock);
+    if (list == NULL)
+	return false;
+    for (; list; list = next) {
+	for (size_t j = 0; j < list->count; j++)
+	    ms_mark_ref_concurrent(list->buf[j]);
+	next = list->next;
+	free(list->buf);
+	free(list);
+    }
+    return true;
+}
+
 static void
 ms_trace_concurrent(void)
 {
-    while (mark_stack_top > 0) {
-	ref_t *obj = mark_stack_pop();
-	size_t len = ms_objstart_extent(ms_region_of(obj), obj);
+    for (;;) {
+	while (mark_stack_top > 0) {
+	    ref_t *obj = mark_stack_pop();
+	    size_t len = ms_objstart_extent(ms_region_of(obj), obj);
 
-	marked_words += len;
-	for (size_t i = 0; i < len; i++) {
-	    ref_t val = obj[i];
-	    if (val & PTR_MASK)
-		ms_mark_ref_concurrent(val);
+	    marked_words += len;
+	    for (size_t i = 0; i < len; i++) {
+		ref_t val = obj[i];
+		if (val & PTR_MASK)
+		    ms_mark_ref_concurrent(val);
+	    }
 	}
+	/* The stack is empty: the barrier buffers handed over
+	   meanwhile, and whatever they lead to. */
+	if (!ms_satb_drain_concurrent())
+	    break;
+    }
+}
+
+/* Spatic, scanned concurrently: any pointer from the world image
+   into the heap is a root.  The mutators write it meanwhile, under
+   the barrier: a word read old was there since the snapshot, and one
+   read new refers to what the snapshot's rules mark anyway, while
+   what was overwritten is in a barrier buffer. */
+static void
+ms_mark_spatic_concurrent(void)
+{
+    ref_t *p;
+
+    for (p = spatic.start; p < spatic.end; p++) {
+	ref_t r = *p;
+
+	if ((r & PTR_MASK) && !SPATIC_PTR(ANY_TO_PTR(r)))
+	    ms_mark_ref_concurrent(r);
     }
 }
 
@@ -2062,6 +2158,21 @@ satb_drain_to_mark_stack(void)
 {
 #ifdef THREADS
     extern int next_index;
+    struct satb_full *list, *next;
+
+    /* Full buffers handed over since the marker last looked, then
+       every thread's partial one. */
+    oak_mutex_lock(&satb_lock);
+    list = satb_full_list;
+    satb_full_list = NULL;
+    oak_mutex_unlock(&satb_lock);
+    for (; list; list = next) {
+	for (size_t j = 0; j < list->count; j++)
+	    ms_mark_ref(list->buf[j]);
+	next = list->next;
+	free(list->buf);
+	free(list);
+    }
     for (int i = 0; i < next_index; i++) {
 	for (size_t j = 0; j < satb_count_array[i]; j++)
 	    ms_mark_ref(satb_buffer_array[i][j]);
@@ -2075,14 +2186,6 @@ satb_drain_to_mark_stack(void)
 }
 
 
-/*
- * Mark roots: VM registers, stacks, spatic space.
- */
-static void
-ms_mark_roots(void)
-{
-    ref_t *p;
-
 /* A root is worth a call only if it is a pointer not into spatic:
    nearly every word of spatic and of the stacks is a fixnum or points
    into spatic, and this is the collector's one pass over them. */
@@ -2090,6 +2193,31 @@ ms_mark_roots(void)
     do { ref_t _r = (r);						\
 	 if ((_r & PTR_MASK) && !SPATIC_PTR(ANY_TO_PTR(_r)))		\
 	     ms_mark_ref(_r); } while (0)
+
+/* Spatic space, with the world stopped: any pointer from the world
+   image into the heap is a root.  The single-threaded cycle's and
+   verify mode's; with threads the scan is concurrent. */
+#if !defined(THREADS) || defined(OAK_GC_VERIFY)
+static void
+ms_mark_spatic(void)
+{
+    ref_t *p;
+
+    for (p = spatic.start; p < spatic.end; p++)
+	MS_ROOT(*p);
+}
+#endif
+
+/*
+ * The roots a pause must scan: the VM registers and every thread's
+ * stacks, which no barrier covers.  Spatic is scanned apart
+ * (ms_mark_spatic; with threads concurrently, ms_mark_spatic_concurrent,
+ * and not at the remark: stores into it are barriered like any).
+ */
+static void
+ms_mark_thread_roots(void)
+{
+    ref_t *p;
 
 #ifdef THREADS
     int my_index;
@@ -2148,13 +2276,20 @@ ms_mark_roots(void)
 	ms_mark_ref(context_stack.segment);
     }
 
-    /* Scan spatic space: any pointer from spatic into the heap is a root. */
-    for (p = spatic.start; p < spatic.end; p++)
-	MS_ROOT(*p);
-
 #undef FORTHREADS
-#undef MS_ROOT
 }
+
+/* Every root, with the world stopped: the single-threaded cycle's,
+   and verify mode's. */
+#if !defined(THREADS) || defined(OAK_GC_VERIFY)
+static void
+ms_mark_roots(void)
+{
+    ms_mark_thread_roots();
+    ms_mark_spatic();
+}
+#endif
+#undef MS_ROOT
 
 /* Before a cycle: every region's marks cleared.  Under alloc_lock,
    so the list is stable; a region mapped after this starts with none
@@ -2258,7 +2393,13 @@ ms_prepare_lazy_sweep(void)
     tlab_free_none = true;
     for (ms_region_t *r = ms_regions; r; r = r->next)
 	memset(r->freebm, 0, BM_WORDS(r) * sizeof(uint64_t));
+}
 
+/* The sweep may begin.  Under alloc_lock, or with the world
+   stopped. */
+void
+ms_start_lazy_sweep(void)
+{
     sweep_region = ms_regions;
     sweep_cursor = 0;
     sweep_run = NULL;
@@ -2356,7 +2497,11 @@ ms_lazy_sweep_one(void)
 		sweep_region = r->next;
 		continue;
 	    }
-	    if (ms_region_all_dead(r)) {
+	    /* Not while the weak pointer table is being cleared: a reset
+	       moves sweep_top, which the readers' liveness test uses
+	       (ms_weak_alive); the region is swept block by block then,
+	       into one entry. */
+	    if (!gc_weak_clearing && ms_region_all_dead(r)) {
 		ms_region_reset(r);
 		sweep_region = r->next;
 		return true;
@@ -2392,8 +2537,10 @@ ms_lazy_sweep_one(void)
 		   its first to the next live one, and only that end is
 		   looked for. */
 		if (BM_TEST(r->mark, idx)) {
-		    /* Live: clear mark for next cycle. */
-		    BM_CLR(r->mark, idx);
+		    /* Live.  The mark bit stays: the next cycle clears
+		       them all, and the weak pointer table's readers
+		       test them while it is being cleared, which the
+		       sweep overlaps. */
 		    if (sweep_run) {
 			size_t run_len = (size_t)(obj - sweep_run);
 			sweep_dead += run_len;
@@ -2436,31 +2583,52 @@ ms_lazy_sweep_finish(void)
 /*  Weak pointer handling                                              */
 /* ------------------------------------------------------------------ */
 
+/* Whether a weakly held object survived the mark whose marks stand:
+   outside the heap, allocated since the snapshot (above its region's
+   sweep_top: born black or implicitly live, and not necessarily
+   marked), or marked.  Read by the mutators too (ms_weak_read in
+   data.h) while the table is being cleared after the remark. */
+bool
+ms_weak_alive(ref_t ref)
+{
+    ref_t *p = ANY_TO_PTR(ref);
+    ms_region_t *r = ms_region_of(p);
+
+    if (r == NULL)
+	return true;
+    if (p >= r->sweep_top)
+	return true;
+    /* For locatives, find the object start. */
+    if (TAG_IS(ref, LOC_TAG)) {
+	p = find_object_start(r, p);
+	if (p == NULL)
+	    return false;
+    }
+    return BM_TEST(r->mark, BM_IDX(r, p)) != 0;
+}
+
+/* The weak pointer table after a mark: entries whose objects did not
+   survive are cleared.  With threads this runs after the remark, the
+   mutators going on (a read of an entry not yet cleared tests the
+   mark bit itself, ms_weak_read) and new weak pointers being made
+   under wp_lock, which is held throughout. */
 static unsigned long
 ms_post_gc_wp(void)
 {
     unsigned long count = 0;
     long i;
 
+    THREADY(oak_mutex_lock(&wp_lock));
     for (i = 0; i < wp_index; i++) {
 	ref_t ref = wp_table[1 + i];
-	if (ref & PTR_MASK) {
-	    ref_t *p = ANY_TO_PTR(ref);
-	    ms_region_t *r = ms_region_of(p);
 
-	    if (r != NULL) {
-		/* For locatives, find the object start. */
-		if (TAG_IS(ref, LOC_TAG))
-		    p = find_object_start(r, p);
-		if (!p || !BM_TEST(r->mark, BM_IDX(r, p))) {
-		    wp_table[1 + i] = e_nil;
-		    count++;
-		}
-	    }
+	if ((ref & PTR_MASK) && !ms_weak_alive(ref)) {
+	    wp_table[1 + i] = e_nil;
+	    count++;
 	}
     }
-
-    rebuild_wp_hashtable();
+    rebuild_wp_hashtable_locked();
+    THREADY(oak_mutex_unlock(&wp_lock));
     return count;
 }
 
@@ -2587,13 +2755,14 @@ ms_run_cycle(const char *reason, size_t amount)
 	    ms_snapshot_ns = now;
 	}
 
-	ms_mark_roots();
+	ms_mark_thread_roots();
 #ifdef OAK_GC_VERIFY
 	/* Trace the whole snapshot now into a copy, then start the
 	   real mark over from the roots. */
+	ms_mark_spatic();
 	ms_trace();
 	ms_verify_take_snapshot();
-	ms_mark_roots();
+	ms_mark_thread_roots();
 #endif
 	if (trace_gc > 1) { fprintf(stderr, " roots"); fflush(stderr); }
 
@@ -2619,7 +2788,8 @@ ms_run_cycle(const char *reason, size_t amount)
 	    }
 	}
 
-	/* === CONCURRENT MARK === */
+	/* === CONCURRENT MARK: spatic, then everything reachable === */
+	ms_mark_spatic_concurrent();
 	ms_trace_concurrent();
 
 	if (trace_gc > 1) {
@@ -2666,14 +2836,14 @@ ms_run_cycle(const char *reason, size_t amount)
 	    satb_drain_to_mark_stack();
 	    t1 = trace_gc > 2 ? gc_now() : 0;
 
-	    /* Re-scan roots to catch new stack entries that appeared
-	       during concurrent mark.  Stacks are C arrays, not covered
-	       by SATB barriers.  What was allocated during the mark is
-	       black and is not scanned: every object it can refer to
+	    /* Re-scan the registers and stacks, C arrays that no barrier
+	       covers.  Spatic is not rescanned: stores into it are
+	       barriered like any.  What was allocated during the mark
+	       is black and is not scanned: every object it can refer to
 	       was reachable at the snapshot (and is marked by the
 	       snapshot's rules), was allocated after it (black), or was
 	       read through a weak pointer (and logged, SATB_READ_WEAK). */
-	    ms_mark_roots();
+	    ms_mark_thread_roots();
 	    t2 = trace_gc > 2 ? gc_now() : 0;
 
 	    /* Process all newly discovered references. */
@@ -2706,7 +2876,8 @@ ms_run_cycle(const char *reason, size_t amount)
     if (trace_gc > 1)
 	fprintf(stderr, "\n; Mark complete.\n");
 
-    /* --- Weak pointers --- */
+#ifndef THREADS
+    /* --- Weak pointers (with threads: after the pause, below) --- */
     if (trace_gc > 1)
 	fprintf(stderr, "; Scanning weak pointer table...");
     {
@@ -2715,6 +2886,7 @@ ms_run_cycle(const char *reason, size_t amount)
 	    fprintf(stderr, " %lu entr%s discarded.\n",
 		    wp_count, wp_count != 1 ? "ies" : "y");
     }
+#endif
 
     /* --- Sweep phase --- */
     gc_phase = GC_PHASE_SWEEP;
@@ -2736,14 +2908,24 @@ ms_run_cycle(const char *reason, size_t amount)
     /* The budget for the next cycle, from what the mark found. */
     ms_set_budget(amount);
 
-    /* Prepare lazy sweep: clear free lists and set the sweep cursor
-       to the first region.  Blocks will be swept on demand by
-       allocating threads (ms_lazy_sweep_one). */
+    /* Prepare the lazy sweep: clear the free lists and their free
+       bits, flush the caches of raw refs.  Blocks will be swept on
+       demand by allocating threads (ms_lazy_sweep_one) once it is
+       started, below. */
     ms_prepare_lazy_sweep();
 
     if (trace_gc > 1)
 	fprintf(stderr, "; Lazy sweep prepared (%zu regions).\n", ms_nregions);
 
+#ifdef THREADS
+    /* The weak pointers are cleared after the pause: until then a
+       read of one tests the mark bit (ms_weak_read, data.h).  The
+       sweep starts now all the same, so the mutators find room
+       meanwhile: it leaves the mark bits alone, and resets no region
+       while the clearing lasts. */
+    gc_weak_clearing = 1;
+    ms_start_lazy_sweep();
+#endif
     gc_phase = GC_PHASE_IDLE;
 
 #ifdef THREADS
@@ -2758,6 +2940,17 @@ ms_run_cycle(const char *reason, size_t amount)
 	if (trace_gc > 1)
 	    fprintf(stderr, "; Remark pause %.3f ms.\n", ms);
     }
+
+    /* --- Weak pointers, concurrently --- */
+    if (trace_gc > 1)
+	fprintf(stderr, "; Scanning weak pointer table...");
+    {
+	unsigned long wp_count = ms_post_gc_wp();
+	if (trace_gc > 1)
+	    fprintf(stderr, " %lu entr%s discarded.\n",
+		    wp_count, wp_count != 1 ? "ies" : "y");
+    }
+    gc_weak_clearing = 0;
 #endif
 
     /* Sweep enough blocks now to satisfy the requested amount, so that
@@ -2773,6 +2966,7 @@ ms_run_cycle(const char *reason, size_t amount)
 	}
 	oak_mutex_unlock(&alloc_lock);
 #else
+	ms_start_lazy_sweep();
 	while (!ms_space_for(amount) && ms_lazy_sweep_one()) {
 	    /* keep sweeping */
 	}

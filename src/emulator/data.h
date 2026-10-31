@@ -532,14 +532,20 @@ extern void ms_verify_log_alloc(ref_t *p, int path, size_t words);
 #define SATB_READ_WEAK(v) ((void)0)
 #endif
 
-/* A value read through a weak pointer (wp_to_ref), logged during a
-   concurrent mark (gc-ms.h, SATB_READ_WEAK): an object the snapshot
-   held only weakly is otherwise invisible to the mark once it is
-   stored into a black object. */
+/* A value read through a weak pointer (wp_to_ref): logged during a
+   concurrent mark (gc-ms.h, SATB_READ_WEAK), since an object the
+   snapshot held only weakly is otherwise invisible to the mark once
+   it is stored into a black object; and while the table is being
+   cleared after a mark, nil unless its object survived (the clearing
+   runs with the mutators going on). */
 static inline ref_t
 satb_weak_read(ref_t v)
 {
   SATB_READ_WEAK(v);
+#ifdef USE_MARK_SWEEP
+  if (OAK_UNLIKELY(gc_weak_clearing) && (v & PTR_MASK) && !ms_weak_alive(v))
+    return e_nil;
+#endif
   return v;
 }
 

@@ -367,9 +367,19 @@ void ms_mark_alloc(ref_t *p);
    words per ms_lazy_sweep_one() call. */
 #define SWEEP_BLOCK_SIZE 4096
 
-/* Prepare for lazy sweep after the mark phase completes.
-   Clears free lists and resets the sweep cursor. */
+/* Prepare for lazy sweep after the mark phase completes: clears the
+   free lists and their free bits, flushes the caches of raw refs. */
 void ms_prepare_lazy_sweep(void);
+
+/* Start the sweep. */
+void ms_start_lazy_sweep(void);
+
+/* After a mark, while the weak pointer table is being cleared (with
+   threads, after the remark pause, the sweep going on meanwhile): a
+   read of a weak pointer tests its object itself, ms_weak_alive, by
+   the marks, which stand until the next cycle clears them. */
+extern volatile int gc_weak_clearing;
+bool ms_weak_alive(ref_t ref);
 
 /* Sweep one block (up to SWEEP_BLOCK_SIZE words) from the sweep cursor.
    Returns true if a block was swept (free lists may now have entries),

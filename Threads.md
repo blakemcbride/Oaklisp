@@ -87,7 +87,12 @@ Global shared state:
                                        gc_concurrent_lock
     satb_buffer_array[]             Per thread: old values overwritten
                                        and values read through weak
-                                       pointers during a mark
+                                       pointers during a mark; a full
+                                       buffer goes to satb_full_list
+                                       (satb_lock) for the marker
+    wp_table[]                      Cleared after a remark under wp_lock,
+                                       readers testing liveness meanwhile
+                                       (gc_weak_clearing, ms_weak_alive)
     new_space, free_point           The dump compaction's destination
                                        (gc.c), with the world stopped
 
@@ -101,7 +106,9 @@ does one waiting for a cycle.  `next_index` is snapshotted at the
 start of a collection, so a thread created during it is never read
 half-initialized, and a thread that has exited is skipped.  The mark
 phase runs concurrently with two brief pauses (initial mark and
-remark); the sweep is lazy, during allocation; a cycle is asked for
+remark), each scanning the registers and stacks only -- the world
+image, the full barrier buffers and the weak pointer table are
+handled concurrently; the sweep is lazy, during allocation; a cycle is asked for
 ahead of the budget so that the mutators keep allocating through it
 (GC.md, "Pacing"); the heap grows and shrinks by mapping and
 unmapping regions, and the copying collector runs only to compact it

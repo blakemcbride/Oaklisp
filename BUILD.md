@@ -366,17 +366,17 @@ time to the default build; the -DTHREADS column from 2026-10-29, its
 code unchanged since):
 
 	                  -DTHREADS   -DUSE_MARK_SWEEP   both (--enable-threads)
-	tak                  1.15           1.02              1.04
-	fib                  1.10           1.02              1.10
+	tak                  1.15           1.11              1.09
+	fib                  1.10           1.07              1.11
 	bignum               1.18           0.98              0.94
-	sort                 1.10           1.03              1.03
-	cons                 1.30           0.87              0.78
-	strings              1.22           1.05              1.11
-	hash                 1.09           1.01              1.04
-	dispatch             1.06           1.02              1.01
-	eval                 1.17           1.02              1.03
-	format               1.15           1.05              1.09
-	compile              1.22           1.00              1.00
+	sort                 1.10           1.06              1.08
+	cons                 1.30           0.90              0.82
+	strings              1.22           1.11              1.05
+	hash                 1.09           1.09              1.10
+	dispatch             1.06           1.06              1.06
+	eval                 1.17           1.05              1.04
+	format               1.15           1.06              1.10
+	compile              1.22           1.10              1.14
 
 These ratios move with the interpreter's code layout as much as with
 the collector: between the region-heap commit and the one before it,
@@ -384,8 +384,9 @@ the --enable-threads build slowed by 4 to 9% on every benchmark, tak,
 fib and dispatch included, which never allocate, and the same sources
 built with "-falign-labels=16 -falign-jumps=32 -falign-loops=32" ran
 every benchmark at or under the earlier times; the GC thread's commit
-moved them back as much the other way.  Take the table as bounds, not
-as the cost of any one feature.
+moved them back as much the other way, and the short pauses' commit
+(no change to the interpreter) moved tak, fib and dispatch 5 to 9%
+again.  Take the table as bounds, not as the cost of any one feature.
 
 With threads in use, "tests/bench.sh -p 4" (four copies of tak, each
 on an OS thread, against the same on one thread, wall clock) runs
