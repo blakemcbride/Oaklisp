@@ -47,10 +47,10 @@
 #error "gc-ms.h is included through data.h"
 #endif
 
-/* Number of size classes.  Classes 0..NUM_SIZE_CLASSES-2 have bounded
-   sizes; the last class is for objects larger than the second-to-last
-   class maximum. */
-#define NUM_SIZE_CLASSES 19
+/* Number of size classes.  Classes 0..31 hold one size each, 1 to 32
+   words; the classes above them hold ranges, and the last class is for
+   objects larger than the second-to-last class maximum (gc-ms.c). */
+#define NUM_SIZE_CLASSES 41
 
 /* Default TLAB size in ref_t words.  Each thread carves chunks of
    this size from a region's bump area or a big free run for lock-free

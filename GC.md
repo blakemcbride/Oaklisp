@@ -287,15 +287,21 @@ are what refills it, or serves a request too big for one.
 
 ### Tier 1: Size-class segregated free lists
 
-19 size classes with these maximum sizes (in `ref_t` words):
+41 size classes.  Classes 0 to 31 each hold one size, 1 to 32
+`ref_t` words; the rest hold ranges, up to these maximum sizes:
 
 ```
-Class:  0   1   2   3   4   5   6    7    8    9
-Max:    1   2   3   4   6   8  12   16   24   32
-
-Class: 10  11  12   13   14   15   16    17   18
+Class: 32  33  34   35   36   37   38    39   40
 Max:   48  64  96  128  192  256  512  1024  inf
 ```
+
+A request takes the first entry of its class that is big enough.  In
+a class holding a range, entries smaller than the request are walked
+past, and a program that keeps many small objects alive between dead
+ones fills such a class with them: every allocation walked them all,
+and building a big live structure took time growing with its square.
+With one size per class for the sizes nearly every object has, the
+first entry always fits.
 
 Free list entries occupy the dead object's memory.  `word[0]` is the
 next pointer, `word[1]` the size (an entry of one word, class 0, has
@@ -323,7 +329,12 @@ virgin space.
 
 Then the bump areas: the cursor region's virgin tail (`alloc_region`,
 the region last bumped from), else the first region on the list with
-room.  An objstart bit is set for the new object.
+room.  An objstart bit is set for the new object.  A virgin tail only
+shrinks, except when a region is mapped or found all dead, so the
+least request a walk of the list found no room for is remembered
+(`virgin_fail`, one for aligned requests and one not) and fails at
+once until then; the list grows with the live data, and walking it on
+every miss was the other half of the slowdown above.
 
 ### Tier 4: Mapping a region
 
@@ -848,7 +859,7 @@ These are compile-time constants in the header files:
 | `MS_RECLAIM_FACTOR` | 3 | `gc-ms.c` | The mark-sweep budget: three times the live data |
 | `MS_REGION_LOG2_BYTES` | 20 | `gc-ms.h` | A chunk is 1 MB; regions are spans of chunks |
 | `MS_EMPTY_CYCLES` | 2 | `gc-ms.c` | Sweeps a region must stay empty before it is unmapped |
-| `NUM_SIZE_CLASSES` | 19 | `gc-ms.h` | Number of segregated free list size classes |
+| `NUM_SIZE_CLASSES` | 41 | `gc-ms.h` | Number of segregated free list size classes (one size each up to 32 words) |
 | `TLAB_SIZE` | 4096 | `gc-ms.h` | Per-thread allocation buffer size in words |
 | `TLAB_MIN_FREE` | 257 | `gc-ms.c` | The least free run (or virgin tail) worth a TLAB |
 | `SWEEP_BLOCK_SIZE` | 4096 | `gc-ms.h` | Lazy sweep granularity in words |

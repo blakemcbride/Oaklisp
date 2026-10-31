@@ -221,6 +221,21 @@ ms_slot_free(ms_region_t *r)
 	t->r[r->slot + k] = NULL;
 }
 
+/* The least request, unaligned and aligned, that a look through every
+   region found no virgin room for.  A virgin tail only shrinks, except
+   when a region is made (ms_region_new) or found all dead
+   (ms_region_reset), which forget these; until then any request at
+   least as big fails at once.  Without them every allocation that
+   missed the cursor region walked the whole list, and the regions grow
+   with the live data.  Under alloc_lock, as the tails are. */
+static size_t virgin_fail[2] = { SIZE_MAX, SIZE_MAX };
+
+static inline void
+ms_virgin_grew(void)
+{
+    virgin_fail[0] = virgin_fail[1] = SIZE_MAX;
+}
+
 /* A region over the CHUNKS chunks at MEM (aligned, zeroed): its
    struct and bitmaps, its slots, its table entries, on the list. */
 static ms_region_t *
@@ -232,6 +247,7 @@ ms_region_new(void *mem, size_t chunks)
 
     memset(r, 0, sizeof *r);
     r->start = r->top = r->sweep_top = (ref_t *)mem;
+    ms_virgin_grew();
     r->end = r->start + words;
     r->chunks = chunks;
     bm = BM_WORDS(r) * sizeof(uint64_t);
@@ -407,30 +423,34 @@ ms_set_budget(size_t amount)
 /* ------------------------------------------------------------------ */
 
 /*
+ * Classes 0 to 31 each hold one size, 1 to 32 words; above that a
+ * class holds a range, to its maximum:
+ *
  * Class   Max words
- *   0       1
- *   1       2
- *   2       3    (cons pairs)
- *   3       4
- *   4       6
- *   5       8    (lambda = 8 words)
- *   6      12
- *   7      16
- *   8      24
- *   9      32
- *  10      48
- *  11      64
- *  12      96
- *  13     128
- *  14     192
- *  15     256
- *  16     512
- *  17    1024
- *  18    inf   (large objects)
+ *  32      48
+ *  33      64
+ *  34      96
+ *  35     128
+ *  36     192
+ *  37     256
+ *  38     512
+ *  39    1024
+ *  40    inf   (large objects)
+ *
+ * The allocator takes the first entry of a request's class that is
+ * big enough.  In a class holding a range, entries smaller than the
+ * request are walked past, and a heap that keeps many small objects
+ * alive between dead ones fills a class with such holes: every
+ * allocation then walked them all, and the time to build a big live
+ * structure grew with its square.  One size per class for the sizes
+ * nearly every object has makes the first entry always fit.
  */
 
+#define MS_EXACT_CLASSES 32
+
 static const size_t class_max[NUM_SIZE_CLASSES] = {
-    1, 2, 3, 4, 6, 8, 12, 16, 24, 32,
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+    17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
     48, 64, 96, 128, 192, 256, 512, 1024,
     (size_t)-1   /* large: no upper bound */
 };
@@ -438,9 +458,11 @@ static const size_t class_max[NUM_SIZE_CLASSES] = {
 int
 ms_size_class(size_t n)
 {
-    /* Find smallest class whose max >= n.
-       Linear scan is fine for 19 classes. */
-    for (int i = 0; i < NUM_SIZE_CLASSES; i++)
+    /* The smallest class whose max >= n: direct for the exact classes,
+       a short scan above them. */
+    if (n <= MS_EXACT_CLASSES)
+	return n == 0 ? 0 : (int)n - 1;
+    for (int i = MS_EXACT_CLASSES; i < NUM_SIZE_CLASSES; i++)
 	if (n <= class_max[i])
 	    return i;
     return NUM_SIZE_CLASSES - 1;
@@ -661,11 +683,14 @@ ms_region_with_room(size_t words, bool aligned)
 
     if (r && ms_virgin_room(r, aligned) >= words)
 	return r;
+    if (words >= virgin_fail[aligned])
+	return NULL;
     for (r = ms_regions; r; r = r->next)
 	if (ms_virgin_room(r, aligned) >= words) {
 	    alloc_region = r;
 	    return r;
 	}
+    virgin_fail[aligned] = words;
     return NULL;
 }
 
@@ -829,7 +854,6 @@ static bool
 ms_space_for(size_t n_words)
 {
     int sc = ms_size_class(n_words);
-    ms_region_t *r;
 
     for (int c = sc; c < NUM_SIZE_CLASSES; c++) {
 	ref_t *p = free_list_heads[c];
@@ -844,9 +868,8 @@ ms_space_for(size_t n_words)
 	    p = (ref_t *)(*p);
 	}
     }
-    for (r = ms_regions; r; r = r->next)
-	if (ms_virgin_room(r, false) >= n_words)
-	    return true;
+    if (ms_region_with_room(n_words, false))
+	return true;
     return ms_may_map();
 }
 
@@ -1968,6 +1991,7 @@ ms_region_reset(ms_region_t *r)
     r->top = r->sweep_top = r->start;
     r->live_words = 0;
     r->empty_cycles++;
+    ms_virgin_grew();
 }
 
 /* Unmap empty regions beyond the budget (hysteresis: empty for
