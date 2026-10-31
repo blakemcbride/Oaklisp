@@ -52,10 +52,11 @@
 	   ;; NATIVE-CATCH is a macro, so in a bootstrap pass whose
 	   ;; compiling world has the older one, every other file's
 	   ;; catches store the bindings list alone; its cdr is a list
-	   ;; or nil, never a process or 0.
-	   (new? (and (pair? saved)
+	   ;; or nil, never a process or 0.  Both are made by CONS, so
+	   ;; the type tests are exact rather than calls of PAIR?.
+	   (new? (and (eq? (get-type saved) cons-pair)
 		      (not (null? (cdr saved)))
-		      (not (pair? (cdr saved)))))
+		      (not (eq? (get-type (cdr saved)) cons-pair))))
 	   (bindings (if new? (car saved) saved))
 	   (saved-process (if new? (cdr saved) 0))
 	   (here (%load-process)))
