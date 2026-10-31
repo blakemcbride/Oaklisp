@@ -644,4 +644,5 @@ read_world_stream(FILE * d, const char *str)
   /* Everything the native direct-call sites cached went with the old
      heap. */
   oak_native_flush_sites();
+  oak_gmc_flush();
 }

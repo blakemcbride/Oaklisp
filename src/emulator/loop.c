@@ -1926,9 +1926,9 @@ loop(ref_t initial_tos)
 #endif
 		      /* Search the type hierarchy. */
 		      ref_t meth_type, offset = INT_TO_REF(0);
-
-		      find_method_type_pair(x, y_type,
-					    &e_current_method, &meth_type);
+		      bool gmc_hit =
+			oak_find_method(x, y_type,
+					&e_current_method, &meth_type);
 
 		      if (e_current_method == e_nil)
 			{
@@ -1949,8 +1949,12 @@ loop(ref_t initial_tos)
 
 #ifdef OP_TYPE_METH_CACHE
 		      maybe_put(trace_mcache, "M");
-		      /* Cache the results of this search (dispatch.c). */
-		      oak_mcache_fill(x, y_type, e_current_method, offset);
+		      /* Cache the results of this search (dispatch.c),
+			 unless the global cache had them. */
+		      if (!gmc_hit)
+			oak_mcache_fill(x, y_type, e_current_method, offset);
+#else
+		      (void)gmc_hit;
 #endif
 		    }
 #if defined(OP_TYPE_METH_CACHE) && defined(THREADS)
@@ -2434,7 +2438,7 @@ loop(ref_t initial_tos)
 
 		e_current_method = e_nil;
 
-		find_method_type_pair(x, the_type,
+		oak_find_super_method(x, the_type,
 				      &e_current_method, &meth_type);
 
 		if (e_current_method == e_nil)

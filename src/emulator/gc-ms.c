@@ -46,6 +46,7 @@
 #include "stacks.h"
 #include "signals.h"
 #include "oak-atomic.h"
+#include "native.h"
 #include "threads.h"
 
 #ifdef _WIN32
@@ -1950,6 +1951,10 @@ static bool   lazy_sweep_active;	/* true when regions remain to sweep */
 void
 ms_prepare_lazy_sweep(void)
 {
+    /* The sweep frees what the mark did not reach, and its memory is
+       used again: the global method cache's raw refs go first. */
+    oak_gmc_flush();
+
     /* Clear all free lists — they will be rebuilt incrementally
        as blocks are lazily swept. */
     for (int i = 0; i < NUM_SIZE_CLASSES; i++)

@@ -39,6 +39,9 @@ extern void oak_native_register(const void *module_info);
    refs and function pointers, so the GC, a world load and module
    registration each call this. */
 extern void oak_native_flush_sites(void);
+/* The global method cache's flush (dispatch.c): wherever the sites'
+   is, objects having moved or been freed. */
+extern void oak_gmc_flush(void);
 
 #include "native-ops.h"
 

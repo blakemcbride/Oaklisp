@@ -904,8 +904,10 @@ gc_top:
       fflush(stdout);
   }
 
-  /* The raw refs cached in native direct-call sites just moved. */
+  /* The raw refs cached in native direct-call sites, and in the
+     global method cache, just moved. */
   oak_native_flush_sites();
+  oak_gmc_flush();
 
 #ifdef USE_MARK_SWEEP
   /* The regions just evacuated go, and the span is the heap, before

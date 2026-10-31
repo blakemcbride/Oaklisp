@@ -225,6 +225,147 @@ oak_mcache_fill(ref_t op, ref_t y_type, ref_t method, ref_t offset)
 #endif
 }
 
+/* The global method cache: what find_method_type_pair answered for an
+   operation and a type -- the method and the type it was found on --
+   for the searches an operation's one-entry cache misses.  That cache
+   holds one type, so a call that sees several types in turn misses it
+   every time, and searched the type graph every time.
+
+   Entries hold raw refs and are no roots: oak_gmc_flush, an epoch
+   bump, empties the cache at every collection that frees or moves
+   objects and at every world load.  ADD-METHOD (%INSTALL-METHOD-WITH-
+   ENV) changes an operation's methods only after parking its one-entry
+   cache (the type slot set to 0), so a search for an operation found
+   parked flushes the cache first; the fill that follows unparks it.
+   With THREADS an entry is read and written under its own sequence
+   count, as the one-entry caches are. */
+
+#define GMC_SIZE 4096
+
+typedef struct
+{
+  size_t seq;			/* odd while being written (THREADS) */
+  size_t epoch;
+  ref_t op, type, method, meth_type;
+} gmc_entry;
+
+static gmc_entry gmc[GMC_SIZE];
+static size_t gmc_epoch = 1;	/* never 0, so the empty entries are stale */
+
+#define GMC_INDEX(op, type)						\
+  ((((size_t)(op) >> 3) ^ (((size_t)(type) >> 3) * 31)) & (GMC_SIZE - 1))
+
+void
+oak_gmc_flush(void)
+{
+#ifdef THREADS
+  size_t e = OAK_ATOMIC_LOAD_REF(&gmc_epoch);
+
+  while (!OAK_ATOMIC_CAS_SIZE(&gmc_epoch, &e, e + 1))
+    ;
+#else
+  gmc_epoch++;
+#endif
+}
+
+static bool
+gmc_read(ref_t op, ref_t type, ref_t *method, ref_t *meth_type)
+{
+  gmc_entry *g = &gmc[GMC_INDEX(op, type)];
+#ifdef THREADS
+  size_t s1 = OAK_ATOMIC_LOAD_REF(&g->seq);
+  ref_t o, t, m, mt;
+  size_t e;
+
+  if (s1 & 1)
+    return false;
+  e = OAK_ATOMIC_LOAD_REF(&g->epoch);
+  o = OAK_ATOMIC_LOAD_REF(&g->op);
+  t = OAK_ATOMIC_LOAD_REF(&g->type);
+  m = OAK_ATOMIC_LOAD_REF(&g->method);
+  mt = OAK_ATOMIC_LOAD_REF(&g->meth_type);
+  OAK_ATOMIC_FENCE_ACQUIRE();
+  if (OAK_ATOMIC_LOAD_REF(&g->seq) != s1
+      || e != OAK_ATOMIC_LOAD_REF(&gmc_epoch) || o != op || t != type)
+    return false;
+  *method = m;
+  *meth_type = mt;
+  return true;
+#else
+  if (g->epoch != gmc_epoch || g->op != op || g->type != type)
+    return false;
+  *method = g->method;
+  *meth_type = g->meth_type;
+  return true;
+#endif
+}
+
+static void
+gmc_write(ref_t op, ref_t type, ref_t method, ref_t meth_type)
+{
+  gmc_entry *g = &gmc[GMC_INDEX(op, type)];
+#ifdef THREADS
+  size_t s = OAK_ATOMIC_LOAD_REF(&g->seq);
+
+  /* Another writer has it: leave the entry be. */
+  if ((s & 1) || !OAK_ATOMIC_CAS_SIZE(&g->seq, &s, s + 1))
+    return;
+  OAK_ATOMIC_FENCE_RELEASE();
+  OAK_ATOMIC_STORE_REF(&g->epoch, OAK_ATOMIC_LOAD_REF(&gmc_epoch));
+  OAK_ATOMIC_STORE_REF(&g->op, op);
+  OAK_ATOMIC_STORE_REF(&g->type, type);
+  OAK_ATOMIC_STORE_REF(&g->method, method);
+  OAK_ATOMIC_STORE_REF(&g->meth_type, meth_type);
+  OAK_ATOMIC_STORE_REF(&g->seq, s + 2);
+#else
+  g->epoch = gmc_epoch;
+  g->op = op;
+  g->type = type;
+  g->method = method;
+  g->meth_type = meth_type;
+#endif
+}
+
+/* True when the global cache answered.  A caller then leaves the
+   operation's one-entry cache as it is: refilling it on every such hit
+   is what made a call seeing several types in turn pay for a fill
+   every time, and the type it holds keeps hitting there. */
+bool
+oak_find_method(ref_t op, ref_t obj_type, ref_t *method_ptr,
+		ref_t *type_ptr)
+{
+#ifdef THREADS
+  ref_t cached = OAK_ATOMIC_LOAD_REF(&REF_SLOT(op, OPERATION_CACHE_TYPE_OFF));
+#else
+  ref_t cached = REF_SLOT(op, OPERATION_CACHE_TYPE_OFF);
+#endif
+
+  if (cached == INT_TO_REF(0))
+    oak_gmc_flush();		/* parked: methods changed since its last fill */
+  else if (gmc_read(op, obj_type, method_ptr, type_ptr))
+    return true;
+  find_method_type_pair(op, obj_type, method_ptr, type_ptr);
+  if (*method_ptr != e_nil)
+    gmc_write(op, obj_type, *method_ptr, *type_ptr);
+  return false;
+}
+
+/* For ^SUPER: the method of OP for TYPE as oak_find_method finds it.
+   ^SUPER fills no cache of its own, so an operation found parked
+   would stay parked and flush the global cache at every ^SUPER;
+   filling its one-entry cache for TYPE unparks it. */
+void
+oak_find_super_method(ref_t op, ref_t type, ref_t *method_ptr,
+		      ref_t *type_ptr)
+{
+  bool parked = REF_SLOT(op, OPERATION_CACHE_TYPE_OFF) == INT_TO_REF(0);
+
+  oak_find_method(op, type, method_ptr, type_ptr);
+  if (parked && *method_ptr != e_nil)
+    oak_mcache_fill(op, type, *method_ptr,
+		    lookup_bp_offset(type, *type_ptr));
+}
+
 /* For natively compiled code (oak-native.h): find the method as
    FUNCALL does, filling the operation's method cache. */
 ref_t
@@ -232,12 +373,13 @@ oak_native_find_method(ref_t op, ref_t y_type, ref_t *offset)
 {
   /* Left alone when there is no method. */
   ref_t method = e_nil, meth_type;
+  bool cached = oak_find_method(op, y_type, &method, &meth_type);
 
-  find_method_type_pair(op, y_type, &method, &meth_type);
   if (method == e_nil)
     return e_nil;
   *offset = lookup_bp_offset(y_type, meth_type);
-  oak_mcache_fill(op, y_type, method, *offset);
+  if (!cached)
+    oak_mcache_fill(op, y_type, method, *offset);
   return method;
 }
 

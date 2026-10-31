@@ -100,6 +100,16 @@ lookup_bp_offset(ref_t y_type, ref_t meth_type)
 extern void find_method_type_pair(ref_t op, ref_t obj_type,
 				  ref_t * method_ptr, ref_t * type_ptr);
 
+/* find_method_type_pair through the global method cache (dispatch.c),
+   which every search on a miss of an operation's own cache goes
+   through; oak_gmc_flush empties it, as every collection that frees or
+   moves objects and every world load must. */
+extern bool oak_find_method(ref_t op, ref_t obj_type,
+			    ref_t * method_ptr, ref_t * type_ptr);
+extern void oak_gmc_flush(void);
+extern void oak_find_super_method(ref_t op, ref_t type,
+				  ref_t * method_ptr, ref_t * type_ptr);
+
 /* An operation's one-entry method cache (OP_TYPE_METH_CACHE): the
    method and bp offset for the type of its last argument.  With
    THREADS a fill is guarded by a sequence count striped by operation

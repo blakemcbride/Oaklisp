@@ -827,7 +827,7 @@ oak_rt_super_call(oak_rt_fn * fn)
   y_type = get_type(y);
 
   e_current_method = e_nil;
-  find_method_type_pair(x, the_type, &e_current_method, &meth_type);
+  oak_find_super_method(x, the_type, &e_current_method, &meth_type);
   if (e_current_method == e_nil)
     {
       /* No handler: put the type back and let the caller trap. */
