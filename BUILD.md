@@ -356,33 +356,36 @@ threads of its own; see Threads.md.  Unused, the option costs little:
 the mark-sweep collector by itself (a bump allocation into a
 thread-local buffer, a sweep that makes one free entry of each run of
 dead objects, a heap of 1 MB regions mapped on demand within a budget
-that starts at four times the default build's) runs the benchmarks
-within a few percent of the default build's speed, and the thread
-support (per-thread registers, the lock-free allocation fast path,
-the guarded sections) costs up to 30% on top.  Measured with "make
-bench" on the same world, FAST builds pinned to one core (ratio of CPU
-time to the default build):
+that starts at four times the default build's, its cycles on a GC
+thread of their own) runs the benchmarks within a few percent of the
+default build's speed, and the thread support (per-thread registers,
+the lock-free allocation fast path, the guarded sections) costs up to
+about 10% on top.  Measured with "make bench" on the same world, FAST
+builds pinned to one core, the GC thread sharing it (ratio of CPU
+time to the default build; the -DTHREADS column from 2026-10-29, its
+code unchanged since):
 
 	                  -DTHREADS   -DUSE_MARK_SWEEP   both (--enable-threads)
-	tak                  1.15           1.05              1.11
-	fib                  1.10           1.05              1.04
-	bignum               1.18           0.92              1.06
-	sort                 1.10           1.04              1.10
-	cons                 1.30           0.94              0.98
-	strings              1.22           1.18              1.31
-	hash                 1.09           1.01              1.13
-	dispatch             1.06           1.02              1.08
-	eval                 1.17           1.06              1.14
-	format               1.15           1.10              1.07
-	compile              1.22           1.00              1.15
+	tak                  1.15           1.02              1.04
+	fib                  1.10           1.02              1.10
+	bignum               1.18           0.98              0.94
+	sort                 1.10           1.03              1.03
+	cons                 1.30           0.87              0.78
+	strings              1.22           1.05              1.11
+	hash                 1.09           1.01              1.04
+	dispatch             1.06           1.02              1.01
+	eval                 1.17           1.02              1.03
+	format               1.15           1.05              1.09
+	compile              1.22           1.00              1.00
 
 These ratios move with the interpreter's code layout as much as with
 the collector: between the region-heap commit and the one before it,
 the --enable-threads build slowed by 4 to 9% on every benchmark, tak,
 fib and dispatch included, which never allocate, and the same sources
 built with "-falign-labels=16 -falign-jumps=32 -falign-loops=32" ran
-every benchmark at or under the earlier times.  Take the table as
-bounds, not as the cost of any one feature.
+every benchmark at or under the earlier times; the GC thread's commit
+moved them back as much the other way.  Take the table as bounds, not
+as the cost of any one feature.
 
 With threads in use, "tests/bench.sh -p 4" (four copies of tak, each
 on an OS thread, against the same on one thread, wall clock) runs

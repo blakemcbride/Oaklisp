@@ -75,7 +75,7 @@ static const char *const gc_event_name[GC_EV_COUNT] = {
   "initial-mark pause",
   "remark pause",
   "  threads stopping",
-  "concurrent cycle, its thread",
+  "concurrent cycle, GC thread",
   "safepoint wait",
   "allocation wait",
   "all global pauses",

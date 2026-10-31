@@ -411,10 +411,13 @@ if ((highcrap != 0x0) && (highcrap != 0x7)) {code;} }
 
 
 
-/* Leaving r unsigned lets us checks for negative and too big in one shot: */
+/* Leaving r unsigned lets us checks for negative and too big in one shot.
+   The value read goes through the concurrent mark's weak-read barrier
+   (satb_weak_read, below; a no-op without the mark-sweep collector), in
+   the interpreter and in generated C alike. */
 #define wp_to_ref(r)					\
   ( (size_t)REF_TO_INT(r) >= (size_t) wp_index ?	\
-   e_nil : wp_table[1+(size_t)REF_TO_INT((r))] )
+   e_nil : satb_weak_read(wp_table[1+(size_t)REF_TO_INT((r))]) )
 
 
 /* This is used to allocate some storage.  It calls gc when necessary. */
@@ -466,7 +469,8 @@ if ((highcrap != 0x0) && (highcrap != 0x7)) {code;} }
 extern volatile int ms_verify_stw_owner;
 extern void ms_verify_stw_alloc(int idx, const char *how);
 #define VERIFY_STW_ALLOC(idx, how)					\
-  if (ms_verify_stw_owner >= 0 && ms_verify_stw_owner != (idx))		\
+  if (ms_verify_stw_owner != MS_NO_STW_OWNER					\
+      && ms_verify_stw_owner != (idx))					\
     ms_verify_stw_alloc((idx), (how));
 extern void ms_verify_log_alloc(ref_t *p, int path, size_t words);
 #define VERIFY_LOG_ALLOC(p, path, n) ms_verify_log_alloc((p), (path), (n));
@@ -525,7 +529,19 @@ extern void ms_verify_log_alloc(ref_t *p, int path, size_t words);
 /* SATB write barrier — no-op when mark-sweep GC is not enabled. */
 #ifndef USE_MARK_SWEEP
 #define SATB_BARRIER(addr) ((void)0)
+#define SATB_READ_WEAK(v) ((void)0)
 #endif
+
+/* A value read through a weak pointer (wp_to_ref), logged during a
+   concurrent mark (gc-ms.h, SATB_READ_WEAK): an object the snapshot
+   held only weakly is otherwise invisible to the mark once it is
+   stored into a black object. */
+static inline ref_t
+satb_weak_read(ref_t v)
+{
+  SATB_READ_WEAK(v);
+  return v;
+}
 
 /* These get slots out of Oaklisp objects, and may be used as lvalues. */
 

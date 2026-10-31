@@ -77,6 +77,7 @@ typedef struct ms_region {
     ref_t *sweep_top;		/* top at the cycle's start: the sweep's limit */
     uint64_t *objstart;		/* 1 bit per word: an object starts here */
     uint64_t *mark;		/* 1 bit per word: the object here is marked */
+    uint64_t *freebm;		/* 1 bit per word: a free-list entry starts here */
     size_t chunks;
     size_t slot;		/* the first of its chunks' slots (GET-DATA) */
     size_t live_words;		/* what the last sweep found live */
@@ -174,9 +175,25 @@ void ms_record_transport(ref_t *new_place);
 /* The GC and FULL-GC instructions: a collection asked for by the
    program. */
 void ms_collect_explicit(const char *reason);
+
 #ifdef THREADS
-bool ms_collect_was_coordinator(void);
+/* With threads the cycles run on a GC thread of their own, started
+   at the first request (gc-ms.c, "The GC thread").  It has no slot
+   in the thread arrays -- it runs no Oaklisp code, allocates nothing
+   and is no root -- and is known by this index in index_key and
+   oak_thread_index_var. */
+#define MS_GC_THREAD_INDEX (-1)
+
+/* The copying collector (a dump) and LOAD-WORLD move or unmap the
+   heap under the GC thread: hold waits for a cycle in progress to
+   end and keeps the next from starting, parked at a safepoint
+   meanwhile; release lets them go on. */
+void ms_gc_hold(void);
+void ms_gc_release(void);
 #endif
+/* Verify mode: the index of the thread that has the world stopped,
+   or this when none has. */
+#define MS_NO_STW_OWNER (-2)
 
 /* Try to allocate n_words from free lists.  Returns pointer to the
    first word of a region of at least n_words, or NULL if no free list
@@ -279,6 +296,13 @@ extern size_t satb_size;
    Called from the SATB_BARRIER macro; do not call directly. */
 void satb_log_old(ref_t *addr);
 
+/* Log a value read through a weak pointer (SATB_READ_WEAK).  Every
+   object reachable at the snapshot is marked by the snapshot's own
+   rules; an object the snapshot held only weakly, read through its
+   weak pointer during the mark and stored into a black object, would
+   not be -- so the read logs it, and the remark marks it. */
+void satb_log_value(ref_t v);
+
 /* Drain all SATB buffers.  In Phase 4 this will feed entries to the
    concurrent marker; for now it just clears the buffers. */
 void satb_flush_all(void);
@@ -290,6 +314,12 @@ void satb_flush_all(void);
 #define SATB_BARRIER(addr) \
     do { if (OAK_UNLIKELY(gc_satb_active)) \
 	     satb_log_old(addr); } while (0)
+
+/* The read barrier on weak pointers: after wp_to_ref, on the value. */
+#undef SATB_READ_WEAK
+#define SATB_READ_WEAK(v) \
+    do { if (OAK_UNLIKELY(gc_satb_active)) \
+	     satb_log_value(v); } while (0)
 
 
 /* ------------------------------------------------------------------ */
@@ -309,17 +339,14 @@ enum gc_phase_t {
 extern volatile int gc_phase;
 
 #ifdef THREADS
-/* True while a concurrent mark-sweep cycle is in progress.
-   Threads that exhaust the heap wait instead of starting a second
-   collection. */
+/* True while a concurrent mark-sweep cycle is in progress on the GC
+   thread.  A thread that exhausts the heap waits for the cycle to
+   end instead of starting one. */
 extern volatile int gc_concurrent_in_progress;
 
-/* Initialize concurrent GC synchronization (called once at startup). */
+/* Initialize concurrent GC synchronization (called once at startup,
+   before ms_init). */
 void gc_safepoint_init(void);
-
-/* Wait for an in-progress concurrent GC to complete.
-   Called from ms_collect when a second thread needs collection. */
-void ms_wait_concurrent_gc(void);
 #endif
 
 /* Drain all SATB buffers into the GC mark stack so that the

@@ -53,10 +53,10 @@ Key files and `#ifdef THREADS` sections:
 | `data.h` | Per-thread register macros, the per-thread alarm clock in `register_set_t`, `ALLOCATE_PROT` (the TLAB fast path), GC buffer arrays |
 | `loop.c` | Opcodes 67-72, `POLL_GC_SIGNALS()`, the method cache's striped seqlock reads, the NATIVE instruction's hand-over |
 | `gc.c` | `FORTHREADS` macro, per-thread root scanning, the stop-the-world handshake |
-| `gc-ms.c`, `gc-ms.h` | Concurrent mark-sweep: the region heap and its lookup table, TLABs, SATB barrier buffers, the coalescing sweep, the budget, verify mode |
+| `gc-ms.c`, `gc-ms.h` | Concurrent mark-sweep: the GC thread and the pacing, the region heap and its lookup table, TLABs, SATB barrier buffers, the coalescing sweep, the budget, verify mode |
 | `oaklisp.c`, `embed-native.c` | The two entry points: thread 0 through `oak_thread0_init`, the thread entry (`loop` or the native call driver) |
 | `stacks.c` | Thread index retrieval in `init_stacks()`, a thread's exit on context underflow |
-| `dispatch.h`, `dispatch.c` | `oak_mcache_read`/`oak_mcache_fill`: the operations' method caches under their striped sequence counts, for the interpreter and native code |
+| `dispatch.h`, `dispatch.c` | `oak_mcache_read`/`oak_mcache_fill`: the operations' method caches under their striped sequence counts, for the interpreter and native code; the global method cache (`gmc_read`/`gmc_write`, an entry under its own sequence count; `oak_gmc_flush`, an epoch bump by CAS) |
 | `oak-native.h`, `native.c`, `native-ops.c` | Natively compiled code: `my_index` is the thread-local `oak_thread_index_var`, `ON_STORE` (barrier), `ON_PENDING` (rendezvous), seqlocked call sites, the registry under `native_lock`, `oak_native_run_thread` |
 | `config.h` | `MAX_THREAD_COUNT` (200), disables move-to-front under threads |
 
@@ -82,20 +82,30 @@ Global shared state:
                                        fast path writes its own bitmap words
     gc_pending, gc_ready[]          GC coordination flags
     free_list_heads[]               Segregated free lists
+    gc_requested, gc_hold,          The GC thread's requests, holds and
+      gc_cycles_done                   completed cycles, under
+                                       gc_concurrent_lock
+    satb_buffer_array[]             Per thread: old values overwritten
+                                       and values read through weak
+                                       pointers during a mark
     new_space, free_point           The dump compaction's destination
                                        (gc.c), with the world stopped
 
-GC coordination: one thread sets `gc_pending`, all others reach a
-safepoint (the interpreter polls every instruction, native code at
-every call, return and backward branch, allocation on its slow path)
-and call `wait_for_gc()`, blocking on `gc_lock`; a parked, sleeping or
-blocked-in-C thread counts as there already.  `next_index` is
-snapshotted at the start of a collection, so a thread created during
-it is never read half-initialized, and a thread that has exited is
-skipped.  The mark phase runs concurrently with two brief pauses
-(initial mark and remark); the sweep is lazy, during allocation; the
-heap grows and shrinks by mapping and unmapping regions, and the
-copying collector runs only to compact it for a dump (see GC.md).
+GC coordination: the GC thread (gc-ms.c; started at the first request,
+no slot in the thread arrays, index -1) sets `gc_pending`, all
+mutators reach a safepoint (the interpreter polls every instruction,
+native code at every call, return and backward branch, allocation on
+its slow path) and call `wait_for_gc()`, blocking on `gc_lock`; a
+parked, sleeping or blocked-in-C thread counts as there already, as
+does one waiting for a cycle.  `next_index` is snapshotted at the
+start of a collection, so a thread created during it is never read
+half-initialized, and a thread that has exited is skipped.  The mark
+phase runs concurrently with two brief pauses (initial mark and
+remark); the sweep is lazy, during allocation; a cycle is asked for
+ahead of the budget so that the mutators keep allocating through it
+(GC.md, "Pacing"); the heap grows and shrinks by mapping and
+unmapping regions, and the copying collector runs only to compact it
+for a dump, holding the GC thread off meanwhile (see GC.md).
 
 Thread-related opcodes:
 
@@ -180,6 +190,10 @@ interpreter:
   (`oak_native_site`) has a sequence count of its own, odd while a
   fill writes it, and a reader trusts the fields it copied only if the
   count is unchanged, else takes the long way.
+- A miss in the one-entry cache asks the global (operation, type) ->
+  method cache (`oak_find_method`, dispatch.c) before searching the
+  type graph; each entry has a sequence count of its own, read and
+  written the same way.
 - Module registration, name resolution and site fills take
   `native_lock`/`site_lock`; the function table grows in chunks that
   never move, so a stub's index is read without a lock.
@@ -246,6 +260,16 @@ Thread Safety
   offset, and makes it even again; a hit needs the same even count
   before and after its reads.  `OP_METH_ALIST_MTF` is off under
   threads: it would mutate the shared alists.
+- The global method cache -- the same seqlock per entry (`seq` in
+  `gmc_entry`), a fill skipped when another holds the entry, and an
+  epoch: an entry counts only while its epoch is the current one.
+  `oak_gmc_flush` bumps the epoch with a CAS, at every mark-sweep
+  cycle (`ms_prepare_lazy_sweep`, before the sweep frees anything),
+  every copying collection and every world load, since entries hold
+  raw refs and are no roots; and a search that finds an operation's
+  one-entry cache parked by `%install-method-with-env` flushes it
+  first.  The native call-site caches, raw refs likewise, are flushed
+  at the same points (`oak_native_flush_sites`).
 - A thread whose thunk returns underflows its context stack, which
   `stack_unflush` turns into the thread's exit (`oak_thread_exit_unwind`);
   a failed `pthread_create` frees what it had allocated; a thread's
@@ -303,10 +327,12 @@ Performance
   of the process; the mutex carries its two winding thunks, made
   once.
 - **Cost**: `make bench` against the default build, same world, CPU
-  time: within 5% on tak, fib, cons, bignum and dispatch; the rest up
-  to 1.2x (`strings`, `format`: interning and output under their
-  guards; BUILD.md has the table).  `bench.sh -p N` runs N copies of
-  tak on N threads: 3.7x on four, bytecode and native alike.
+  time, measured after the region heap: 0.98x to 1.31x (`strings`
+  1.31, `eval` 1.14, `hash` 1.13, `compile` 1.15; BUILD.md has the
+  table), ratios that move 4 to 9% with the interpreter's code
+  layout.  Under oakc the string benchmark takes 1.4x to 1.8x the
+  default build's time (Speed.md).  `bench.sh -p N` runs N copies of
+  tak on N threads: 3.9x on four, bytecode and native alike.
 
 See `GC.md` for full garbage collection documentation.
 
@@ -349,6 +375,7 @@ safe (ThreadUpdate.md Phase 3):
 | Winding stack, pending rewind | unwind-protect.oak | per process, a new process starting with its creator's (its extent begins inside the creator's). A throw to another process's catch (an error in a forced promise, handled by the forcer) unwinds the thrower's own windings as the thrower, then restores the catcher as the current process and unwinds its windings to the catch |
 | Error handlers | error2.oak | a fluid, so per process |
 | Method cache | dispatch.c, loop.c | striped seqlock; `OP_METH_ALIST_MTF` off |
+| Global method cache | dispatch.c | a seqlock per entry; an epoch, bumped by CAS, flushes it at every collection, world load and parked lookup |
 | Operation-method alists, bp alists | kernel1-install.oak | `%install-method-with-env` under `*add-method-mutex*`; readers walk lists that only grow at the head or have a cdr replaced |
 | Mixed-type cache | mix-types.oak | `*mix-types-mutex*` around the walk and the insert; the type is made outside it |
 | Expression table, fancy accessors | anonymous.oak | `*expression-table-mutex*` (reentrant: evaluation inside can print) |
@@ -418,9 +445,8 @@ Not required for the current thread support:
   that incremental
 - **Locks per stream**: `print` to a shared stream from several
   threads without interleaving (only `format` is atomic per call)
-- **No allocation stalls during marking**: GCEnhancements.md (the
-  copying fallback is gone, its Phase 2; a thread out of memory
-  during a cycle maps a region within the budget and parks only
-  beyond it)
+- **Parallel marking** and **per-thread handshakes** (no global
+  pauses): GCEnhancements.md Phases 5 and 6; the GC thread and the
+  pacing (its Phase 3) are done
 - **Parallel marking**: Multiple GC worker threads share the mark
   stack, reducing mark phase latency on multi-core systems

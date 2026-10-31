@@ -83,6 +83,23 @@ static size_t ms_slots_ptr;		/* ms_slot_table_t *, published */
 /* The copying collector's destination span (ms_evacuate_begin). */
 static size_t evac_chunks;
 
+/* Pacing (with threads; 0 without): the words the mutators may map
+   past the budget while a cycle runs, and before it that a cycle is
+   asked for ahead of the budget (ms_set_pacing). */
+static size_t ms_headroom;
+/* Words handed out since the last cycle's snapshot (its initial
+   mark): with what that mark found live, the heap's occupancy, which
+   the trigger compares with the budget. */
+static size_t ms_since_snapshot;
+#ifdef THREADS
+static void ms_request_cycle(const char *reason);
+static int gc_requested;
+#endif
+
+/* The lazy sweep's state (defined with it, below). */
+static ms_region_t *sweep_region;
+static bool lazy_sweep_active;
+
 #define BM_WORDS(r)	(((r)->chunks * MS_REGION_WORDS + 63) / 64)
 #define BM_IDX(r, p)	((size_t)((p) - (r)->start))
 #define BM_SET(bm, i)	((bm)[(i)/64] |=  (1ULL << ((i) % 64)))
@@ -102,6 +119,39 @@ ms_objstart_set(ms_region_t *r, ref_t *p)
     (void)OAK_ATOMIC_FETCH_OR_U64(&r->objstart[i / 64], 1ULL << (i % 64));
 #else
     BM_SET(r->objstart, i);
+#endif
+}
+
+/* The free bit of a free-list entry's first word: set as the entry is
+   made, cleared as it is taken (under alloc_lock), and tested by the
+   marker, which may run meanwhile: a reference landing in a free
+   entry is garbage, and marking the entry would trace the dead
+   objects in it and whatever they point to, as it did before -- harmless,
+   but it kept garbage alive and made verify mode follow it.  A stale
+   reading costs nothing: an entry taken during a mark is born black
+   by its taker, and one not yet seen as free is merely marked as
+   before. */
+static inline void
+ms_free_set(ms_region_t *r, ref_t *p)
+{
+    size_t i = BM_IDX(r, p);
+
+#ifdef THREADS
+    (void)OAK_ATOMIC_FETCH_OR_U64(&r->freebm[i / 64], 1ULL << (i % 64));
+#else
+    BM_SET(r->freebm, i);
+#endif
+}
+
+static inline void
+ms_free_clear(ms_region_t *r, ref_t *p)
+{
+    size_t i = BM_IDX(r, p);
+
+#ifdef THREADS
+    (void)OAK_ATOMIC_FETCH_AND_U64(&r->freebm[i / 64], ~(1ULL << (i % 64)));
+#else
+    BM_CLR(r->freebm, i);
 #endif
 }
 
@@ -254,8 +304,10 @@ ms_region_new(void *mem, size_t chunks)
     bm = BM_WORDS(r) * sizeof(uint64_t);
     r->objstart = (uint64_t *)xmalloc(bm);
     r->mark = (uint64_t *)xmalloc(bm);
+    r->freebm = (uint64_t *)xmalloc(bm);
     memset(r->objstart, 0, bm);
     memset(r->mark, 0, bm);
+    memset(r->freebm, 0, bm);
     r->slot = ms_slot_alloc(r);
     ms_table_set(r, r);
     if (ms_regions_tail)
@@ -301,6 +353,7 @@ ms_region_free(ms_region_t *r)
 {
     free(r->objstart);
     free(r->mark);
+    free(r->freebm);
 #ifdef OAK_GC_VERIFY
     free(r->verify_snap);
     free(r->verify_born);
@@ -384,27 +437,107 @@ ms_crunch(size_t i)
     return p < r->end ? p : NULL;
 }
 
-/* Whether a region may be mapped: within the budget.  The budget is
-   e_next_newspace_size (LOAD-REG/STORE-REG next-newspace-size), set
-   after every cycle to the copying collector's rule, never below the
-   configured heap size (--size-heap, original_newspace_size). */
+/* Whether a region may be mapped: within the budget plus the headroom.
+   The budget is e_next_newspace_size (LOAD-REG/STORE-REG
+   next-newspace-size), set after every cycle to the copying
+   collector's rule, never below the configured heap size (--size-heap,
+   original_newspace_size).  With threads a cycle is asked for when the
+   heap reaches the budget less the headroom (ms_region_map), and the
+   mutators go on mapping up to the budget plus the headroom while it
+   runs; a thread that needs more than that waits for the cycle.  The
+   headroom is twice what was allocated during the last cycle's mark,
+   between an eighth and a half of the budget. */
 #define MS_RECLAIM_FACTOR 3
 
 static bool
 ms_may_map(void)
 {
-    return ms_mapped < (size_t)e_next_newspace_size;
+    size_t limit = (size_t)e_next_newspace_size + ms_headroom;
+
+#ifdef MAX_NEW_SPACE_SIZE
+    if (limit > MAX_NEW_SPACE_SIZE)
+	limit = MAX_NEW_SPACE_SIZE;
+#endif
+    return ms_mapped < limit;
 }
 
 /* Words of the objects the mark traced this cycle: the live data, less
    what was born black meanwhile. */
 static size_t marked_words;
 
+/* Words allocated while the last cycle's mark ran, and whether a
+   thread ran out of room and waited during the cycle.  What is
+   allocated during a mark is born black and freed only by the next
+   cycle, so the budget counts twice that on top of three times the
+   live data (a program allocating faster than a mark runs would
+   otherwise find each sweep freeing next to nothing, and wait at
+   every cycle); it is also at least the live data plus
+   MS_CYCLE_SPACING times that, so that a program allocating fast
+   against little live data gets a cycle every so many cycle lengths
+   rather than one after another (every cycle costs every thread two
+   pauses), and at least MS_MIN_CYCLE_MS of allocation at the rate
+   measured between the last two snapshots, for the same reason; and
+   it grows by half after a cycle in which a thread waited.  The
+   headroom is what was allocated during the mark, between an eighth
+   and a half of the budget. */
+static size_t ms_alloc_during_mark;	/* smoothed over the cycles */
+#ifdef THREADS
+static double ms_alloc_rate;		/* words per ms, smoothed */
+static gc_ns_t ms_snapshot_ns;		/* when the mark began */
+static bool ms_waited;
+#endif
+#define MS_CYCLE_SPACING 16
+#define MS_MIN_CYCLE_MS 32
+
+static void
+ms_set_pacing(void)
+{
+#ifdef THREADS
+    size_t budget = (size_t)e_next_newspace_size;
+    size_t h = ms_alloc_during_mark;
+
+    if (h < budget / 8)
+	h = budget / 8;
+    if (h > budget / 2)
+	h = budget / 2;
+    if (trace_gc > 1 && h != ms_headroom)
+	fprintf(stderr, "; MS-GC: %zu words allocated during the mark%s:"
+		" headroom %zu -> %zu.\n", ms_alloc_during_mark,
+		ms_waited ? ", a thread waited" : "", ms_headroom, h);
+    ms_headroom = h;
+    ms_waited = false;
+#else
+    ms_headroom = 0;
+#endif
+}
+
 static void
 ms_set_budget(size_t amount)
 {
     size_t want = MS_RECLAIM_FACTOR * marked_words + amount;
 
+#ifdef THREADS
+    {
+	/* Between cycles: at least MS_CYCLE_SPACING marks' worth of
+	   allocation, and at least MS_MIN_CYCLE_MS of it at the rate
+	   measured between the last two snapshots. */
+	size_t spacing = MS_CYCLE_SPACING * ms_alloc_during_mark;
+	size_t period = (size_t)(ms_alloc_rate * MS_MIN_CYCLE_MS);
+	size_t old = (size_t)e_next_newspace_size;
+
+	want += 2 * ms_alloc_during_mark;
+	if (period > spacing)
+	    spacing = period;
+	if (want < marked_words + 2 * ms_alloc_during_mark + spacing)
+	    want = marked_words + 2 * ms_alloc_during_mark + spacing;
+	if (ms_waited && want < old + old / 2)
+	    want = old + old / 2;
+	/* No more than doubled in one cycle: one long cycle, with a
+	   lot allocated during it, is not a trend. */
+	if (want > 2 * old)
+	    want = 2 * old;
+    }
+#endif
     if (want < original_newspace_size)
 	want = original_newspace_size;
 #ifdef MAX_NEW_SPACE_SIZE
@@ -416,6 +549,7 @@ ms_set_budget(size_t amount)
 		"budget %zu -> %zu.\n", marked_words, ms_mapped,
 		(size_t)e_next_newspace_size, want);
     e_next_newspace_size = want;
+    ms_set_pacing();
 }
 
 
@@ -502,10 +636,6 @@ static void ms_sweep_run_end(ref_t **run_start, size_t *run_len);
 #define TLAB_MIN_FREE 257	/* a free run this big can be a TLAB */
 static bool tlab_free_none;
 
-#ifdef THREADS
-static void ms_born_record(ref_t *p, size_t words);
-#endif
-
 /* An entry's size field, checked: a zero would loop the allocator,
    and in a debugging build an entry running past its region is a
    corrupt list. */
@@ -539,20 +669,19 @@ ms_free_list_alloc(size_t n_words)
 		continue;
 	    }
 	    if (actual_size >= n_words) {
+		ms_region_t *r = ms_region_of(p);
+
 		*prev = (ref_t *)(*p);
-		ms_objstart_set(ms_region_of(p), p);
+		ms_objstart_set(r, p);
+		ms_free_clear(r, p);
 		free_list_total_words -= actual_size;
+		ms_since_snapshot += actual_size;
 
 		/* Born-black: during concurrent mark, objects allocated
 		   from the free list (below sweep_top) must have their
-		   mark bit set so sweep doesn't reclaim them, and are
-		   scanned at the remark. */
-		if (OAK_UNLIKELY(gc_phase >= GC_PHASE_CONCURRENT_MARK)) {
+		   mark bit set so sweep doesn't reclaim them. */
+		if (OAK_UNLIKELY(gc_phase >= GC_PHASE_CONCURRENT_MARK))
 		    ms_mark_alloc(p);
-#ifdef THREADS
-		    ms_born_record(p, n_words);
-#endif
-		}
 #if defined(THREADS) && defined(OAK_GC_VERIFY)
 		ms_verify_log_alloc(p, 3, n_words);
 #endif
@@ -596,21 +725,20 @@ ms_free_list_alloc(size_t n_words)
 
 		*prev = (ref_t *)(*p);
 		ms_objstart_set(r, p);
+		ms_free_clear(r, p);
 		ms_objstart_set(r, rest);
 		rest[0] = (ref_t)free_list_heads[rc];
 		if (rest_size >= 2)
 		    rest[1] = (ref_t)rest_size;
+		ms_free_set(r, rest);
 		free_list_heads[rc] = rest;
 		free_list_total_words -= n_words;
+		ms_since_snapshot += n_words;
 		if (rest_size >= TLAB_MIN_FREE)
 		    tlab_free_none = false;
 
-		if (OAK_UNLIKELY(gc_phase >= GC_PHASE_CONCURRENT_MARK)) {
+		if (OAK_UNLIKELY(gc_phase >= GC_PHASE_CONCURRENT_MARK))
 		    ms_mark_alloc(p);
-#ifdef THREADS
-		    ms_born_record(p, n_words);
-#endif
-		}
 #if defined(THREADS) && defined(OAK_GC_VERIFY)
 		ms_verify_log_alloc(p, 4, n_words);
 #endif
@@ -671,6 +799,7 @@ ms_virgin_take(ms_region_t *r, size_t words, bool aligned)
     if (r->top == r->start)
 	r->empty_cycles = 0;
     ms_filler(r, r->top, (size_t)(start - r->top));
+    ms_since_snapshot += (size_t)(start + words - r->top);
     r->top = start + words;
     return start;
 }
@@ -778,16 +907,22 @@ ms_tlab_from_virgin(size_t min_words, bool force,
 
 /* A TLAB out of a free-list entry: the biggest-class entry of at
    least TLAB_MIN_FREE words, trimmed to aligned edges, the trimmings
-   going back on the lists.  Not during a concurrent mark: objects
-   allocated below sweep_top then must be born black, which the fast
-   path does not do (and the cycle began by retiring every TLAB;
-   refills come from the virgin tails, above sweep_top, until it
-   ends). */
+   going back on the lists.  During a concurrent mark the TLAB lies
+   below its region's sweep_top, so everything allocated in it must be
+   born black, which the fast path does not do: the TLAB's mark bits
+   are all set as it is carved (ms_blacken), whole bitmap words of its
+   own, so every object later placed in it is marked wherever it
+   starts.  The sweep looks at objstart bits only, so the bits at
+   other positions are harmless, and the next cycle clears them. */
 /* No free run served last time, and none has been added since: the
    search would find nothing again (cleared by the sweeps and the
    split).  TLAB_MIN_FREE is the least size of every entry in the
    classes searched. */
 static bool tlab_free_none = true;
+
+#ifdef THREADS
+static void ms_blacken(ms_region_t *r, ref_t *start, ref_t *end);
+#endif
 
 static ref_t *
 ms_tlab_from_free(size_t min_words, ms_region_t **out_r, ref_t **out_end)
@@ -796,7 +931,7 @@ ms_tlab_from_free(size_t min_words, ms_region_t **out_r, ref_t **out_end)
 
     if (need < TLAB_MIN_FREE)
 	need = TLAB_MIN_FREE;
-    if (gc_phase >= GC_PHASE_CONCURRENT_MARK || tlab_free_none)
+    if (tlab_free_none)
 	return NULL;
     for (int c = NUM_SIZE_CLASSES - 1; c >= 0 && class_max[c] >= need; c--) {
 	ref_t **prev = &free_list_heads[c];
@@ -818,6 +953,7 @@ ms_tlab_from_free(size_t min_words, ms_region_t **out_r, ref_t **out_end)
 		size_t head = (size_t)(start - p);
 
 		*prev = (ref_t *)(*p);
+		ms_free_clear(r, p);
 		free_list_total_words -= actual_size;
 		end -= tail;
 		if (head != 0) {
@@ -831,6 +967,24 @@ ms_tlab_from_free(size_t min_words, ms_region_t **out_r, ref_t **out_end)
 		    ms_objstart_set(r, t);
 		    ms_sweep_run_end(&t, &len);
 		}
+		/* No more than a TLAB's worth; the rest goes back on its
+		   list.  A whole big run as one TLAB counted as handed out
+		   at once, which brought cycles on far too early, and
+		   during a mark its unused tail is retired black at the
+		   remark and freed only by the next cycle. */
+		if ((size_t)(end - start) > TLAB_SIZE) {
+		    ref_t *rest = start + TLAB_SIZE;
+		    size_t len = (size_t)(end - rest);
+
+		    ms_objstart_set(r, rest);
+		    ms_sweep_run_end(&rest, &len);
+		    end = start + TLAB_SIZE;
+		}
+#ifdef THREADS
+		if (OAK_UNLIKELY(gc_phase >= GC_PHASE_CONCURRENT_MARK))
+		    ms_blacken(r, start, end);
+#endif
+		ms_since_snapshot += (size_t)(end - start);
 		*out_r = r;
 		*out_end = end;
 		return start;
@@ -880,6 +1034,17 @@ ms_alloc_slow_locked(size_t n_words, int idx)
 {
     ref_t *p;
 
+#ifdef THREADS
+    /* The trigger: a cycle is asked for when the heap's occupancy --
+       what the last mark found live, and what has been handed out
+       since its snapshot -- comes within the headroom of the budget,
+       so that the cycle ends before the mutators run out of room. */
+    if (!gc_concurrent_in_progress && !gc_requested
+	&& marked_words + ms_since_snapshot + ms_headroom
+	   >= (size_t)e_next_newspace_size)
+	ms_request_cycle("heap at its trigger");
+#endif
+
     /* 1. A small request wants a TLAB, so that the ones after it take
        no lock: out of a big free entry, sweeping for one if need be,
        else out of a virgin tail. */
@@ -921,13 +1086,32 @@ ms_alloc_slow_locked(size_t n_words, int idx)
 	return p;
     }
 
+    if (trace_gc > 2) {
+	ms_region_t *r;
+	size_t rooms = 0, biggest = 0, empties = 0;
+
+	for (r = ms_regions; r; r = r->next) {
+	    size_t room = ms_virgin_room(r, false);
+	    if (room >= n_words)
+		rooms++;
+	    if (room > biggest)
+		biggest = room;
+	    if (r->top == r->start)
+		empties++;
+	}
+	fprintf(stderr, "; MS-GC: no room for %zu words: sweep %s at region"
+		" %p, tlab_free_none %d, virgin_fail %zu/%zu, %zu regions with"
+		" room (biggest %zu), %zu empty, free %zu.\n",
+		n_words, lazy_sweep_active ? "active" : "done",
+		(void *)sweep_region, tlab_free_none, virgin_fail[0],
+		virgin_fail[1], rooms, biggest, empties, free_list_total_words);
+    }
     return NULL;  /* GC needed */
 }
 
 
-/* After this thread's own cycle has left nothing big enough: the heap
-   grows past its budget, which follows.  There is no copying
-   fallback. */
+/* After a cycle has left nothing big enough: the heap grows past its
+   budget, which follows.  There is no copying fallback. */
 static ref_t *
 ms_alloc_beyond_budget(size_t n_words, int idx, const char *reason)
 {
@@ -948,8 +1132,10 @@ ms_alloc_beyond_budget(size_t n_words, int idx, const char *reason)
 	p = ms_virgin_alloc(n_words, false, true);
 	ms_bump_alloc_notify(p, n_words);
     }
-    if (ms_mapped > (size_t)e_next_newspace_size)
+    if (ms_mapped > (size_t)e_next_newspace_size) {
 	e_next_newspace_size = ms_mapped;
+	ms_set_pacing();
+    }
     return p;
 }
 
@@ -967,19 +1153,13 @@ ms_allocate_slow(size_t words, char *reason)
     }
 #endif
     p = ms_alloc_slow_locked(words, idx);
-    /* ms_collect either runs a cycle as the coordinator or, with
-       threads, when another thread's cycle is under way, waits for
-       it; after a wait the retry can still fail, so go round again.
-       After our own cycle, a request still unmet maps a region past
-       the budget. */
+    /* ms_collect runs a cycle, or with threads waits for the GC
+       thread's to end (asking for one if none is running); a request
+       still unmet after it maps a region past the budget. */
     while (!p) {
 	ms_collect(false, reason, words);
 	p = ms_alloc_slow_locked(words, idx);
-#ifdef THREADS
-	if (!p && ms_collect_was_coordinator())
-#else
 	if (!p)
-#endif
 	    p = ms_alloc_beyond_budget(words, idx, reason);
     }
 #if defined(THREADS) && defined(OAK_GC_VERIFY)
@@ -1104,6 +1284,24 @@ satb_log_old(ref_t *addr)
 }
 
 void
+satb_log_value(ref_t v)
+{
+    if (!(v & PTR_MASK))
+	return;
+#ifdef THREADS
+    {
+	int idx = *(int *)oak_tls_get(index_key);
+	satb_room(&satb_buffer_array[idx], satb_count_array[idx],
+		  &satb_size_array[idx]);
+	satb_buffer_array[idx][satb_count_array[idx]++] = v;
+    }
+#else
+    satb_room(&satb_buffer, satb_count, &satb_size);
+    satb_buffer[satb_count++] = v;
+#endif
+}
+
+void
 satb_flush_all(void)
 {
 #ifdef THREADS
@@ -1123,22 +1321,31 @@ satb_flush_all(void)
 volatile int gc_phase = GC_PHASE_IDLE;
 
 #ifdef THREADS
+/*
+ * The GC thread.  Every cycle runs on a thread of its own, started at
+ * the first request, so that no mutator is out of action for the
+ * length of a mark: a mutator asks for a cycle (ms_request_cycle: at
+ * the trigger, or an explicit GC) and goes on, or when it has no room
+ * left waits for the next cycle to end (ms_wait_cycle), parked at a
+ * safepoint.  The GC thread has no slot in the thread arrays: it
+ * runs no Oaklisp code, allocates nothing, holds no roots, and the
+ * stop-the-world handshakes it runs do not wait for it; its index is
+ * MS_GC_THREAD_INDEX.  A dump or a world load, which move or unmap
+ * the heap, hold it off (ms_gc_hold) until they are done.
+ */
 volatile int gc_concurrent_in_progress = 0;
-
-/* Whether the calling thread's last ms_collect ran the cycle itself
-   (as opposed to waiting for another thread's).  Per thread: a single
-   flag let a thread that had only waited see the one another thread's
-   cycle had set. */
-static bool ms_collect_coordinated[MAX_THREAD_COUNT];
-
-bool
-ms_collect_was_coordinator(void)
-{
-    return ms_collect_coordinated[*(int *)oak_tls_get(index_key)];
-}
 
 static oak_mutex_t gc_concurrent_lock = OAK_MUTEX_INITIALIZER;
 static oak_cond_t  gc_concurrent_done_cv = OAK_COND_INITIALIZER;
+static oak_cond_t  gc_request_cv = OAK_COND_INITIALIZER;
+static int gc_requested;		/* a cycle is wanted */
+static const char *gc_request_reason;
+static size_t gc_request_amount;	/* the most a waiter needs */
+static unsigned long gc_cycles_done;
+static int gc_hold;			/* dumps and world loads in progress */
+static bool gc_thread_started;
+
+static void *ms_gc_thread_main(void *arg);
 
 void
 gc_safepoint_init(void)
@@ -1146,15 +1353,117 @@ gc_safepoint_init(void)
 #ifdef OAK_NEEDS_DYNAMIC_MUTEX_INIT
     oak_mutex_init(&gc_concurrent_lock);
     oak_cond_init(&gc_concurrent_done_cv);
+    oak_cond_init(&gc_request_cv);
 #endif
 }
 
-void
-ms_wait_concurrent_gc(void)
+/* Under gc_concurrent_lock. */
+static void
+ms_gc_thread_start_locked(void)
+{
+    oak_thread_t t;
+
+    if (gc_thread_started)
+	return;
+    if (oak_thread_create(&t, ms_gc_thread_main, NULL) != 0) {
+	fprintf(stderr, "\nFatal error: cannot start the GC thread.\n");
+	exit(EXIT_FAILURE);
+    }
+    gc_thread_started = true;
+}
+
+/* Ask for a cycle, unless one is running or already asked for. */
+static void
+ms_request_cycle(const char *reason)
 {
     oak_mutex_lock(&gc_concurrent_lock);
+    if (!gc_concurrent_in_progress && !gc_requested) {
+	gc_requested = 1;
+	gc_request_reason = reason;
+	ms_gc_thread_start_locked();
+	oak_cond_broadcast(&gc_request_cv);
+    }
+    oak_mutex_unlock(&gc_concurrent_lock);
+}
+
+/* No room for AMOUNT words: wait for the next cycle to end (asking
+   for one if none is running), parked at a safepoint.  alloc_lock is
+   held on entry and again on return. */
+static void
+ms_wait_cycle(const char *reason, size_t amount)
+{
+    int idx = *(int *)oak_tls_get(index_key);
+    unsigned long target;
+    gc_timer_t wait;
+
+    gc_stats_begin(&wait, GC_EV_ALLOC_WAIT);
+    if (trace_gc > 1)
+	fprintf(stderr, "; MS-GC: thread %d waits for a cycle (%s, %zu words):"
+		" %zu mapped, budget %zu, headroom %zu, %zu free, phase %d.\n",
+		idx, reason, amount, ms_mapped, (size_t)e_next_newspace_size,
+		ms_headroom, free_list_total_words, gc_phase);
+    oak_mutex_unlock(&alloc_lock);
+    /* Advertise that we are parked for the whole time we are out of
+       action, including while re-acquiring the allocator lock: the
+       stop-the-world handshake spins until every thread's gc_ready
+       flag is set. */
+    gc_ready[idx] = 1;
+    oak_mutex_lock(&gc_concurrent_lock);
+    target = gc_cycles_done + 1;
+    ms_waited = true;
+    if (amount > gc_request_amount)
+	gc_request_amount = amount;
+    if (!gc_concurrent_in_progress && !gc_requested) {
+	gc_requested = 1;
+	gc_request_reason = reason;
+	ms_gc_thread_start_locked();
+	oak_cond_broadcast(&gc_request_cv);
+    }
+    while (gc_cycles_done < target)
+	oak_cond_wait(&gc_concurrent_done_cv, &gc_concurrent_lock);
+    oak_mutex_unlock(&gc_concurrent_lock);
+    /* Leave the parked state the way wait_for_gc does: under gc_lock,
+       which the GC thread holds for the whole of a stop-the-world
+       pause.  Clearing gc_ready without it let a thread woken here run
+       straight through the next cycle's initial mark, which had
+       counted it as parked, so what it allocated meanwhile was neither
+       a root nor born black. */
+    oak_mutex_lock(&gc_lock);
+    gc_ready[idx] = 0;
+    oak_mutex_unlock(&gc_lock);
+    while (oak_mutex_trylock(&alloc_lock) != 0) {
+	if (gc_pending)
+	    wait_for_gc();
+	else
+	    oak_thread_yield();
+    }
+    gc_stats_end(&wait, GC_EV_ALLOC_WAIT, reason);
+}
+
+void
+ms_gc_hold(void)
+{
+    int idx = *(int *)oak_tls_get(index_key);
+
+    /* Parked while waiting: the cycle's pauses need us at a
+       safepoint. */
+    gc_ready[idx] = 1;
+    oak_mutex_lock(&gc_concurrent_lock);
+    gc_hold++;
     while (gc_concurrent_in_progress)
 	oak_cond_wait(&gc_concurrent_done_cv, &gc_concurrent_lock);
+    oak_mutex_unlock(&gc_concurrent_lock);
+    oak_mutex_lock(&gc_lock);
+    gc_ready[idx] = 0;
+    oak_mutex_unlock(&gc_lock);
+}
+
+void
+ms_gc_release(void)
+{
+    oak_mutex_lock(&gc_concurrent_lock);
+    if (gc_hold > 0 && --gc_hold == 0 && gc_requested)
+	oak_cond_broadcast(&gc_request_cv);
     oak_mutex_unlock(&gc_concurrent_lock);
 }
 
@@ -1167,7 +1476,8 @@ stw_request_pause(int my_index_val)
     int gc_thread_count;
     gc_timer_t handshake;
 
-    gc_ready[my_index_val] = 1;
+    if (my_index_val >= 0)
+	gc_ready[my_index_val] = 1;
     set_gc_flag(true);   /* locks gc_lock, sets gc_pending */
     gc_stats_begin(&handshake, GC_EV_HANDSHAKE);
     gc_thread_count = next_index;
@@ -1195,33 +1505,11 @@ stw_request_pause(int my_index_val)
 static void
 stw_release(int my_index_val)
 {
-    gc_ready[my_index_val] = 0;
+    if (my_index_val >= 0)
+	gc_ready[my_index_val] = 0;
     set_gc_flag(false);   /* gc_pending=false, unlocks gc_lock */
 }
 
-/* The objects allocated from free lists during the concurrent mark:
-   born black, below their regions' sweep_top, and scanned at the
-   remark like what the TLABs allocated above it (a reference they
-   hold may be the last to an object the snapshot held only weakly). */
-static struct ms_born { ref_t *p; size_t words; } *born_list;
-static size_t born_count, born_cap;
-
-static void
-ms_born_record(ref_t *p, size_t words)
-{
-    if (born_count >= born_cap) {
-	born_cap = born_cap ? born_cap * 2 : 256;
-	born_list = (struct ms_born *)realloc(born_list,
-					      born_cap * sizeof(*born_list));
-	if (!born_list) {
-	    fprintf(stderr, "gc-ms: born list realloc failed\n");
-	    exit(EXIT_FAILURE);
-	}
-    }
-    born_list[born_count].p = p;
-    born_list[born_count].words = words;
-    born_count++;
-}
 #endif /* THREADS */
 
 
@@ -1248,6 +1536,28 @@ ms_mark_alloc(ref_t *p)
     BM_SET(r->mark, idx);
 #endif
 }
+
+#ifdef THREADS
+/* Born black, the whole of [START, END): a TLAB carved from a free
+   run during the mark.  Whole bitmap words (TLAB_ALIGN), the TLAB's
+   own, though the marker may set a bit in them meanwhile, so atomic. */
+static void
+ms_blacken(ms_region_t *r, ref_t *start, ref_t *end)
+{
+    size_t w0 = BM_IDX(r, start) / 64, w1 = BM_IDX(r, end) / 64, w;
+
+#ifdef OAK_GC_VERIFY
+    if (r->verify_born == NULL) {
+	r->verify_born = (uint64_t *)xmalloc(BM_WORDS(r) * sizeof(uint64_t));
+	memset(r->verify_born, 0, BM_WORDS(r) * sizeof(uint64_t));
+    }
+    for (w = w0; w < w1; w++)
+	OAK_ATOMIC_FETCH_OR_U64(&r->verify_born[w], ~0ULL);
+#endif
+    for (w = w0; w < w1; w++)
+	OAK_ATOMIC_FETCH_OR_U64(&r->mark[w], ~0ULL);
+}
+#endif
 
 
 /* ------------------------------------------------------------------ */
@@ -1347,6 +1657,9 @@ ms_mark_target(ref_t ref, ref_t **objp)
 	if (p == NULL)
 	    return NULL;
     }
+    /* Into a free-list entry: garbage (ms_free_set). */
+    if (BM_TEST(r->freebm, BM_IDX(r, p)))
+	return NULL;
     *objp = p;
     return r;
 }
@@ -1488,27 +1801,6 @@ ms_trace_concurrent(void)
     }
 }
 
-/* What was allocated during the concurrent mark -- every region's
-   words above its sweep_top, and the born list -- scanned for
-   references at the remark (STW).  These objects are black without
-   having been traced, and may hold the last reference to an object
-   the snapshot held only weakly (wp_to_ref during the mark). */
-static void
-ms_scan_born(void)
-{
-    ms_region_t *r;
-    ref_t *p;
-    size_t k;
-
-    for (r = ms_regions; r; r = r->next)
-	for (p = r->sweep_top; p < r->top; p++)
-	    if (*p & PTR_MASK)
-		ms_mark_ref(*p);
-    for (k = 0; k < born_count; k++)
-	for (p = born_list[k].p; p < born_list[k].p + born_list[k].words; p++)
-	    if (*p & PTR_MASK)
-		ms_mark_ref(*p);
-}
 #endif /* THREADS */
 
 
@@ -1523,7 +1815,7 @@ ms_scan_born(void)
  */
 static unsigned long ms_verify_cycles, ms_verify_missed_total;
 static int ms_verify_from_marked;
-volatile int ms_verify_stw_owner = -1;
+volatile int ms_verify_stw_owner = MS_NO_STW_OWNER;
 
 /* Verify mode: a ring of recent allocations, to say where a missed
    object came from.  Path 1 is the TLAB fast path, 2 the slow path;
@@ -1689,10 +1981,10 @@ ms_verify_marks(void)
 	memset(r->mark, 0, bytes);
     }
 
-    /* What the remark treats as live: the roots, and everything
-       allocated during the mark (scanned, never swept). */
+    /* What the remark treats as live: everything reachable from the
+       roots, the objects allocated during the mark included (the
+       remark did not scan those: the weak-read barrier stands in). */
     ms_mark_roots();
-    ms_scan_born();
 
     while (mark_stack_top > 0) {
 	ref_t *obj = mark_stack_pop();
@@ -1915,6 +2207,7 @@ ms_sweep_run_end(ref_t **run_start, size_t *run_len)
 	p[0] = (ref_t)free_list_heads[sc];
 	if (len >= 2)
 	    p[1] = (ref_t)len;
+	ms_free_set(ms_region_of(p), p);
 	free_list_heads[sc] = p;
 	free_list_total_words += len;
 	if (len >= TLAB_MIN_FREE)
@@ -1952,15 +2245,19 @@ void
 ms_prepare_lazy_sweep(void)
 {
     /* The sweep frees what the mark did not reach, and its memory is
-       used again: the global method cache's raw refs go first. */
+       used again: the global method cache's raw refs go first, and so
+       do the native call sites' (they are no roots either). */
     oak_gmc_flush();
+    oak_native_flush_sites();
 
     /* Clear all free lists — they will be rebuilt incrementally
-       as blocks are lazily swept. */
+       as blocks are lazily swept -- and their entries' free bits. */
     for (int i = 0; i < NUM_SIZE_CLASSES; i++)
 	free_list_heads[i] = NULL;
     free_list_total_words = 0;
     tlab_free_none = true;
+    for (ms_region_t *r = ms_regions; r; r = r->next)
+	memset(r->freebm, 0, BM_WORDS(r) * sizeof(uint64_t));
 
     sweep_region = ms_regions;
     sweep_cursor = 0;
@@ -1993,6 +2290,7 @@ ms_region_reset(ms_region_t *r)
 
     memset(r->objstart, 0, bytes);
     memset(r->mark, 0, bytes);
+    memset(r->freebm, 0, bytes);
     r->top = r->sweep_top = r->start;
     r->live_words = 0;
     r->empty_cycles++;
@@ -2029,6 +2327,20 @@ ms_lazy_sweep_one(void)
 
 	if (r == NULL) {
 	    lazy_sweep_active = false;
+	    if (trace_gc > 1) {
+		size_t live = 0, allocated = 0, empties = 0;
+
+		for (r = ms_regions; r; r = r->next) {
+		    live += r->live_words;
+		    allocated += (size_t)(r->top - r->start);
+		    if (r->top == r->start)
+			empties++;
+		}
+		fprintf(stderr, "; MS-GC: sweep done: %zu live, %zu free on"
+			" the lists, %zu allocated in %zu regions, %zu empty.\n",
+			live, free_list_total_words, allocated, ms_nregions,
+			empties);
+	    }
 	    ms_unmap_surplus();
 	    return false;
 	}
@@ -2157,73 +2469,34 @@ ms_post_gc_wp(void)
 /*  Main collection entry point                                        */
 /* ------------------------------------------------------------------ */
 
-void
-ms_collect(bool pre_dump, char *reason, size_t amount)
+/* A cycle: the mark (stop-the-world in a single-threaded build; with
+   threads concurrent, between two pauses, on the GC thread), the weak
+   pointers, the budget, and the start of the lazy sweep.  AMOUNT is
+   what the request that asked for it needs; with threads the most any
+   waiter needs is added to it.  Without threads there is no
+   alloc_lock; with threads it is taken here as needed and not held
+   on return. */
+static void
+ms_run_cycle(const char *reason, size_t amount)
 {
     long old_used;
     gc_timer_t cycle;
 #ifdef THREADS
     gc_timer_t pause;
-#endif
 
-#ifdef THREADS
-    /* If a concurrent GC is already running (another thread triggered
-       collection), wait for it to complete and return.  The caller's
-       ALLOCATE_PROT will retry the allocation after we return. */
-    ms_collect_coordinated[*(int *)oak_tls_get(index_key)] = false;
-    if (gc_concurrent_in_progress) {
-	int parked_index = *(int *)oak_tls_get(index_key);
-	gc_timer_t wait;
-
-	gc_stats_begin(&wait, GC_EV_ALLOC_WAIT);
-	oak_mutex_unlock(&alloc_lock);
-	/* Advertise that we are parked for the whole time we are out of
-	   action, including while re-acquiring the allocator lock.  The
-	   coordinator's stop-the-world handshake spins until every
-	   thread's gc_ready flag is set, so a thread that parks here
-	   without setting it deadlocks the collection. */
-	gc_ready[parked_index] = 1;
-	ms_wait_concurrent_gc();
-	/* Leave the parked state the way wait_for_gc does: under
-	   gc_lock, which a coordinator holds for the whole of a
-	   stop-the-world pause.  Clearing gc_ready without it let a
-	   thread woken here run straight through the next cycle's
-	   initial mark, which had counted it as parked, so what it
-	   allocated meanwhile was neither a root nor born black. */
-	oak_mutex_lock(&gc_lock);
-	gc_ready[parked_index] = 0;
-	oak_mutex_unlock(&gc_lock);
-	while (oak_mutex_trylock(&alloc_lock) != 0) {
-	    if (gc_pending)
-		wait_for_gc();
-	    else
-		oak_thread_yield();
-	}
-	gc_stats_end(&wait, GC_EV_ALLOC_WAIT, reason);
-	return;
-    }
-#endif
-
-    /* Finish any lazy sweep remaining from the previous cycle.
-       This must happen before we clear the mark bitmaps. */
-    ms_lazy_sweep_finish();
-
-    /* For world dumps, use the copying GC which produces a contiguous
-       heap suitable for serialization.  Note that we have deliberately
-       not claimed gc_concurrent_in_progress: the mutators are not
-       parked, so it has to run its own stop-the-world handshake. */
-    if (pre_dump) {
-	gc(pre_dump, true, reason, amount);
-	return;
-    }
-
-#ifdef THREADS
-    /* We are the GC coordinator for this cycle. */
-    gc_concurrent_in_progress = 1;
-    ms_collect_coordinated[*(int *)oak_tls_get(index_key)] = true;
     gc_stats_begin(&cycle, GC_EV_CYCLE);
+    /* Finish any lazy sweep remaining from the previous cycle, a block
+       at a time so that the allocator gets in between, and end holding
+       the lock.  This must happen before we clear the mark bitmaps. */
+    for (;;) {
+	oak_mutex_lock(&alloc_lock);
+	if (!ms_lazy_sweep_one())
+	    break;
+	oak_mutex_unlock(&alloc_lock);
+    }
 #else
     gc_stats_begin(&cycle, GC_EV_MARK_SWEEP);
+    ms_lazy_sweep_finish();
 #endif
 
     old_used = (long)ms_allocated_words() - (long)free_list_total_words;
@@ -2261,9 +2534,6 @@ ms_collect(bool pre_dump, char *reason, size_t amount)
     ms_clear_marks();
     mark_stack_init();
     marked_words = 0;
-#ifdef THREADS
-    born_count = 0;
-#endif
 #if defined(THREADS) && defined(OAK_GC_VERIFY)
     ms_verify_cycle_begin();
 #endif
@@ -2278,8 +2548,6 @@ ms_collect(bool pre_dump, char *reason, size_t amount)
 
 #ifdef THREADS
     {
-	int my_index_val = *(int *)oak_tls_get(index_key);
-
 	/* === STW PAUSE 1: Initial mark (scan roots) === */
 	gc_phase = GC_PHASE_INITIAL_MARK;
 
@@ -2288,9 +2556,9 @@ ms_collect(bool pre_dump, char *reason, size_t amount)
 	oak_mutex_unlock(&alloc_lock);
 
 	gc_stats_begin(&pause, GC_EV_INITIAL_MARK);
-	(void)stw_request_pause(my_index_val);
+	(void)stw_request_pause(MS_GC_THREAD_INDEX);
 #ifdef OAK_GC_VERIFY
-	ms_verify_stw_owner = my_index_val;
+	ms_verify_stw_owner = MS_GC_THREAD_INDEX;
 #endif
 
 	if (trace_gc > 1)
@@ -2300,6 +2568,24 @@ ms_collect(bool pre_dump, char *reason, size_t amount)
 	   fast path.  Retire the TLABs and take the snapshot now. */
 	ms_tlab_retire_all();
 	ms_snapshot_tops();
+
+	/* The allocation rate, for the pacing: what was handed out since
+	   the last snapshot, over the time since; smoothed, half this
+	   measure and half the last. */
+	{
+	    gc_ns_t now = gc_now();
+	    double ms = ms_snapshot_ns ? (double)(now - ms_snapshot_ns) / 1e6 : 0;
+	    double rate = ms > 0.01 ? (double)ms_since_snapshot / ms : 0;
+
+	    if (rate > 0)
+		ms_alloc_rate = ms_alloc_rate > 0 ? (ms_alloc_rate + rate) / 2 : rate;
+	    if (trace_gc > 1)
+		fprintf(stderr, "\n; %zu words allocated in the %.1f ms since the"
+			" last snapshot (%.0f/ms; smoothed %.0f/ms).",
+			ms_since_snapshot, ms, rate, ms_alloc_rate);
+	    ms_since_snapshot = 0;
+	    ms_snapshot_ns = now;
+	}
 
 	ms_mark_roots();
 #ifdef OAK_GC_VERIFY
@@ -2319,11 +2605,14 @@ ms_collect(bool pre_dump, char *reason, size_t amount)
 
 	/* === RELEASE: mutators resume during concurrent mark === */
 #ifdef OAK_GC_VERIFY
-	ms_verify_stw_owner = -1;
+	ms_verify_stw_owner = MS_NO_STW_OWNER;
 #endif
-	stw_release(my_index_val);
+	/* The pause ends with the release: timed before it, since once
+	   the mutators are let go this thread may not run again for a
+	   scheduler's slice (on one core it never does). */
 	{
 	    double ms = gc_stats_end(&pause, GC_EV_INITIAL_MARK, reason);
+	    stw_release(MS_GC_THREAD_INDEX);
 	    if (trace_gc > 1) {
 		fprintf(stderr, " %.3f ms.\n; Concurrent tracing...", ms);
 		fflush(stderr);
@@ -2341,31 +2630,59 @@ ms_collect(bool pre_dump, char *reason, size_t amount)
 	/* === STW PAUSE 2: Remark === */
 	gc_phase = GC_PHASE_REMARK;
 	gc_stats_begin(&pause, GC_EV_REMARK);
-	(void)stw_request_pause(my_index_val);
+	(void)stw_request_pause(MS_GC_THREAD_INDEX);
 #ifdef OAK_GC_VERIFY
-	ms_verify_stw_owner = my_index_val;
+	ms_verify_stw_owner = MS_GC_THREAD_INDEX;
 #endif
 
 	/* Retire TLABs allocated during concurrent mark. */
 	ms_tlab_retire_all();
 
+	/* What the mutators allocated meanwhile, for the pacing: what
+	   the allocator handed out since the snapshot.  Smoothed: half
+	   this cycle's, half what it was. */
+	{
+	    size_t during = ms_since_snapshot;
+
+	    ms_alloc_during_mark = ms_alloc_during_mark
+		? (ms_alloc_during_mark + during) / 2 : during;
+	    if (trace_gc > 1)
+		fprintf(stderr, "\n; %zu words allocated in the mark's %.2f ms"
+			" (smoothed %zu).", during,
+			(double)(gc_now() - ms_snapshot_ns) / 1e6,
+			ms_alloc_during_mark);
+	}
+
 	/* Drain SATB buffers — these contain old pointer values
 	   that were overwritten during concurrent mark and must
 	   be traced to maintain the snapshot-at-beginning invariant. */
-	satb_drain_to_mark_stack();
+	{
+	    extern int next_index;
+	    gc_ns_t t0 = trace_gc > 2 ? gc_now() : 0, t1, t2;
+	    size_t entries = 0;
 
-	/* Re-scan roots to catch new stack entries that appeared
-	   during concurrent mark.  Stacks are C arrays, not covered
-	   by SATB barriers. */
-	ms_mark_roots();
+	    for (int i = 0; i < next_index; i++)
+		entries += satb_count_array[i];
+	    satb_drain_to_mark_stack();
+	    t1 = trace_gc > 2 ? gc_now() : 0;
 
-	/* Scan what was allocated during the concurrent mark: black
-	   without a trace, it may hold pointers to old objects that
-	   need marking. */
-	ms_scan_born();
+	    /* Re-scan roots to catch new stack entries that appeared
+	       during concurrent mark.  Stacks are C arrays, not covered
+	       by SATB barriers.  What was allocated during the mark is
+	       black and is not scanned: every object it can refer to
+	       was reachable at the snapshot (and is marked by the
+	       snapshot's rules), was allocated after it (black), or was
+	       read through a weak pointer (and logged, SATB_READ_WEAK). */
+	    ms_mark_roots();
+	    t2 = trace_gc > 2 ? gc_now() : 0;
 
-	/* Process all newly discovered references. */
-	ms_trace();
+	    /* Process all newly discovered references. */
+	    ms_trace();
+	    if (trace_gc > 2)
+		fprintf(stderr, "\n; Remark: %zu SATB entries %.3f ms, roots"
+			" %.3f ms, trace %.3f ms.", entries,
+			(t1 - t0) / 1e6, (t2 - t1) / 1e6, (gc_now() - t2) / 1e6);
+	}
 
 #ifdef OAK_GC_VERIFY
 	ms_verify_marks();
@@ -2407,6 +2724,15 @@ ms_collect(bool pre_dump, char *reason, size_t amount)
     mark_stack = NULL;
     mark_stack_size = 0;
 
+#ifdef THREADS
+    /* The waiters' needs, and the eager sweep for them below. */
+    oak_mutex_lock(&gc_concurrent_lock);
+    if (gc_request_amount > amount)
+	amount = gc_request_amount;
+    gc_request_amount = 0;
+    oak_mutex_unlock(&gc_concurrent_lock);
+#endif
+
     /* The budget for the next cycle, from what the mark found. */
     ms_set_budget(amount);
 
@@ -2418,38 +2744,43 @@ ms_collect(bool pre_dump, char *reason, size_t amount)
     if (trace_gc > 1)
 	fprintf(stderr, "; Lazy sweep prepared (%zu regions).\n", ms_nregions);
 
-    /* Sweep enough blocks now to satisfy the requested amount, so that
-       the caller's retry finds room (or the budget's). */
+    gc_phase = GC_PHASE_IDLE;
+
+#ifdef THREADS
+    /* Release all threads from the remark STW pause (timed before the
+       release, as above). */
+#ifdef OAK_GC_VERIFY
+    ms_verify_stw_owner = MS_NO_STW_OWNER;
+#endif
     {
+	double ms = gc_stats_end(&pause, GC_EV_REMARK, reason);
+	stw_release(MS_GC_THREAD_INDEX);
+	if (trace_gc > 1)
+	    fprintf(stderr, "; Remark pause %.3f ms.\n", ms);
+    }
+#endif
+
+    /* Sweep enough blocks now to satisfy the requested amount, so that
+       the retry of whoever asked finds room (or the budget's).  With
+       threads this is after the pause, the lock taken a block at a
+       time: a big request could have the whole heap swept here. */
+    {
+#ifdef THREADS
+	oak_mutex_lock(&alloc_lock);
+	while (!ms_space_for(amount) && ms_lazy_sweep_one()) {
+	    oak_mutex_unlock(&alloc_lock);
+	    oak_mutex_lock(&alloc_lock);
+	}
+	oak_mutex_unlock(&alloc_lock);
+#else
 	while (!ms_space_for(amount) && ms_lazy_sweep_one()) {
 	    /* keep sweeping */
 	}
+#endif
 	if (trace_gc > 1 && free_list_total_words > 0)
 	    fprintf(stderr, "; Eagerly swept %zu words.\n",
 		    free_list_total_words);
     }
-
-    gc_phase = GC_PHASE_IDLE;
-
-#ifdef THREADS
-    {
-	int my_index_val = *(int *)oak_tls_get(index_key);
-
-	/* Release all threads from the remark STW pause. */
-#ifdef OAK_GC_VERIFY
-	ms_verify_stw_owner = -1;
-#endif
-	stw_release(my_index_val);
-	{
-	    double ms = gc_stats_end(&pause, GC_EV_REMARK, reason);
-	    if (trace_gc > 1)
-		fprintf(stderr, "; Remark pause %.3f ms.\n", ms);
-	}
-
-	/* Re-acquire alloc_lock — ALLOCATE_PROT expects us to hold it. */
-	oak_mutex_lock(&alloc_lock);
-    }
-#endif
 
     if (trace_gc == 1)
 	fprintf(stderr, ":%ld%%",
@@ -2457,18 +2788,14 @@ ms_collect(bool pre_dump, char *reason, size_t amount)
 		? (100 * (long)free_list_total_words) / old_used : 0);
     if (trace_gc > 1)
 	fprintf(stderr, "; MS-GC complete.  %zu free on the lists,"
-		" %zu words mapped in %zu regions, budget %zu.\n",
+		" %zu words mapped in %zu regions, budget %zu,"
+		" headroom %zu.\n",
 		free_list_total_words, ms_mapped, ms_nregions,
-		(size_t)e_next_newspace_size);
+		(size_t)e_next_newspace_size, ms_headroom);
     if (trace_gc == 1)
 	fprintf(stderr, "\n");
 
 #ifdef THREADS
-    /* Signal any threads waiting for the concurrent GC to finish. */
-    oak_mutex_lock(&gc_concurrent_lock);
-    gc_concurrent_in_progress = 0;
-    oak_cond_broadcast(&gc_concurrent_done_cv);
-    oak_mutex_unlock(&gc_concurrent_lock);
     gc_stats_end(&cycle, GC_EV_CYCLE, reason);
 #else
     {
@@ -2480,11 +2807,66 @@ ms_collect(bool pre_dump, char *reason, size_t amount)
 }
 
 
+#ifdef THREADS
+/* The GC thread: a cycle for every request, when none is held off. */
+static void *
+ms_gc_thread_main(void *arg)
+{
+    int *idx = (int *)xmalloc(sizeof(int));
+
+    (void)arg;
+    *idx = MS_GC_THREAD_INDEX;
+    oak_tls_set(index_key, idx);
+    oak_thread_index_var = MS_GC_THREAD_INDEX;
+    oak_mutex_lock(&gc_concurrent_lock);
+    for (;;) {
+	const char *reason;
+
+	while (!gc_requested || gc_hold)
+	    oak_cond_wait(&gc_request_cv, &gc_concurrent_lock);
+	gc_requested = 0;
+	reason = gc_request_reason;
+	gc_concurrent_in_progress = 1;
+	oak_mutex_unlock(&gc_concurrent_lock);
+
+	ms_run_cycle(reason, 0);
+
+	oak_mutex_lock(&gc_concurrent_lock);
+	gc_concurrent_in_progress = 0;
+	gc_cycles_done++;
+	oak_cond_broadcast(&gc_concurrent_done_cv);
+    }
+    return NULL;
+}
+#endif
+
+
+/* A collection for a request of AMOUNT words: with threads, wait for
+   the GC thread's next cycle to end (asking for one if none runs);
+   without, run one here.  The caller holds alloc_lock where there is
+   one, and has synchronized its state. */
+void
+ms_collect(bool pre_dump, char *reason, size_t amount)
+{
+    /* For world dumps, use the copying GC which produces a contiguous
+       heap suitable for serialization; it runs its own stop-the-world
+       handshake. */
+    if (pre_dump) {
+	gc(pre_dump, true, reason, amount);
+	return;
+    }
+#ifdef THREADS
+    ms_wait_cycle(reason, amount);
+#else
+    ms_run_cycle(reason, amount);
+#endif
+}
+
+
 /* The GC and FULL-GC instructions: a collection asked for by the
-   program.  ms_collect wants the allocator lock, and either runs the
-   cycle or, with threads, joins the one in progress; the copying
-   collector is not used (in a threads build it would run under
-   another thread's marker, and in both it would copy the heap). */
+   program: a cycle run here, or with threads one of the GC thread's,
+   waited for; the copying collector is not used (in a threads build it
+   would run under the marker, and in both it would copy the heap). */
 void
 ms_collect_explicit(const char *reason)
 {
@@ -2526,25 +2908,38 @@ ms_forget_heap(void)
     sweep_region = NULL;
     sweep_cursor = 0;
     sweep_run = NULL;
-#ifdef THREADS
-    born_count = 0;
-#endif
     alloc_region = NULL;
 }
 
-void
-ms_destroy(void)
+static void
+ms_unmap_all(void)
 {
     while (ms_regions)
 	ms_region_unmap(ms_regions);
     ms_forget_heap();
 }
 
+/* LOAD-WORLD: the heap goes, with the GC thread held off until
+   ms_init makes the new one. */
+void
+ms_destroy(void)
+{
+#ifdef THREADS
+    ms_gc_hold();
+#endif
+    ms_unmap_all();
+}
+
 void
 ms_init(void)
 {
-    ms_destroy();
+    ms_unmap_all();
     e_next_newspace_size = original_newspace_size;
+    ms_alloc_during_mark = 0;
+    ms_set_pacing();
+#ifdef THREADS
+    ms_gc_release();
+#endif
 }
 
 void
@@ -2585,7 +2980,7 @@ ms_evacuate_end(void)
     /* The old regions go; the destination span is the heap, one
        region, with the objstart bits of what was transported into
        it. */
-    ms_destroy();
+    ms_unmap_all();
     r = ms_region_new(new_space.start, evac_chunks);
     r->top = r->sweep_top = free_point;
     for (size_t i = 0; i < deferred_count; i++) {
@@ -2608,6 +3003,7 @@ ms_evacuate_end(void)
 	want = MAX_NEW_SPACE_SIZE;
 #endif
     e_next_newspace_size = want;
+    ms_set_pacing();
     if (trace_gc > 1)
 	fprintf(stderr, "; MS-GC: the heap is the compacted span: %zu words"
 		" live in %zu mapped, budget %zu.\n",

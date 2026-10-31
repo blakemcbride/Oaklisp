@@ -22,12 +22,12 @@
  * A global pause stops every thread: a copying collection, a
  * single-threaded mark-sweep collection, and the two stop-the-world
  * pauses of a concurrent mark-sweep cycle.  A stall holds up one
- * thread: the thread that runs a concurrent cycle is out of action
- * for the whole of it, a thread parks at a safepoint while another
- * holds a pause, and a thread that runs out of memory during a cycle
- * waits for it to end.  Each event is timed where it happens, and
- * the report at exit gives count, total, mean, maximum, percentiles
- * and a histogram per kind.
+ * thread: a thread parks at a safepoint while the GC thread holds a
+ * pause, and a thread that runs out of memory waits for a cycle to
+ * end.  The concurrent cycle itself is timed too, as the GC thread
+ * sees it; it stalls nobody.  Each event is timed where it happens,
+ * and the report at exit gives count, total, mean, maximum,
+ * percentiles and a histogram per kind.
  */
 
 #ifndef GC_STATS_H_INCLUDED
@@ -45,7 +45,7 @@ enum gc_event {
   /* A part of a pause. */
   GC_EV_HANDSHAKE,	/* asking the threads to stop until all have */
   /* Stalls of one thread. */
-  GC_EV_CYCLE,		/* the thread that ran a concurrent cycle */
+  GC_EV_CYCLE,		/* a concurrent cycle, as the GC thread sees it */
   GC_EV_SAFEPOINT,	/* parked at a safepoint for a pause */
   GC_EV_ALLOC_WAIT,	/* out of memory, waiting for another's cycle */
   /* Every global pause not nested in another. */
@@ -60,8 +60,8 @@ extern int gc_stats_on;
 
 typedef uint64_t gc_ns_t;
 
-/* The monotonic clock, in nanoseconds; 0 when nothing is being
-   timed. */
+/* The monotonic clock, in nanoseconds (always read: the collector's
+   pacing uses it too). */
 extern gc_ns_t gc_now(void);
 
 typedef struct {

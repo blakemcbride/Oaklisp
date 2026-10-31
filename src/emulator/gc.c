@@ -486,8 +486,12 @@ gc(bool pre_dump, bool full_gc, char *reason, size_t amount)
   int *my_index_p;
   gc_timer_t handshake;
 
-  /* With the mark-sweep collector this runs only for a dump, never
-     inside a cycle, so the handshake is always its own. */
+#ifdef USE_MARK_SWEEP
+  /* With the mark-sweep collector this runs only for a dump: the GC
+     thread's cycle, if one runs, ends first, and none starts until
+     this is over. */
+  ms_gc_hold();
+#endif
   my_index_p = oak_tls_get(index_key);
   my_index = *my_index_p;
   gc_ready[my_index] = 1;
@@ -921,6 +925,9 @@ gc_top:
   my_index = *my_index_p;
   gc_ready[my_index] = 0;
   set_gc_flag (false);
+#ifdef USE_MARK_SWEEP
+  ms_gc_release();
+#endif
 #endif
   {
     double ms = gc_stats_end(&pause, GC_EV_COPY, reason);

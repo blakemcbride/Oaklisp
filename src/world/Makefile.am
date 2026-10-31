@@ -374,7 +374,8 @@ NATMODS = `for m in *.so; do test -f $$m && printf ' --native-module %s' $$m; do
 # The .so beside each .oa is C that includes the native headers, so a
 # header change (an ABI bump above all) rebuilds them.
 NATIVEHDRS = $(top_srcdir)/src/emulator/oak-native.h \
- $(top_srcdir)/src/emulator/native-ops.h
+ $(top_srcdir)/src/emulator/native-ops.h \
+ $(top_srcdir)/src/emulator/data.h $(top_srcdir)/src/emulator/gc-ms.h
 
 $(NATDIR)/%.oa: %.oak oakworld.bin $(NATIVEHDRS)
 	@$(MKDIR_P) $(NATDIR)

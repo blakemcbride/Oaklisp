@@ -81,10 +81,10 @@ oak_main_native(int argc, char **argv, const oak_embedding *emb,
 
 #ifdef USE_MARK_SWEEP
   /* The region heap: mapped as allocation needs it (gc-ms.c). */
-  ms_init();
 #ifdef THREADS
   gc_safepoint_init();
 #endif
+  ms_init();
 #else
   new_space.size = e_next_newspace_size = original_newspace_size;
   alloc_space(&new_space, new_space.size);

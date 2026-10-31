@@ -99,6 +99,7 @@ static inline int CTZ64(uint64_t x) {
  *
  * Operations provided:
  *   OAK_ATOMIC_FETCH_OR_U64(ptr, val)   - atomic OR on uint64_t, relaxed
+ *   OAK_ATOMIC_FETCH_AND_U64(ptr, val)  - atomic AND on uint64_t, relaxed
  *   OAK_ATOMIC_LOAD_REF(ptr)            - atomic load with acquire semantics
  *   OAK_ATOMIC_STORE_REF(ptr, val)      - atomic store with release semantics
  *   OAK_ATOMIC_CAS_SIZE(ptr, expp, val) - compare-and-swap on a size_t,
@@ -116,6 +117,10 @@ static inline int CTZ64(uint64_t x) {
 #define OAK_ATOMIC_FETCH_OR_U64(ptr, val) \
     atomic_fetch_or_explicit((_Atomic uint64_t *)(ptr), (val), \
 			     memory_order_relaxed)
+
+#define OAK_ATOMIC_FETCH_AND_U64(ptr, val) \
+    atomic_fetch_and_explicit((_Atomic uint64_t *)(ptr), (val), \
+			      memory_order_relaxed)
 
 #define OAK_ATOMIC_LOAD_REF(ptr) \
     atomic_load_explicit((_Atomic size_t *)(ptr), memory_order_acquire)
@@ -138,6 +143,9 @@ static inline int CTZ64(uint64_t x) {
 #define OAK_ATOMIC_FETCH_OR_U64(ptr, val) \
     __atomic_fetch_or((ptr), (val), __ATOMIC_RELAXED)
 
+#define OAK_ATOMIC_FETCH_AND_U64(ptr, val) \
+    __atomic_fetch_and((ptr), (val), __ATOMIC_RELAXED)
+
 #define OAK_ATOMIC_LOAD_REF(ptr) \
     __atomic_load_n((ptr), __ATOMIC_ACQUIRE)
 
@@ -157,6 +165,9 @@ static inline int CTZ64(uint64_t x) {
 
 #define OAK_ATOMIC_FETCH_OR_U64(ptr, val) \
     _InterlockedOr64((volatile long long *)(ptr), (long long)(val))
+
+#define OAK_ATOMIC_FETCH_AND_U64(ptr, val) \
+    _InterlockedAnd64((volatile long long *)(ptr), (long long)(val))
 
 static inline size_t oak_atomic_load_ref_(volatile size_t *p) {
     size_t v = *p;
