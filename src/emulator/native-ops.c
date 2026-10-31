@@ -889,12 +889,12 @@ ref_t
 oak_rt_test_and_set(ref_t * p, ref_t old, ref_t new)
 {
 #ifdef THREADS
-  SATB_BARRIER(p);
+  SATB_BARRIER(p, new);
   return OAK_ATOMIC_CAS_SIZE(p, &old, new) ? e_t : e_false;
 #else
   if (*p != old)
     return e_false;
-  SATB_BARRIER(p);
+  SATB_BARRIER(p, new);
   *p = new;
   return e_t;
 #endif

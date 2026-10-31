@@ -72,13 +72,15 @@ static gc_stat_t stats[GC_EV_COUNT];
 static const char *const gc_event_name[GC_EV_COUNT] = {
   "copying collection",
   "mark-sweep collection",
-  "initial-mark pause",
-  "remark pause",
+  "verify pause",
   "  threads stopping",
   "concurrent cycle, GC thread",
+  "handshake round, GC thread",
+  "root scan, own stacks",
   "safepoint wait",
   "allocation wait",
   "all global pauses",
+  "all stops of one thread",
 };
 
 #ifdef THREADS
@@ -108,8 +110,16 @@ gc_now(void)
 static int
 is_pause(enum gc_event ev)
 {
-  return ev == GC_EV_COPY || ev == GC_EV_MARK_SWEEP
-    || ev == GC_EV_INITIAL_MARK || ev == GC_EV_REMARK;
+  return ev == GC_EV_COPY || ev == GC_EV_MARK_SWEEP || ev == GC_EV_VERIFY;
+}
+
+/* A stop of one thread: a stall, or a pause (as the thread that runs
+   it sees it; the others see it as their safepoint waits). */
+static int
+is_stop(enum gc_event ev)
+{
+  return ev == GC_EV_SCAN || ev == GC_EV_SAFEPOINT || ev == GC_EV_ALLOC_WAIT
+    || is_pause(ev);
 }
 
 static void
@@ -163,6 +173,8 @@ gc_stats_end(gc_timer_t *t, enum gc_event ev, const char *reason)
     gc_stats_add(&stats[ev], ns);
     if (is_pause(ev) && !t->nested)
       gc_stats_add(&stats[GC_EV_PAUSES], ns);
+    if (is_stop(ev) && !t->nested)
+      gc_stats_add(&stats[GC_EV_STOPS], ns);
 #ifdef THREADS
     oak_mutex_unlock(&gc_stats_lock);
 #endif
@@ -196,8 +208,8 @@ void
 gc_stats_report(FILE *f)
 {
   gc_ns_t run = gc_now() - gc_stats_t0;
-  gc_stat_t *all = &stats[GC_EV_PAUSES];
-  double p99 = 0;
+  gc_stat_t *all = &stats[GC_EV_PAUSES], *stops = &stats[GC_EV_STOPS];
+  double p99 = 0, stops_p99 = 0;
   int ev;
   gc_ns_t *sorted = malloc(GC_STATS_SAMPLES * sizeof(gc_ns_t));
 
@@ -223,6 +235,8 @@ gc_stats_report(FILE *f)
       p50 = p90 = pp99 = (double)s->max / 1e6;
     if (ev == GC_EV_PAUSES)
       p99 = pp99;
+    if (ev == GC_EV_STOPS)
+      stops_p99 = pp99;
     fprintf(f, "; %-30s %7llu %9.2f %8.3f %8.3f %8.3f %8.3f %8.3f  %6llu %5llu %5llu %5llu %5llu\n",
 	    gc_event_name[ev], (unsigned long long)s->count,
 	    (double)s->total / 1e6, (double)s->total / 1e6 / (double)s->count,
@@ -231,12 +245,18 @@ gc_stats_report(FILE *f)
 	    (unsigned long long)s->hist[2], (unsigned long long)s->hist[3],
 	    (unsigned long long)s->hist[4]);
   }
-  fprintf(f, "; GC: %llu global pauses, total %.2f ms, max %.3f ms, p99 %.3f ms,"
-	  " %.1f%% of %.0f ms\n",
+  /* The summary: the global pauses, then the stops of one thread --
+     the same in a build that stops the world for every collection;
+     with the concurrent collector the pauses are none and the stops
+     are its root scans and waits.  bench.sh reads the last "max" and
+     "p99" of this line. */
+  fprintf(f, "; GC: %llu global pauses, total %.2f ms, %.1f%% of %.0f ms;"
+	  " %llu stops of one thread, max %.3f ms, p99 %.3f ms\n",
 	  (unsigned long long)all->count, (double)all->total / 1e6,
-	  (double)all->max / 1e6, p99,
 	  run > 0 ? 100.0 * (double)all->total / (double)run : 0.0,
-	  (double)run / 1e6);
+	  (double)run / 1e6, (unsigned long long)stops->count,
+	  (double)stops->max / 1e6, stops_p99);
+  (void)p99;
   fflush(f);
 #ifdef THREADS
   oak_mutex_unlock(&gc_stats_lock);

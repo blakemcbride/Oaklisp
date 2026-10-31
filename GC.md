@@ -60,13 +60,13 @@ Verify mode
 -----------
 
 `make CPPFLAGS="-DOAK_GC_VERIFY"` in a threads build (GCC or Clang)
-checks the concurrent collector as it runs.  At the initial mark it
-traces the whole snapshot stop-the-world into a separate bitmap; at
-the end of the remark it marks the heap again from scratch and
-reports every live object below `sweep_limit` that the concurrent
-mark missed, with the object referring to it (its type, whether it
-was marked, born black, reachable at the snapshot) and where both
-were allocated, from a ring of the last four million allocations
+checks the concurrent collector as it runs.  At the end of every
+mark it stops the world (the mode's one pause), retires the TLABs,
+marks the heap again from scratch from the roots as they are then,
+and reports every live object below its region's `sweep_top` that
+the concurrent mark missed, with the object referring to it (its
+type, whether it was marked or born black) and where both were
+allocated, from a ring of the last four million allocations
 (`OAK_GC_VERIFY_LOG=0` in the environment turns the ring off: its
 atomic add on every allocation shifts the timing).  It also reports
 any allocation made while the GC thread has the world stopped.  A
@@ -408,9 +408,12 @@ with threads):**
    is an ordinary cycle, waited for; the heap is never merged into
    spatic).
 
-TLABs are retired before every STW pause (`ms_tlab_retire_all`):
-unused TLAB space is zeroed and given an objstart bit so sweep can
-reclaim it.
+A TLAB is retired (`ms_tlab_retire`: its unused space zeroed and
+given an objstart bit, so that the sweep can reclaim it and no
+object's extent absorbs it) when its thread replaces it, at the
+thread's first handshake of a cycle, and when the thread exits; the
+single-threaded cycle and verify mode retire them all at once
+(`ms_tlab_retire_all`).
 
 
 Collection: Single-Threaded Mode
@@ -433,118 +436,202 @@ and the sweep lazy, as with threads:
 Collection: Multi-Threaded Mode (Concurrent)
 ---------------------------------------------
 
-Under `THREADS + USE_MARK_SWEEP`, the GC uses a three-phase concurrent
-collection with two brief STW pauses, run by a thread of its own.
+Under `THREADS + USE_MARK_SWEEP` a cycle runs on a thread of its own
+and stops no thread for any other: the mark's roots are taken by
+handshakes, one thread at a time, its end is agreed by rounds of
+them, and the sweep is lazy.  There is no global pause (a dump's
+compaction and verify mode's check are the exceptions).
 
 ### The GC thread
 
 Every cycle runs on the GC thread (`ms_gc_thread_main`), started at
 the first request, so that no mutator is ever out of action for the
 length of a mark.  It has no slot in the thread arrays: it runs no
-Oaklisp code, allocates nothing and holds no roots, so the
-stop-the-world handshakes it runs do not wait for it, and
-`%thread-count` does not count it; its index (`index_key`,
-`oak_thread_index_var`) is `MS_GC_THREAD_INDEX`, -1.  A mutator asks
-for a cycle (`ms_request_cycle`, under `gc_concurrent_lock`) and goes
-on; one that has no room left waits for the next cycle to end
+Oaklisp code, allocates nothing and holds no roots, so the handshake
+rounds it runs ask nothing of it, and `%thread-count` does not count
+it; its index (`index_key`, `oak_thread_index_var`) is
+`MS_GC_THREAD_INDEX`, -1.  A mutator asks for a cycle
+(`ms_request_cycle`, under `gc_concurrent_lock`) and goes on; one
+that has no room left waits for the next cycle to end
 (`ms_wait_cycle`, parked at a safepoint with `gc_ready` set, leaving
 that state under `gc_lock`), and the GC and FULL-GC instructions wait
 the same way.  A dump (`gc()`) and a world load (`ms_destroy`), which
 move or unmap the heap, hold the GC thread off (`ms_gc_hold`: a cycle
 in progress ends first, parked meanwhile, and none starts until
 `ms_gc_release`).  Verify mode's record of who has the world stopped
-(`ms_verify_stw_owner`) is the GC thread's index during a pause and
+(`ms_verify_stw_owner`) is the GC thread's index during its pause and
 `MS_NO_STW_OWNER` otherwise.
 
-### Phase 1: Initial Mark (STW)
+### Phase 1: The snapshot
 
 The GC thread, having finished the previous cycle's sweep (a block at
 a time, releasing `alloc_lock` between blocks so the allocator gets
-in) and cleared the mark bitmaps under `alloc_lock`:
-1. Sets `gc_pending` — all mutators park via `wait_for_gc()`
-2. Retires every TLAB and snapshots every region's `sweep_top`, and
-   measures the allocation rate since the last snapshot (Pacing)
-3. Scans the registers and stacks of every thread
-   (`ms_mark_thread_roots()`): what no barrier covers
-4. Activates SATB write barriers (`gc_satb_active = 1`)
-5. Releases all threads — mutators resume
+in) and holding `alloc_lock`:
+1. Clears the mark bitmaps
+2. Advances the cycle's epoch (`gc_mark_epoch`): every thread is
+   unscanned, every barrier buffer stale
+3. Sets `gc_phase` to `GC_PHASE_CONCURRENT_MARK`: what is allocated
+   from free entries from now on is born black
+4. Snapshots every region's `sweep_top`, and measures the allocation
+   rate since the last snapshot (Pacing)
+5. Turns the barrier on (`gc_satb_active`, after a release fence, so
+   that a thread that sees the flag sees the epoch), and releases
+   `alloc_lock`
+6. Flushes the global method cache and the native call-site caches
+   (raw refs that are no roots: a hit during the mark logs the
+   method it yields, `SATB_READ_RAW`, so what the sweep frees is in
+   none of them)
 
-### Phase 2: Concurrent Mark
+A TLAB carved after this is above its region's `sweep_top` (a
+virgin tail) or blackened (a free run).  One carved before it and
+still in use lies below `sweep_top`: its thread retires it at its
+first handshake, and what the thread allocates from it meanwhile,
+unmarked, is covered by that handshake's scan of the thread's stacks
+and by the barrier's logging of what an unscanned thread stores.
+Until it is scanned a thread allocates nothing black: the slow path
+(`ms_alloc_slow_locked`), which carves every new TLAB and takes every
+born-black entry, scans the thread first if it is unscanned, under
+`alloc_lock`, so that the snapshot cannot come between the scan and
+the allocation.  A fresh object's initializing stores are not
+barriered, so a black object filled from an unscanned stack would
+hide a reference only that stack held; verify mode found exactly
+that, once in three runs.
+
+### Phase 2: The roots, by handshakes
+
+A *round* (`ms_handshake_round`): the GC thread posts a request
+(`gc_hs_request`, a number) and sets `gc_pending`; each mutator, at
+its next safepoint (the interpreter polls at every instruction,
+native code at every call, return and backward branch: `wait_for_gc`,
+then `ms_handshake_poll`, with its stacks synchronized), does its part
+(`ms_handshake`) and records the request as done (`gc_hs_done`, a
+release store); for a thread parked, sleeping, waiting for a cycle or
+blocked in C (`gc_ready` set, its stacks synchronized too) the GC
+thread does the part itself, under `gc_lock`, which the thread takes
+to leave that state.  The round is over when every live thread is
+in; a thread that exits leaves it, its buffer handed over first
+(`ms_thread_exiting`), and one created meanwhile joins it (its
+slot's record is reset when the slot is handed out,
+`ms_thread_slot_reset`).  Nobody waits for anybody: a round holds the
+GC thread only, for as long as the slowest thread takes to reach a
+safepoint.
+
+The first handshake of a cycle (the thread's `gc_scan_epoch` is not
+the cycle's): retire the TLAB; scan the thread's registers, examine
+buffer, value and context stacks and their segment pointers into its
+own barrier buffer (`ms_scan_thread_roots`); mark the thread scanned;
+hand the buffer to the marker.  A few microseconds: the stacks in
+memory are at most a few thousand words, the rest lives in heap
+segments, which the marker traces.  (Verify mode and the
+single-threaded cycle scan the same roots straight into the mark
+stack, with the world stopped: `ms_mark_roots`.)
+
+Then the GC thread marks the global registers and tables
+(`ms_mark_global_roots`, atomically), scans spatic and traces -- only
+once every stack is in: tracing earlier could read a TLAB tail not
+yet retired as the extent of the object before it.  A round holds
+the GC thread for as long as the slowest thread takes to reach a
+safepoint: microseconds, a thread that has done its part signalling
+it (`gc_hs_cv`; on one core the GC thread would otherwise wait for
+the mutator's slice to end).
+
+### Phase 3: Concurrent Mark
 
 The GC thread traces the heap while mutators run:
 - Scans spatic first (`ms_mark_spatic_concurrent()`): every pointer
   from the world image into the heap is a root, but stores into
   spatic are barriered like any, so the scan can run under the
-  barrier rather than in the pause -- a word read old was there since
-  the snapshot, one read new refers to what the snapshot's rules mark
-  anyway, and what was overwritten is in a barrier buffer
+  barrier -- a word read old was there since the snapshot, one read
+  new refers to what the snapshot's rules mark anyway, and what was
+  overwritten is in a barrier buffer
 - Uses `ms_trace_concurrent()` with atomic mark-bitmap operations
   (`__atomic_fetch_or`)
-- Mutators' SATB barriers log old pointer values before any heap
-  write; a buffer that fills (1024 entries) is handed to the marker
-  (`satb_full_list`, under `satb_lock`) and a fresh one begun, and the
-  marker drains the full ones (`ms_satb_drain_concurrent`) each time
-  its mark stack runs dry, until neither has anything left
+- Mutators' SATB barriers log the old value before any heap write,
+  and the value stored too while the storing thread's stacks are
+  unscanned (SATB Write Barriers, below); a buffer that fills (1024
+  entries) is handed to the marker (`satb_full_list`, under
+  `satb_lock`) and a fresh one begun, as is every buffer at a
+  handshake, and the marker drains the list
+  (`ms_satb_drain_concurrent`) each time its mark stack runs dry
+- A reference to an object allocated since the snapshot (above its
+  region's `sweep_top`), from a buffer or a field, is ignored: the
+  object is implicitly live and holds only references the marker
+  reaches by other means, and marking it would make a mutator that
+  keeps overwriting fields with fresh objects feed the termination
+  rounds for as long as it allocates
 - Objects allocated from free lists during this phase are marked
   atomically ("born-black") via `ms_mark_alloc()`; a TLAB carved from
   a free run is blackened whole (`ms_blacken`)
 - Objects allocated from virgin tails (TLABs included) are above
   their region's `sweep_top` and are implicitly live (not swept); a
   region mapped during the mark has `sweep_top` at its start
+- Neither kind is ever traced: what they can refer to was reachable
+  at the snapshot (marked by the snapshot's rules), was allocated
+  after it (black), was stored by an unscanned thread (logged), or
+  was read through a weak pointer or a raw-ref cache (logged)
 - The region table may grow meanwhile (a mutator mapping a region
   under `alloc_lock` publishes it with release stores; the marker's
   lookups are acquire loads); regions are only unmapped between
   cycles
 
-### Phase 3: Remark (STW)
+### Phase 4: Termination, by rounds
 
-The GC thread parks all threads again, then:
-1. Retires TLABs allocated during concurrent mark, and counts what
-   was allocated during the mark (Pacing)
-2. Drains the SATB buffers into the mark stack
-   (`satb_drain_to_mark_stack()`): any full ones handed over since the
-   marker last looked, and each thread's partial one
-3. Re-scans the registers and stacks (C arrays, not covered by SATB;
-   `ms_mark_thread_roots()`).  Spatic is not rescanned (its stores
-   are barriered), and what was allocated during the mark is black
-   and is not scanned: everything it can refer to was reachable at
-   the snapshot (marked by the snapshot's rules), was allocated after
-   it (black), or was read through a weak pointer, which the
-   weak-read barrier logged
-4. Traces all newly discovered references
-5. Deactivates SATB barriers
-6. Sets the budget, prepares the lazy sweep (clears free lists and
-   the free bits, flushes the global method cache and the native
-   call-site caches, whose raw refs are no roots), and sets
-   `gc_weak_clearing`
-7. Releases all threads
-8. Then, outside the pause, clears the weak pointer table under
-   `wp_lock` (`ms_post_gc_wp`): an entry is cleared unless its object
-   is alive by the marks (`ms_weak_alive`: outside the heap,
-   allocated since the snapshot -- above its region's `sweep_top`,
-   born black or implicitly live and not necessarily marked -- or
-   marked).  A mutator reading a weak pointer meanwhile makes the
-   same test itself (`satb_weak_read`, data.h, on
-   `gc_weak_clearing`), so an object the clearing has not reached yet
-   is never resurrected, and an object allocated from a free entry
-   meanwhile is born black (`MS_BORN_BLACK`), so a weak pointer made
-   to it survives; then the flag is cleared.  The sweep, started in
-   the pause, goes on throughout: it leaves the mark bits alone (the
-   next cycle clears them all), and resets no region while the
-   clearing lasts (a reset moves `sweep_top`)
-9. Sweeps enough blocks (the lock taken a block at a time) for the
+When the mark stack is empty the GC thread runs a round in which
+every thread hands its buffer over, drains the list and traces.  If
+that marked nothing new (`mark_stack_pushes` unchanged), the mark is
+complete; otherwise another round.  Two or three rounds in all is
+usual, each a few microseconds of the GC thread's time.
+
+Why a quiet round is enough: suppose an object reachable at the end
+is unmarked.  It was reachable at the snapshot (what is allocated
+after is black or logged), so some marked object held the last
+pointer to it on a path from the roots; the marker traced that
+object and did not see the pointer, so the pointer was overwritten
+first, and the overwrite was logged.  The entry was logged after the
+thread's flush in the quiet round (or it would have been drained),
+so the holder was traced after that round began -- it was found from
+an entry drained in that round, which marked something new.  Not
+quiet after all.
+
+With `OAK_GC_VERIFY` the GC thread now stops the world once, retires
+every TLAB, marks the heap again from the roots as they are, and
+reports what the concurrent mark missed ("Verify mode").
+
+### Phase 5: After the mark
+
+1. The barrier goes off.  Entries logged after a thread's last
+   handshake, before this, carry this cycle's epoch and are dropped
+   at the thread's first append of the next cycle (`satb_fresh`);
+   they refer to marked objects anyway
+2. Counts what was allocated during the mark (Pacing)
+3. Under `alloc_lock`: sets the budget, prepares the lazy sweep
+   (clears the free lists and the free bits), sets
+   `gc_weak_clearing`, starts the sweep and sets `gc_phase` idle
+4. Clears the weak pointer table under `wp_lock` (`ms_post_gc_wp`):
+   an entry is cleared unless its object is alive by the marks
+   (`ms_weak_alive`: outside the heap, allocated since the snapshot
+   -- above its region's `sweep_top`, born black or implicitly live
+   and not necessarily marked -- or marked).  A mutator reading a
+   weak pointer meanwhile makes the same test itself
+   (`satb_weak_read`, data.h, on `gc_weak_clearing`), so an object
+   the clearing has not reached yet is never resurrected, and an
+   object allocated from a free entry meanwhile is born black
+   (`MS_BORN_BLACK`), so a weak pointer made to it survives; then the
+   flag is cleared.  The sweep goes on throughout: it leaves the
+   mark bits alone (the next cycle clears them all), and resets no
+   region while the clearing lasts (a reset moves `sweep_top`)
+5. Sweeps enough blocks (the lock taken a block at a time) for the
    largest request any waiter made to be met, or for the budget to
    allow mapping a region, and announces the cycle's end to the
    waiters
 
-So the two pauses hold the registers and stacks only: on the stress
-test the initial mark takes at most 0.06 ms (p50 0.01) and the
-remark 1.1 ms (p50 0.035), against 0.24 and 0.89 before, 0.2 ms of
-each being the scan of the world image.
+So the only stop a thread takes for a cycle is the scan of its own
+stacks, a few microseconds (Pause Statistics has the numbers); the
+GC thread's rounds hold nobody.
 
-### Post-Remark: Lazy Sweep
+### Lazy Sweep
 
-After threads are released, sweep runs on demand, region by region:
+The sweep runs on demand, region by region:
 - Each call to `ms_lazy_sweep_one()` sweeps one 4096-word block of
   the current region, between its start and its `sweep_top`; a run of
   dead objects open at the block's end carries over to the next
@@ -555,8 +642,8 @@ After threads are released, sweep runs on demand, region by region:
   the sweep completes, if the heap is over its budget
 - The mark bits are left as they are (the next cycle clears them
   all); a TLAB's unused tail is retired -- zeroed, given an objstart
-  bit -- when its thread replaces it as well as at the pauses, so no
-  object's extent absorbs stale words
+  bit -- when its thread replaces it, and at the thread's first
+  handshake of a cycle, so no object's extent absorbs stale words
 - Called from `ms_alloc_slow_locked()` when free lists are empty
 - Naturally adapts sweep rate to allocation pressure
 - `ms_lazy_sweep_finish()` flushes remaining blocks at the start of
@@ -581,19 +668,21 @@ ends); a thread that finds no room beyond that waits for the cycle
 (`ms_wait_cycle`), and when the cycle leaves it nothing, maps a
 region past the budget.
 
-At the remark the GC thread sets the next budget from what it
-measured (`ms_set_budget`, `ms_set_pacing`):
+At the end of the mark the GC thread sets the next budget from what
+it measured (`ms_set_budget`, `ms_set_pacing`):
 
-- the live data `L` (the words the mark traced), the words `A`
-  allocated during the mark (smoothed: half this cycle's, half the
-  last value), and the allocation rate `R` since the previous
-  snapshot (words per ms, smoothed the same way);
+- the live data `L` (the words the mark traced: what was reachable
+  at the snapshot, not what was allocated during the mark, which the
+  marker neither traces nor counts), the words `A` allocated during
+  the mark (smoothed: half this cycle's, half the last value), and
+  the allocation rate `R` since the previous snapshot (words per ms,
+  smoothed the same way);
 - budget = max(`--size-heap`, 3L + 2A, L + 2A + max(16A, R ×
   `MS_MIN_CYCLE_MS`)); what is allocated during a mark is born black
   and freed only by the next cycle, so it counts twice, and a cycle
-  costs every thread two pauses whatever the heap size, so cycles
-  come at least 16 marks' worth and 32 ms of allocation apart however
-  little is live; grown by half after a cycle in which a thread
+  costs every thread a root scan and the marker its rounds whatever
+  the heap size, so cycles come at least 16 marks' worth and 32 ms of
+  allocation apart however little is live; grown by half after a cycle in which a thread
   waited, and never more than doubled in one cycle (one long cycle is
   not a trend); capped by `MAX_NEW_SPACE_SIZE`;
 - headroom = A, between an eighth and a half of the budget.
@@ -602,20 +691,24 @@ Without threads there is no headroom and no trigger: the cycle runs
 in the allocating thread when the budget is exhausted.  `--trace-gc 2`
 prints the measurements and every change of the budget and headroom,
 and each wait with the heap's state; `--trace-gc 3` adds the
-allocator's view when it finds no room, and the remark's parts.
+allocator's view when it finds no room, and every handshake round
+(`--gc-stats` counts them).
 
 ### GC Phase Tracking
 
-The `gc_phase` variable tracks the current state:
+The `gc_phase` variable tracks the current state.  With threads:
 
 ```
 GC_PHASE_IDLE
-  → GC_PHASE_INITIAL_MARK   (STW pause 1)
-  → GC_PHASE_CONCURRENT_MARK (mutators running)
-  → GC_PHASE_REMARK          (STW pause 2)
-  → GC_PHASE_SWEEP           (lazy sweep, mutators running)
-  → GC_PHASE_IDLE
+  → GC_PHASE_CONCURRENT_MARK (from the snapshot to the end of the mark;
+                              born black from free entries meanwhile)
+  → GC_PHASE_IDLE            (the lazy sweep; born black while the weak
+                              table is cleared, gc_weak_clearing)
 ```
+
+The single-threaded cycle passes through `GC_PHASE_SWEEP` as it
+prepares the sweep; `GC_PHASE_INITIAL_MARK` and `GC_PHASE_REMARK` are
+unused since the pauses went.
 
 
 SATB Write Barriers
@@ -638,19 +731,34 @@ which native-parity.test checks the generated C for:
 9. STORE-SLOT (general slot store)
 10. Operation cache writes (method/type cache)
 
-and one read barrier: a value read through a weak pointer
+and two read barriers: a value read through a weak pointer
 (`wp_to_ref`, the WP-CONTENTS instruction, open-coded in generated C
-too) is logged the same way (`SATB_READ_WEAK`, `satb_log_value`).
-Every object reachable at the snapshot is marked by the snapshot's
-own rules, but one the snapshot held only weakly, read through its
-weak pointer during the mark and stored into a black object, would
-not be; logging the read makes the remark mark it.
+too) is logged the same way (`SATB_READ_WEAK`, `satb_log_value`), and
+so is the method a hit in the global method cache or a native call
+site yields (`SATB_READ_RAW`, dispatch.c and `ON_SITE_JUMP`).  Every
+object reachable at the snapshot is marked by the snapshot's own
+rules, but one the snapshot held only weakly, or only in a raw-ref
+cache that is no root, read from there during the mark and stored
+into a black object or kept on a scanned stack, would not be;
+logging the read makes the marker mark it.
+
+The barrier takes the value stored as well as the slot
+(`SATB_BARRIER(addr, v)`, `satb_log_store`).  Because the stacks are
+scanned one thread at a time, a thread whose stacks are not yet
+scanned this cycle (`gc_scan_epoch[i]` is not `gc_mark_epoch`) logs
+the value it stores too: a reference held only by its stack, stored
+into an already-marked object and then dropped from the stack would
+otherwise be lost, and a scanned stack can hold only references the
+marker reaches anyway (loaded from marked objects, logged, or
+allocated black).  Go's collector uses the same hybrid.
 
 When `gc_satb_active == 0` (the normal state), the barrier is a single
-well-predicted branch with negligible overhead.  When active, the old
-pointer value is logged to a per-thread buffer (1024 entries); a full
-buffer is handed to the marker, which drains it concurrently, and a
-fresh one begun.
+well-predicted branch with negligible overhead.  When active, the
+values are logged to a per-thread buffer (1024 entries, stamped with
+the cycle's epoch; entries of an earlier epoch are dropped at the
+first append); a full buffer is handed to the marker, which drains it
+concurrently, and a fresh one begun, and so is the buffer at every
+handshake.
 
 Fresh allocations (CONS, MAKE-CELL, ALLOCATE, etc.) are not barriered
 because they write to newly created objects, not overwrite existing
@@ -785,18 +893,22 @@ With `--trace-gc 2`:
 Under `THREADS + USE_MARK_SWEEP` with `--trace-gc 2`:
 
 ```
-; Mark-sweep GC due to space crunch in CONS instruction.
-; Marking... [heap=262144 words in 2 regions, used=260000, free_list=0]
-; STW initial mark... roots 0.226 ms.
-; Concurrent tracing... done.
-; STW remark... done.
+; Mark-sweep GC due to heap at its trigger.
+; Marking... [heap=393216 words in 3 regions, used=286720, free_list=53519]
+; 202560 words allocated in the 9.5 ms since the last snapshot (21316/ms; smoothed 21316/ms). roots
+; Concurrent tracing... done in 2 rounds.
+; 81920 words allocated in the mark's 0.48 ms (smoothed 47104).
 ; Mark complete.
+; MS-GC: 60935 words live in 393216 mapped: budget 262144 -> 524288.
+; MS-GC: 47104 words allocated during the mark: headroom 32768 -> 65536.
+; Lazy sweep prepared (3 regions).
 ; Scanning weak pointer table... 0 entries discarded.
-; Lazy sweep prepared (2 regions).
-; Eagerly swept 3576 words.
-; Remark pause 0.248 ms.
-; MS-GC complete.  3576 free on the lists, 262144 words mapped in 2 regions, budget 262144.
+; Eagerly swept 40302 words.
+; MS-GC complete.  40302 free on the lists, 393216 words mapped in 3 regions, budget 524288, headroom 65536.
 ```
+
+"roots" is the first handshake round done; the rounds are those of
+the termination, the roots' included.
 
 Regions mapped and unmapped are traced as above (`mapped a region`,
 `unmapped a region`), as is a budget change (`budget 262144 ->
@@ -806,8 +918,9 @@ budget`).
 At `--trace-gc 2` every pause ends with its length: `; GC pause
 0.694 ms.` after a copying collection, `; MS-GC pause 2.1 ms.` after
 a single-threaded mark-sweep one, and in the concurrent collector the
-initial-mark line ends with its pause and `; Remark pause ...`
-follows the sweep preparation, when the mutators are released.
+concurrent collector's mark ends with its number of handshake
+rounds, and `--trace-gc 3` prints every round and every root scan as
+a `; GC event:` line.
 
 
 Pause Statistics
@@ -818,44 +931,46 @@ stall by the monotonic clock and prints a report at exit, in ms:
 
 ```
 ; GC pauses and stalls, ms: count, total, mean, max, p50, p90, p99, and how many under 0.1, 1, 10, 100 ms and over
-; copying collection                   8     25.32    3.165    6.276    2.315    6.276    6.276       0     0     8     0     0
-; initial-mark pause                  24      5.74    0.239    0.345    0.228    0.318    0.345       0    24     0     0     0
-; remark pause                        24     10.29    0.429    1.749    0.241    1.033    1.749       0    21     3     0     0
-;   threads stopping                  56      0.02    0.000    0.002    0.000    0.001    0.002      56     0     0     0     0
-; concurrent cycle, its thread        24     55.81    2.325    9.800    0.751    5.611    9.800       0    14    10     0     0
-; safepoint wait                      65     62.94    0.968    4.293    0.350    3.445    4.293       0    53    12     0     0
-; allocation wait                     46     97.23    2.114    9.869    0.566    8.218    9.869       0    32    14     0     0
-; all global pauses                   56     41.35    0.738    6.276    0.244    2.246    6.276       0    45    11     0     0
-; GC: 56 global pauses, total 41.35 ms, max 6.276 ms, p99 6.276 ms, 7.2% of 573 ms
+; concurrent cycle, GC thread         19     28.61    1.506    5.569    0.920    3.931    5.569       0    11     8     0     0
+; handshake round, GC thread          59      0.21    0.004    0.016    0.002    0.010    0.016      59     0     0     0     0
+; root scan, own stacks               71      0.22    0.003    0.011    0.002    0.008    0.011      71     0     0     0     0
+; all stops of one thread             71      0.22    0.003    0.011    0.002    0.008    0.011      71     0     0     0     0
+; GC: 0 global pauses, total 0.00 ms, 0.0% of 563 ms; 71 stops of one thread, max 0.011 ms, p99 0.011 ms
 ```
 
 The kinds:
 
 - **Global pauses**, every thread stopped: a *copying collection*
-  (configs 1 and 3; in 2 and 4 the fallback, the growth and the
-  pre-dump compaction), a *mark-sweep collection* with one thread
-  (config 2: mark and sweep together, a fallback copy nested inside
-  it counted under its own kind only), and the concurrent collector's
-  *initial-mark* and *remark* pauses (config 4).  *All global pauses*
-  is their union, less the nested ones, and the `; GC:` line sums it
-  up against the run's wall-clock time.
+  (configs 1 and 3; in 2 and 4 the pre-dump compaction), a
+  *mark-sweep collection* with one thread (config 2: mark and sweep
+  together), and verify mode's *verify pause* at the end of a mark
+  (config 4 with `OAK_GC_VERIFY`).  *All global pauses* is their
+  union, less the nested ones.
 - **Threads stopping**: inside a pause with threads, from the request
-  until the last thread has reached a safepoint -- the handshake
-  latency Phase 5 of GCEnhancements.md cares about.
-- **Stalls of one thread**: a *safepoint wait* (a thread parked while
-  the GC thread held a pause), and an *allocation wait* (a thread out
-  of room, waiting for the next cycle to end; its safepoint waits
-  meanwhile count under both).  The *concurrent cycle* is the whole
-  cycle as the GC thread sees it, from finishing the previous sweep
-  to the end of the eager sweep; it stalls nobody.
+  until the last thread has reached a safepoint.
+- **The GC thread's own time**, stalling nobody: the *concurrent
+  cycle* is the whole cycle as the GC thread sees it, from finishing
+  the previous sweep to the end of the eager sweep, and a *handshake
+  round* is from its request to the last thread's part done.
+- **Stalls of one thread**: a *root scan* (a thread scanning its own
+  registers and stacks at its first handshake of a cycle), a
+  *safepoint wait* (a thread parked while another held a pause), and
+  an *allocation wait* (a thread out of room, waiting for the next
+  cycle to end).  *All stops of one thread* is their union with the
+  pauses (as the thread that runs a pause sees it).
+- The `; GC:` line sums the global pauses up against the run's
+  wall-clock time, then the stops of one thread: in a build that
+  stops the world for every collection the two are the same events;
+  with the concurrent collector the pauses are none and the stops are
+  the root scans.  `make bench` reports the stops' max and p99.
 
 The percentiles come from up to 4096 samples per kind, a uniform
 reservoir beyond that; count, total and max are exact.  The report
 goes to stderr; a stand-alone executable gets the option through
 `OAKLISP_OPTIONS`.  `make bench` runs every benchmark with it and
-prints the longest and the 99th-percentile pause of each run beside
-the time (tests/bench.sh, `-o` saves them too), and `-p N` prints
-the `; GC:` line of its one-thread and N-thread runs.
+prints the longest and the 99th-percentile stop of one thread of
+each run beside the time (tests/bench.sh, `-o` saves them too), and
+`-p N` prints the `; GC:` line of its one-thread and N-thread runs.
 
 `tests/gc-stress.test` is the collectors' load test: `gc-stress.oak`
 makes and verifies lists, vectors, bignums, closures, continuations,
@@ -868,67 +983,69 @@ log.  Its first run found bignum division's caches shared between
 threads (Threads.md, "Shared state"), not a collector bug: verify mode
 is clean on it in every mode.  The same test then runs
 `weak-young.oak`: weak pointers to objects made during a mark and
-held only by an old object, which a remark that cleared every
-unmarked entry lost (the objects were implicitly live, above their
+held only by an old object, which the remark pause of the time,
+clearing every unmarked entry, lost (the objects were implicitly live, above their
 regions' `sweep_top`, and unmarked), one run in three.
 
 Measured 2026-10-31, with the region heap, the GC thread and the
-pauses of Phase 4 (i9-14900KF, `make bench` pinned to one P core,
-FAST builds of the same sources): the longest pause and the p99
-pause in ms of each benchmark's run (compile plus five repetitions),
-in the four configurations.  Few collections happen per run, so the
-two are mostly equal; dispatch, fib and tak collect nothing.  (The
-config 3 column is the region heap's measurement of 2026-10-29: its
-code did not change.)
+handshakes of Phase 5 (i9-14900KF, `make bench` pinned to one P
+core, FAST builds of the same sources): the longest stop of one
+thread and its p99 in ms of each benchmark's run (compile plus five
+repetitions), in the four configurations -- the global pause in
+configs 1 to 3, which have no other stop, a thread's own root scan
+or wait in config 4, which has no global pause.  Few collections
+happen per run, so the two are mostly equal; dispatch, fib and tak
+collect nothing.  (The config 3 column is the region heap's
+measurement of 2026-10-29: its code did not change.)
 
 | Benchmark | 1 copying | 2 mark-sweep | 3 threads, copying | 4 threads, mark-sweep |
 |-----------|-----------|--------------|--------------------|-----------------------|
-| bignum | 0.31 / 0.31 | 0.27 / 0.27 | 0.30 / 0.29 | 0.036 / 0.036 |
-| compile | 0.40 / 0.40 | 0.33 / 0.33 | 0.35 / 0.35 | 0.011 / 0.011 |
-| cons | 0.40 / 0.30 | 0.28 / 0.27 | 0.31 / 0.29 | 0.056 / 0.056 |
-| eval | 0.86 / 0.83 | 1.00 / 1.00 | 0.86 / 0.81 | 0.019 / 0.019 |
-| format | 0.35 / 0.35 | 0.24 / 0.24 | 0.33 / 0.33 | 0.009 / 0.009 |
-| hash | 6.52 / 6.52 | 4.73 / 4.73 | 6.19 / 6.19 | 0.171 / 0.171 |
-| sort | 2.42 / 2.42 | 1.08 / 1.08 | 7.17 / 7.17 | 0.011 / 0.011 |
-| strings | 0.36 / 0.35 | 0.25 / 0.25 | 0.31 / 0.29 | 0.012 / 0.012 |
+| bignum | 0.34 / 0.33 | 0.22 / 0.22 | 0.30 / 0.29 | 0.008 / 0.008 |
+| compile | 0.38 / 0.38 | 0.30 / 0.30 | 0.35 / 0.35 | 0.007 / 0.007 |
+| cons | 0.32 / 0.30 | 0.24 / 0.24 | 0.31 / 0.29 | 0.008 / 0.008 |
+| eval | 0.81 / 0.79 | 0.96 / 0.96 | 0.86 / 0.81 | 0.61 / 0.61 |
+| format | 0.35 / 0.35 | 0.21 / 0.21 | 0.33 / 0.33 | 0.005 / 0.005 |
+| hash | 6.15 / 6.15 | 4.75 / 4.75 | 6.19 / 6.19 | 0.009 / 0.009 |
+| sort | 2.30 / 2.30 | 1.07 / 1.07 | 7.17 / 7.17 | 0.008 / 0.008 |
+| strings | 0.36 / 0.35 | 0.27 / 0.27 | 0.31 / 0.29 | 0.005 / 0.005 |
 
-Before the region heap (2026-10-29, three commits earlier), the
-long pauses in the mark-sweep configurations were the copying
-collector growing the heap, a whole-heap copy each time: 28.3 ms on
-hash and 8.4 on sort in config 2, 20.6 and 6.5 in config 4, with
-eval and compile at 1.5 to 2.3 ms.  Now a mark-sweep build never
-copies except for a dump.  In config 4 every pause is an initial
-mark or a remark, and both scan the registers and stacks only: the
-longest is 0.17 ms (hash's remark), the rest 0.01 to 0.06 ms, where
-one commit earlier, with the spatic scan, the barrier drain and the
-weak table inside the pauses, hash paused 1.1 ms and the rest 0.21
-to 0.43.  In config 2 the pause is the stop-the-world mark of the
-live data, which is why hash and eval pause 1.0 to 4.7 ms there
-(Phase 7 of GCEnhancements.md is about that build).  In
+Before the region heap (2026-10-29, four commits earlier), the long
+pauses in the mark-sweep configurations were the copying collector
+growing the heap, a whole-heap copy each time: 28.3 ms on hash and
+8.4 on sort in config 2, 20.6 and 6.5 in config 4, with eval and
+compile at 1.5 to 2.3 ms.  Now a mark-sweep build never copies
+except for a dump.  In config 4 there is no global pause at all: the
+column is the longest stop of one thread, its own root scan, 0.005
+to 0.015 ms (eval's 0.61 ms is one allocation wait, the thread
+outrunning the marker once before the headroom had adapted); one
+commit earlier the two pauses, scanning the stacks only, were 0.17
+ms on hash and 0.01 to 0.06 elsewhere, and two commits earlier, with
+the spatic scan, the barrier drain and the weak table inside them,
+1.1 and 0.21 to 0.43.  In config 2 the pause is the stop-the-world
+mark of the live data, which is why hash and eval pause 1.0 to 4.8
+ms there (Phase 7 of GCEnhancements.md is about that build).  In
 `gc-stress.oak` on four threads (config 4, `--size-heap 256`, 19
-cycles in 0.54 s, twenty runs) initial mark took at most 0.06 ms
-(p50 0.01), remark at most 1.1 ms (p50 0.035: the last partial
-barrier buffers, the stacks, and the trace from them), the threads
-stopped within 0.12 ms (p50 1 us) -- 38 global pauses, 0.4% of the
-run, against 1.9% one commit earlier (initial mark up to 0.24 ms,
-remark 0.89, p50 0.23) and 5.1% with the copying growth before the
-region heap (71 pauses, copies up to 6.2 ms, the run 1.03 s).  No
-thread ran a cycle or waited for memory in the twenty runs (the
-region heap alone: the cycle's thread lost up to 3.1 ms, 46 waits up
-to 2.9 ms); the first run after a build, its pages cold, saw the
-four threads wait 0.6 ms once each at the limit of the runway
-("Pacing").  What remains is the safepoint wait of a thread parked
-for a pause, at most 1.2 ms (140 times, p50 0.05) -- Phases 5 and
-6.  The GC thread's own time per cycle was up to 6.4 ms (p50 0.9),
-stalling nobody.  The same program in the default build (95 copying
-collections) paused at most 1.2 ms, p50 0.47, 3.1% of the run, and
-in config 2 (141 cycles) at most 0.72 ms, p50 0.36, 2.9%.  Four
-copies of tak on four OS threads (`tests/bench.sh -p 4`, config 4)
-ran 3.96 times faster than on one, with no collection.  A
-measurement note: pinned to one core, the GC thread does not run
-again for a scheduler's slice after it releases the mutators, so the
-pauses are timed up to the release; the mutators' safepoint waits are
-the pauses as they felt them.
+cycles in 0.55 s, twenty runs) no thread stopped another: each
+thread's root scan took at most 0.05 ms (p50 0.002), the GC thread's
+rounds (two per cycle) at most 1.0 ms (p50 0.005), and no thread
+waited for memory (the same program as an oakc executable allocates
+faster than the one marker traces: there the four threads each wait
+once per run, up to 1.3 ms, for the first big cycle -- Phase 6 of
+GCEnhancements.md) -- against 38 global pauses, 0.4% of the run, one
+commit earlier (initial mark up to 0.06 ms, remark 1.1; the threads
+parked for them up to 1.2 ms), 1.9% two commits earlier, and 5.1%
+with the copying growth before the region heap (71 pauses, copies up
+to 6.2 ms, the run 1.03 s; the region heap alone: the cycle's thread
+lost up to 3.1 ms, 46 waits up to 2.9 ms).  The GC thread's own time
+per cycle was up to 5.2 ms (p50 1.2), stalling nobody.  The same
+program in the default build (95 copying collections) paused at most
+1.2 ms, p50 0.47, 3.0% of the run, and in config 2 (141 cycles) at
+most 0.70 ms, p50 0.36, 2.7%.  Four copies of tak on four OS threads
+(`tests/bench.sh -p 4`, config 4) ran 3.95 times faster than on one,
+with no collection.  A measurement note: on one core a round ends
+when the last thread signals the GC thread, not when the mutator's
+slice ends (`gc_hs_cv`); before that, a round cost the cycle 2.5 ms
+of waiting and the throughput 8%.
 
 
 Key Design Decisions
@@ -944,10 +1061,21 @@ threads can safely dereference pointers during collection.
 **A GC thread.**  A cycle run by whichever mutator ran out of memory
 stalled that thread for the length of the mark, and the others once
 the heap was full, since nothing could be mapped until the cycle
-ended.  On a thread of its own the mark costs the mutators only the
-two pauses, the heap is paced so that a cycle is asked for while
-there is still room (Pacing), and a thread waits only when the
+ended.  On a thread of its own the mark costs the mutators only
+their root scans, the heap is paced so that a cycle is asked for
+while there is still room (Pacing), and a thread waits only when the
 mutators together allocate faster than the GC thread marks.
+
+**Handshakes, not pauses.**  Two stop-the-world pauses per cycle,
+however short, held every thread for the slowest to reach a
+safepoint, and parked them all for the scan of all their stacks.
+Now each thread scans its own stacks at a safepoint of its own and
+goes on, a round of such handshakes holds only the GC thread, and
+the mark ends when a round of buffer flushes marks nothing new.  The
+price is a barrier that also logs the value stored while the storing
+thread's stacks are unscanned -- one more test on the barrier's slow
+path -- and a read barrier on the raw-ref caches, which the pauses
+used to cover by rescanning the stacks.
 
 **Sweep uses objstart bitmap, not type-pointer length.**  The
 `MAKE-CELL` instruction allocates 1-word cells where `word[0]` stores
@@ -969,10 +1097,9 @@ amortizes sweep cost across allocations in single-threaded mode.
 concurrent mark are below their region's `sweep_top` and would be
 incorrectly freed.  Setting their mark bits atomically prevents this.
 Objects allocated via a virgin tail or TLAB are above `sweep_top` and
-are never swept (implicitly live).  Neither kind is scanned at the
-remark: what they can refer to is covered by the snapshot's rules and
-the weak-read barrier, and scanning a mark's worth of allocation
-inside the pause cost milliseconds.
+are never swept (implicitly live).  Neither kind is ever traced: what
+they can refer to is covered by the snapshot's rules, the logging of
+an unscanned thread's stores, and the read barriers.
 
 **A heap of regions.**  A contiguous heap can only grow by being
 copied, which is a whole-heap pause.  Regions (spans of aligned 1 MB
@@ -999,7 +1126,8 @@ Source Files
 | `gc.c` | Copying GC: transport, scavenge, locative fixup, heap expansion (the dump compaction in mark-sweep builds) |
 | `gc.h` | Copying GC declarations, `GC_MEMORY`/`GC_RECALL` macros |
 | `data.h` | `ALLOCATE_PROT` macro (three variants), heap data structures |
-| `loop.c` | SATB barrier insertion sites, allocation instruction handlers |
+| `loop.c` | SATB barrier insertion sites, allocation instruction handlers, the safepoint poll |
+| `threads.c` | `wait_for_gc`: a thread's safepoint (a pause to wait out, or its handshake), the parked states (`gc_ready`), thread exit |
 | `oaklisp.c` | GC initialization (`ms_init`, `gc_safepoint_init`) |
 | `weak.c` | Weak pointer table processing (used by both collectors) |
 | `gc-stats.c`, `gc-stats.h` | Pause and stall timing and the `--gc-stats` report |
@@ -1038,9 +1166,10 @@ Recommendations
 **For single-threaded use:**  The default build (Config 1, copying GC).
 
 **For multi-threaded use:**  Config 4 (`THREADS + USE_MARK_SWEEP`) is
-strongly recommended.  The concurrent mark-sweep collector minimizes
-STW pause times (only initial mark and remark are STW; sweep is lazy),
-and TLABs eliminate allocation lock contention for the common case.
+strongly recommended.  The concurrent mark-sweep collector stops no
+thread for another (a thread's one stop is the scan of its own
+stacks, microseconds; the sweep is lazy), and TLABs eliminate
+allocation lock contention for the common case.
 Config 3 (`THREADS` alone) has longer pauses (every collection is a
 stop-the-world copy) and all allocations contend on `alloc_lock`.
 

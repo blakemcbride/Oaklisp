@@ -204,7 +204,8 @@ extern oak_native_fn *oak_native_fn_chunks[OAK_NATIVE_FN_CHUNKS];
    stack or a register does not.  native-parity.test greps the
    generated C for raw stores. */
 #define ON_STORE(p, v)							\
-  do { ref_t *_on_p = (p); SATB_BARRIER(_on_p); *_on_p = (v); } while (0)
+  do { ref_t *_on_p = (p); ref_t _on_v = (v);				\
+       SATB_BARRIER(_on_p, _on_v); *_on_p = _on_v; } while (0)
 
 /* The thread registers (LOAD-REG 23 to 25). */
 #ifdef THREADS
@@ -524,7 +525,10 @@ oak_native_direct_return(unsigned *k)
    site's sequence count is still the even number ON_SITE_CALL read
    first (a fill in another thread takes it odd and leaves it changed);
    otherwise the call falls through to the ON_FUNCALL after it.  BP is
-   1 for a generic site, whose bp offset applies, 0 for a lambda. */
+   1 for a generic site, whose bp offset applies, 0 for a lambda.  The
+   method is a raw ref from no root: during a mark the hit logs it for
+   the marker (SATB_READ_RAW; the code and environment are reached
+   from it). */
 #ifdef THREADS
 #define ON_SITE_CHECK(s, seq1)						\
   (OAK_ATOMIC_FENCE_ACQUIRE(), OAK_ATOMIC_LOAD_REF(&(s)->seq) == (seq1))
@@ -536,7 +540,8 @@ oak_native_direct_return(unsigned *k)
   do { ref_t _on_m = (s)->method, _on_c = (s)->code, _on_e = (s)->env;	\
        ref_t _on_o = (s)->offset; oak_native_fn _on_fn = (s)->fn;	\
        if (ON_SITE_CHECK(s, seq1))					\
-	 { if (bp) e_bp = REF_TO_PTR(sp[-1]) + REF_TO_INT(_on_o);	\
+	 { SATB_READ_RAW(_on_m);					\
+	   if (bp) e_bp = REF_TO_PTR(sp[-1]) + REF_TO_INT(_on_o);	\
 	   e_current_method = _on_m;					\
 	   e_code_segment = _on_c;					\
 	   e_env = REF_TO_PTR(_on_e);					\
@@ -548,7 +553,8 @@ oak_native_direct_return(unsigned *k)
   do { ref_t _on_m = (s)->method, _on_c = (s)->code, _on_e = (s)->env;	\
        ref_t _on_o = (s)->offset;					\
        if (ON_SITE_CHECK(s, seq1))					\
-	 { if (bp) e_bp = REF_TO_PTR(sp[-1]) + REF_TO_INT(_on_o);	\
+	 { SATB_READ_RAW(_on_m);					\
+	   if (bp) e_bp = REF_TO_PTR(sp[-1]) + REF_TO_INT(_on_o);	\
 	   e_current_method = _on_m;					\
 	   e_code_segment = _on_c;					\
 	   e_env = REF_TO_PTR(_on_e);					\

@@ -53,7 +53,8 @@ extern int oak_live_thread_count(void);
 extern int oak_thread_park(long ms);
 extern int oak_thread_unpark(int idx);
 extern void oak_thread_sleep_ms(long ms);
-extern bool gc_pending;
+extern volatile bool gc_pending;
+extern bool gc_stw;
 extern oak_mutex_t gc_lock;
 #endif
 

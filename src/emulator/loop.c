@@ -669,7 +669,7 @@ loop(ref_t initial_tos)
 	    case 15:		/* SET-CONTENTS */
 	      POPVAL(x);
 	      CHECKTAG1(x, LOC_TAG, 2);
-	      SATB_BARRIER(LOC_TO_PTR(x));
+	      SATB_BARRIER(LOC_TO_PTR(x), PEEKVAL());
 	      *LOC_TO_PTR(x) = PEEKVAL();
 	      GOTO_TOP;
 
@@ -791,7 +791,7 @@ loop(ref_t initial_tos)
 	    case 22:		/* STORE-BP-I */
 	      POPVAL(x);
 	      CHECKTAG1(x, INT_TAG, 2);
-	      SATB_BARRIER(e_bp + REF_TO_INT(x));
+	      SATB_BARRIER(e_bp + REF_TO_INT(x), PEEKVAL());
 	      *(e_bp + REF_TO_INT(x)) = PEEKVAL();
 	      GOTO_TOP;
 
@@ -1009,14 +1009,14 @@ loop(ref_t initial_tos)
 	    case 42:		/* SET-CAR */
 	      CONSINSTR(2);
 	      POPVALS(1);
-	      SATB_BARRIER(pcar(x));
+	      SATB_BARRIER(pcar(x), PEEKVAL());
 	      *pcar(x) = PEEKVAL();
 	      GOTO_TOP;
 
 	    case 43:		/* SET-CDR */
 	      CONSINSTR(2);
 	      POPVALS(1);
-	      SATB_BARRIER(pcdr(x));
+	      SATB_BARRIER(pcdr(x), PEEKVAL());
 	      *pcdr(x) = PEEKVAL();
 	      GOTO_TOP;
 
@@ -1157,12 +1157,14 @@ loop(ref_t initial_tos)
 #endif
 	      x = PEEKVAL();
 	      /* CHECKTAG0(x,PTR_TAG,1); */
-	      SATB_BARRIER(&REF_SLOT(x, CONTINUATION_VAL_SEGS));
+	      SATB_BARRIER(&REF_SLOT(x, CONTINUATION_VAL_SEGS),
+			   value_stack.segment);
 	      REF_SLOT(x, CONTINUATION_VAL_SEGS)
 		= value_stack.segment;
 	      REF_SLOT(x, CONTINUATION_VAL_OFF)
 		= INT_TO_REF(value_stack.pushed_count);
-	      SATB_BARRIER(&REF_SLOT(x, CONTINUATION_CXT_SEGS));
+	      SATB_BARRIER(&REF_SLOT(x, CONTINUATION_CXT_SEGS),
+			   context_stack.segment);
 	      REF_SLOT(x, CONTINUATION_CXT_SEGS)
 		= context_stack.segment;
 	      REF_SLOT(x, CONTINUATION_CXT_OFF)
@@ -1355,7 +1357,7 @@ loop(ref_t initial_tos)
 #ifdef THREADS
 	      /* One compare-and-swap (the barrier logs the old value
 		 first, whether or not the swap then happens). */
-	      SATB_BARRIER(LOC_TO_PTR(x));
+	      SATB_BARRIER(LOC_TO_PTR(x), PEEKVAL());
 	      PEEKVAL() = OAK_ATOMIC_CAS_SIZE(LOC_TO_PTR(x), &y, PEEKVAL())
 		? e_t : e_false;
 	      /* End Critical Section. */
@@ -1365,7 +1367,7 @@ loop(ref_t initial_tos)
 		PEEKVAL() = e_false;
 		GOTO_TOP;
 	      }
-	      SATB_BARRIER(LOC_TO_PTR(x));
+	      SATB_BARRIER(LOC_TO_PTR(x), PEEKVAL());
 	      *LOC_TO_PTR(x) = PEEKVAL();
 	      PEEKVAL() = e_t;
 	      GOTO_TOP;
@@ -1607,7 +1609,7 @@ loop(ref_t initial_tos)
 	      GOTO_TOP;
 
 	    case 13:		/* STORE-BP n */
-	      SATB_BARRIER(e_bp + arg_field);
+	      SATB_BARRIER(e_bp + arg_field, PEEKVAL());
 	      *(e_bp + arg_field) = PEEKVAL();
 	      GOTO_TOP;
 
@@ -1617,7 +1619,7 @@ loop(ref_t initial_tos)
 	      GOTO_TOP;
 
 	    case 15:		/* STORE-ENV n */
-	      SATB_BARRIER(e_env + arg_field);
+	      SATB_BARRIER(e_env + arg_field, PEEKVAL());
 	      *(e_env + arg_field) = PEEKVAL();
 	      GOTO_TOP;
 
@@ -2013,7 +2015,7 @@ loop(ref_t initial_tos)
 	    case 26:		/* STORE-SLOT n */
 	      POPVAL(x);
 	      CHECKTAG1(x, PTR_TAG, 2);
-	      SATB_BARRIER(&REF_SLOT(x, arg_field));
+	      SATB_BARRIER(&REF_SLOT(x, arg_field), PEEKVAL());
 	      REF_SLOT(x, arg_field) = PEEKVAL();
 	      GOTO_TOP;
 

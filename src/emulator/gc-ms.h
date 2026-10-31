@@ -84,7 +84,6 @@ typedef struct ms_region {
     unsigned empty_cycles;	/* sweeps in a row that found nothing live */
     struct ms_region *next;	/* the heap's list, in mapping order */
 #ifdef OAK_GC_VERIFY
-    uint64_t *verify_snap;	/* reachable at the snapshot */
     uint64_t *verify_born;	/* born black this cycle */
 #endif
 } ms_region_t;
@@ -190,6 +189,18 @@ void ms_collect_explicit(const char *reason);
    meanwhile; release lets them go on. */
 void ms_gc_hold(void);
 void ms_gc_release(void);
+
+/* The handshakes (gc-ms.c, "Handshakes"): a cycle's mark asks every
+   mutator, through gc_pending, to retire its TLAB and scan its own
+   registers and stacks into its barrier buffer, and later to hand
+   that buffer over; a thread does its part at its next safepoint
+   (ms_handshake_poll, from wait_for_gc), the GC thread does it for a
+   thread parked or blocked in C.  A thread about to exit hands its
+   buffer over (ms_thread_exiting) and its slot is reset for the next
+   occupant (ms_thread_slot_reset). */
+void ms_handshake_poll(int idx);
+void ms_thread_exiting(int idx);
+void ms_thread_slot_reset(int idx);
 #endif
 /* Verify mode: the index of the thread that has the world stopped,
    or this when none has. */
@@ -251,7 +262,8 @@ ref_t *ms_allocate_slow(size_t words, char *reason);
 void ms_tlab_retire(ref_t *cursor, ref_t *end);
 
 /* Retire all threads' TLABs.  Must be called with the world stopped:
-   the TLAB fast path in ALLOCATE_PROT takes no lock. */
+   the TLAB fast path in ALLOCATE_PROT takes no lock.  The
+   single-threaded cycle's, and verify mode's. */
 void ms_tlab_retire_all(void);
 
 /* The objstart bit of the TLAB fast path (ALLOCATE_PROT, data.h): a
@@ -267,13 +279,18 @@ void ms_tlab_retire_all(void);
 /* ------------------------------------------------------------------ */
 
 /* When gc_satb_active is nonzero, the SATB_BARRIER macro logs the old
-   value of a heap slot before it is overwritten.  This is the
-   snapshot-at-the-beginning invariant needed for concurrent marking.
+   value of a heap slot before it is overwritten -- the
+   snapshot-at-the-beginning invariant of the concurrent mark -- and,
+   while the storing thread's own stacks have not been scanned this
+   cycle, the value stored as well (gc-ms.c, "Handshakes": the stacks
+   are scanned one thread at a time, so a reference held only by an
+   unscanned stack and stored into a marked object would otherwise be
+   lost when the stack drops it).
 
-   Under THREADS + USE_MARK_SWEEP, gc_satb_active is set to 1 during
-   the concurrent mark phase and cleared during the remark STW pause.
-   In single-threaded mode it is always 0.  The compiler should predict
-   the branch as not-taken (negligible overhead). */
+   Under THREADS + USE_MARK_SWEEP, gc_satb_active is set for the length
+   of a mark, with no pause at either end.  In single-threaded mode it
+   is always 0.  The compiler should predict the branch as not-taken
+   (negligible overhead). */
 
 extern int gc_satb_active;
 
@@ -292,34 +309,36 @@ extern size_t satb_count;
 extern size_t satb_size;
 #endif
 
-/* Log the old value at *addr to the per-thread SATB buffer.
-   Called from the SATB_BARRIER macro; do not call directly. */
-void satb_log_old(ref_t *addr);
+/* Log the old value at *addr, and the new one V while this thread's
+   stacks are unscanned, to the thread's SATB buffer.  Called from the
+   SATB_BARRIER macro; do not call directly. */
+void satb_log_store(ref_t *addr, ref_t v);
 
-/* Log a value read through a weak pointer (SATB_READ_WEAK).  Every
-   object reachable at the snapshot is marked by the snapshot's own
-   rules; an object the snapshot held only weakly, read through its
-   weak pointer during the mark and stored into a black object, would
-   not be -- so the read logs it, and the remark marks it. */
+/* Log a value read from somewhere no root covers (SATB_READ_WEAK,
+   SATB_READ_RAW).  Every object reachable at the snapshot is marked by
+   the snapshot's own rules; an object the snapshot held only weakly,
+   read through its weak pointer during the mark and stored into a
+   black object, would not be -- so the read logs it, and the marker
+   marks it.  The same for a method read out of the global method
+   cache or a native call site, raw refs that are no roots. */
 void satb_log_value(ref_t v);
 
-/* Drain all SATB buffers.  In Phase 4 this will feed entries to the
-   concurrent marker; for now it just clears the buffers. */
-void satb_flush_all(void);
-
-/* Barrier macro: insert before any heap write that overwrites an
-   existing pointer field.  No-op when gc_satb_active == 0.
-   Overrides the no-op fallback defined in data.h. */
+/* Barrier macro: insert before any heap write of V over an existing
+   pointer field.  No-op when gc_satb_active == 0.  Overrides the no-op
+   fallback defined in data.h. */
 #undef SATB_BARRIER
-#define SATB_BARRIER(addr) \
+#define SATB_BARRIER(addr, v) \
     do { if (OAK_UNLIKELY(gc_satb_active)) \
-	     satb_log_old(addr); } while (0)
+	     satb_log_store((addr), (v)); } while (0)
 
-/* The read barrier on weak pointers: after wp_to_ref, on the value. */
+/* The read barrier on weak pointers (after wp_to_ref, on the value)
+   and on the raw-ref caches (on the method a hit yields). */
 #undef SATB_READ_WEAK
 #define SATB_READ_WEAK(v) \
     do { if (OAK_UNLIKELY(gc_satb_active)) \
 	     satb_log_value(v); } while (0)
+#undef SATB_READ_RAW
+#define SATB_READ_RAW(v) SATB_READ_WEAK(v)
 
 
 /* ------------------------------------------------------------------ */
@@ -328,7 +347,9 @@ void satb_flush_all(void);
 
 /* GC phase tracking.  Controls born-black allocation during
    concurrent mark and determines whether atomic bitmap operations
-   are needed. */
+   are needed.  With threads a cycle goes IDLE -> CONCURRENT_MARK
+   (from before the snapshot to the end of the mark) -> IDLE; the
+   single-threaded cycle passes through the others. */
 enum gc_phase_t {
     GC_PHASE_IDLE = 0,
     GC_PHASE_INITIAL_MARK,
@@ -348,10 +369,6 @@ extern volatile int gc_concurrent_in_progress;
    before ms_init). */
 void gc_safepoint_init(void);
 #endif
-
-/* Drain all SATB buffers into the GC mark stack so that the
-   concurrent marker can trace them.  Called during remark. */
-void satb_drain_to_mark_stack(void);
 
 /* Set mark bit for a newly allocated object during concurrent mark
    (born-black).  Safe to call at any time; no-op if address is

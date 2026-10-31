@@ -39,7 +39,13 @@ oak_mutex_t alloc_lock = OAK_MUTEX_INITIALIZER;
 oak_mutex_t index_lock = OAK_MUTEX_INITIALIZER;
 /* DUMP-WORLD and LOAD-WORLD, in the interpreter and in native code. */
 oak_mutex_t dump_lock = OAK_MUTEX_INITIALIZER;
-bool gc_pending = false;
+/* Something for the mutators to do at their next safepoint
+   (wait_for_gc): stop for a stop-the-world pause (gc_stw), or with
+   the mark-sweep collector take part in a handshake round
+   (gc-ms.c).  Set and cleared by whoever runs the pause or the
+   round, never both at once. */
+volatile bool gc_pending = false;
+bool gc_stw = false;
 int gc_ready[MAX_THREAD_COUNT];
 /* Slots of threads that have exited.  next_index never decreases, so
    without this a dead thread's gc_ready flag would stay 0 forever and
@@ -90,7 +96,12 @@ oak_thread_exit_unwind(void)
   /* This thread will not execute another instruction, so retire it here
      rather than making a collection that is already waiting on our
      handshake flag wait for the thread-local destructor to run.
-     free_registers repeats this when the thread actually exits. */
+     free_registers repeats this when the thread actually exits.  The
+     barrier buffer goes to the marker first: a round skips a dead
+     thread. */
+#ifdef USE_MARK_SWEEP
+  ms_thread_exiting(my_index);
+#endif
   gc_thread_dead[my_index] = 1;
   gc_ready[my_index] = 1;
 
@@ -447,10 +458,12 @@ void set_gc_flag (bool flag)
 #ifdef THREADS
   if (flag == true) {
     oak_mutex_lock(&gc_lock);
-    gc_pending = flag;
+    gc_stw = true;
+    gc_pending = true;
   }
   else {
-    gc_pending = flag;
+    gc_stw = false;
+    gc_pending = false;
     oak_mutex_unlock(&gc_lock);
   }
 #endif
@@ -494,6 +507,9 @@ static void release_thread_slot (int i)
     return;			/* slot 0 is the main thread */
   gc_thread_dead[i] = 1;
   gc_ready[i] = 1;
+#ifdef USE_MARK_SWEEP
+  ms_thread_slot_reset(i);
+#endif
   oak_mutex_lock(&index_lock);
   slot_reusable[i] = 1;
   oak_mutex_unlock(&index_lock);
@@ -519,7 +535,11 @@ void free_registers (void *arg)
 
   /* Announce the slot is gone before doing anything that can block, so
      a collection that is already waiting on our handshake flag is free
-     to finish. */
+     to finish.  The barrier buffer goes to the marker first (a second
+     time, after oak_thread_exit_unwind, is nothing). */
+#ifdef USE_MARK_SWEEP
+  ms_thread_exiting(i);
+#endif
   gc_thread_dead[i] = 1;
   gc_ready[i] = 1;
 
@@ -571,6 +591,8 @@ void free_registers (void *arg)
 #endif
 }
 
+/* A safepoint, the caller's stacks synchronized: wait out a
+   stop-the-world pause, or take part in a handshake round. */
 void wait_for_gc()
 {
 #ifdef THREADS
@@ -579,11 +601,16 @@ void wait_for_gc()
   gc_timer_t stall;
   my_index_p = oak_tls_get(index_key);
   my_index = *(my_index_p);
-  gc_stats_begin(&stall, GC_EV_SAFEPOINT);
-  gc_ready[my_index] = 1;
-  oak_mutex_lock(&gc_lock);
-  gc_ready[my_index] = 0;
-  oak_mutex_unlock(&gc_lock);
-  gc_stats_end(&stall, GC_EV_SAFEPOINT, NULL);
+  if (gc_stw) {
+    gc_stats_begin(&stall, GC_EV_SAFEPOINT);
+    gc_ready[my_index] = 1;
+    oak_mutex_lock(&gc_lock);
+    gc_ready[my_index] = 0;
+    oak_mutex_unlock(&gc_lock);
+    gc_stats_end(&stall, GC_EV_SAFEPOINT, NULL);
+  }
+#ifdef USE_MARK_SWEEP
+  ms_handshake_poll(my_index);
+#endif
 #endif
 }

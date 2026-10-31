@@ -528,8 +528,9 @@ extern void ms_verify_log_alloc(ref_t *p, int path, size_t words);
 
 /* SATB write barrier — no-op when mark-sweep GC is not enabled. */
 #ifndef USE_MARK_SWEEP
-#define SATB_BARRIER(addr) ((void)0)
+#define SATB_BARRIER(addr, v) ((void)0)
 #define SATB_READ_WEAK(v) ((void)0)
+#define SATB_READ_RAW(v) ((void)0)
 #endif
 
 /* A value read through a weak pointer (wp_to_ref): logged during a

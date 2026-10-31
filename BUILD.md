@@ -336,7 +336,9 @@ linkers agree, and (when Guile is present) that the Guile-hosted
 compiler reproduces the objects too.  Failures are detailed in
 tests/NAME.log.  "make bench" prints best-of-five CPU times for
 eleven small benchmarks, with the longest and the 99th-percentile
-garbage-collection pause of each run (--gc-stats; GC.md); see
+stop of one thread for garbage collection in each run (--gc-stats;
+GC.md: a global pause where the collector stops the world, a
+thread's own root scan with the concurrent collector); see
 tests/bench.sh for saving and comparing runs, and for "-p N", which
 runs N copies of tak on N OS threads (an emulator with threads)
 against the same on one, by the wall clock.
@@ -366,17 +368,17 @@ time to the default build; the -DTHREADS column from 2026-10-29, its
 code unchanged since):
 
 	                  -DTHREADS   -DUSE_MARK_SWEEP   both (--enable-threads)
-	tak                  1.15           1.11              1.09
-	fib                  1.10           1.07              1.11
-	bignum               1.18           0.98              0.94
-	sort                 1.10           1.06              1.08
-	cons                 1.30           0.90              0.82
-	strings              1.22           1.11              1.05
-	hash                 1.09           1.09              1.10
-	dispatch             1.06           1.06              1.06
-	eval                 1.17           1.05              1.04
-	format               1.15           1.06              1.10
-	compile              1.22           1.10              1.14
+	tak                  1.15           1.05              1.02
+	fib                  1.10           1.07              1.08
+	bignum               1.18           0.94              0.92
+	sort                 1.10           1.05              1.02
+	cons                 1.30           0.92              0.79
+	strings              1.22           1.14              1.12
+	hash                 1.09           1.09              1.08
+	dispatch             1.06           1.04              1.01
+	eval                 1.17           1.02              1.01
+	format               1.15           1.03              1.05
+	compile              1.22           1.00              1.00
 
 These ratios move with the interpreter's code layout as much as with
 the collector: between the region-heap commit and the one before it,
@@ -384,9 +386,13 @@ the --enable-threads build slowed by 4 to 9% on every benchmark, tak,
 fib and dispatch included, which never allocate, and the same sources
 built with "-falign-labels=16 -falign-jumps=32 -falign-loops=32" ran
 every benchmark at or under the earlier times; the GC thread's commit
-moved them back as much the other way, and the short pauses' commit
-(no change to the interpreter) moved tak, fib and dispatch 5 to 9%
-again.  Take the table as bounds, not as the cost of any one feature.
+moved them back as much the other way, the short pauses' commit (no
+change to the interpreter) moved tak, fib and dispatch 5 to 9% again,
+and the handshakes' commit moved strings from 1.05 to 1.12 with the
+same count of instructions and branches executed (perf: 5.96 billion
+each) and 23% more branch mispredictions, while most of the others
+moved down.  Take the table as bounds, not as the cost of any one
+feature.
 
 With threads in use, "tests/bench.sh -p 4" (four copies of tak, each
 on an OS thread, against the same on one thread, wall clock) runs

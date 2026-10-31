@@ -40,16 +40,20 @@ enum gc_event {
   /* Global pauses. */
   GC_EV_COPY,		/* a copying collection, start to end */
   GC_EV_MARK_SWEEP,	/* a mark-sweep collection with one thread */
-  GC_EV_INITIAL_MARK,	/* concurrent mark-sweep: the initial-mark pause */
-  GC_EV_REMARK,		/* concurrent mark-sweep: the remark pause */
+  GC_EV_VERIFY,		/* verify mode's pause at the end of a mark */
   /* A part of a pause. */
   GC_EV_HANDSHAKE,	/* asking the threads to stop until all have */
-  /* Stalls of one thread. */
+  /* The GC thread's own time: stalls nobody. */
   GC_EV_CYCLE,		/* a concurrent cycle, as the GC thread sees it */
+  GC_EV_ROUND,		/* a handshake round, request to last thread in */
+  /* Stalls of one thread. */
+  GC_EV_SCAN,		/* a thread scanning its own stacks at a handshake */
   GC_EV_SAFEPOINT,	/* parked at a safepoint for a pause */
   GC_EV_ALLOC_WAIT,	/* out of memory, waiting for another's cycle */
-  /* Every global pause not nested in another. */
+  /* Every global pause not nested in another; every stop of one
+     thread (those pauses, and the stalls). */
   GC_EV_PAUSES,
+  GC_EV_STOPS,
   GC_EV_COUNT
 };
 

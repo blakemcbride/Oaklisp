@@ -49,11 +49,11 @@ Key files and `#ifdef THREADS` sections:
 | File | Thread-related content |
 |------|----------------------|
 | `threads.h`, `oak-thread.h` | The mutexes, `THREADY()`, the TLS key and `oak_thread_index_var`, `oak_thread0_init`, `oak_thread_entry`, the blocking-call brackets; the POSIX/Win32 abstraction |
-| `threads.c` | `create_thread()`, `init_thread()`, `wait_for_gc()`, `set_gc_flag()`, thread 0's setup, parking (stream primitives 19-21), dynamic mutex init for MSVC |
+| `threads.c` | `create_thread()`, `init_thread()`, `wait_for_gc()` (a thread's safepoint: a pause to wait out, or its handshake), `set_gc_flag()`, thread 0's setup, parking (stream primitives 19-21), thread exit (the barrier buffer handed over, the slot reset), dynamic mutex init for MSVC |
 | `data.h` | Per-thread register macros, the per-thread alarm clock in `register_set_t`, `ALLOCATE_PROT` (the TLAB fast path), GC buffer arrays |
 | `loop.c` | Opcodes 67-72, `POLL_GC_SIGNALS()`, the method cache's striped seqlock reads, the NATIVE instruction's hand-over |
 | `gc.c` | `FORTHREADS` macro, per-thread root scanning, the stop-the-world handshake |
-| `gc-ms.c`, `gc-ms.h` | Concurrent mark-sweep: the GC thread and the pacing, the region heap and its lookup table, TLABs, SATB barrier buffers, the coalescing sweep, the budget, verify mode |
+| `gc-ms.c`, `gc-ms.h` | Concurrent mark-sweep: the GC thread and the pacing, the handshake rounds, the region heap and its lookup table, TLABs, SATB barrier buffers, the coalescing sweep, the budget, verify mode |
 | `oaklisp.c`, `embed-native.c` | The two entry points: thread 0 through `oak_thread0_init`, the thread entry (`loop` or the native call driver) |
 | `stacks.c` | Thread index retrieval in `init_stacks()`, a thread's exit on context underflow |
 | `dispatch.h`, `dispatch.c` | `oak_mcache_read`/`oak_mcache_fill`: the operations' method caches under their striped sequence counts, for the interpreter and native code; the global method cache (`gmc_read`/`gmc_write`, an entry under its own sequence count; `oak_gmc_flush`, an epoch bump by CAS) |
@@ -80,39 +80,59 @@ Global shared state:
                                        up without a lock (ms_region_of)
     A region's top and bitmaps      Modified under alloc_lock; the TLAB
                                        fast path writes its own bitmap words
-    gc_pending, gc_ready[]          GC coordination flags
+    gc_pending, gc_stw, gc_ready[]  GC coordination flags: something to
+                                       do at the next safepoint, a pause
+                                       to wait out, a thread parked
+    gc_hs_request, gc_hs_done[],    The handshake rounds (gc-ms.c): the
+      gc_mark_epoch,                   round asked for, each thread's last
+      gc_scan_epoch[]                  done (a release store), the cycle's
+                                       epoch and each thread's scanned
+                                       state (read by its own barrier)
     free_list_heads[]               Segregated free lists
     gc_requested, gc_hold,          The GC thread's requests, holds and
       gc_cycles_done                   completed cycles, under
                                        gc_concurrent_lock
-    satb_buffer_array[]             Per thread: old values overwritten
-                                       and values read through weak
-                                       pointers during a mark; a full
-                                       buffer goes to satb_full_list
-                                       (satb_lock) for the marker
-    wp_table[]                      Cleared after a remark under wp_lock,
+    satb_buffer_array[]             Per thread: old values overwritten,
+                                       values stored while the thread's
+                                       stacks are unscanned, values read
+                                       through weak pointers and raw-ref
+                                       caches, and the thread's own roots
+                                       at its handshake; a full buffer, and
+                                       the buffer at every handshake, goes
+                                       to satb_full_list (satb_lock) for
+                                       the marker
+    wp_table[]                      Cleared after a mark under wp_lock,
                                        readers testing liveness meanwhile
                                        (gc_weak_clearing, ms_weak_alive)
     new_space, free_point           The dump compaction's destination
                                        (gc.c), with the world stopped
 
 GC coordination: the GC thread (gc-ms.c; started at the first request,
-no slot in the thread arrays, index -1) sets `gc_pending`, all
-mutators reach a safepoint (the interpreter polls every instruction,
-native code at every call, return and backward branch, allocation on
-its slow path) and call `wait_for_gc()`, blocking on `gc_lock`; a
-parked, sleeping or blocked-in-C thread counts as there already, as
-does one waiting for a cycle.  `next_index` is snapshotted at the
-start of a collection, so a thread created during it is never read
-half-initialized, and a thread that has exited is skipped.  The mark
-phase runs concurrently with two brief pauses (initial mark and
-remark), each scanning the registers and stacks only -- the world
-image, the full barrier buffers and the weak pointer table are
-handled concurrently; the sweep is lazy, during allocation; a cycle is asked for
-ahead of the budget so that the mutators keep allocating through it
-(GC.md, "Pacing"); the heap grows and shrinks by mapping and
-unmapping regions, and the copying collector runs only to compact it
-for a dump, holding the GC thread off meanwhile (see GC.md).
+no slot in the thread arrays, index -1) stops nobody.  It sets
+`gc_pending` for a handshake round; each mutator, at its next
+safepoint (the interpreter polls every instruction, native code at
+every call, return and backward branch, allocation on its slow path),
+calls `wait_for_gc()`, which does the thread's part of the round --
+at the first of a cycle, retiring its TLAB and scanning its own
+registers and stacks into its barrier buffer; at every one, handing
+the buffer to the marker -- and goes on; for a parked, sleeping or
+blocked-in-C thread, or one waiting for a cycle (`gc_ready` set,
+stacks synchronized), the GC thread does the part itself under
+`gc_lock`, which the thread takes to leave that state.  A thread that
+exits hands its buffer over and is skipped; one created during a
+round joins it.  The barrier logs the value stored, as well as the
+one overwritten, while the storing thread's stacks are unscanned
+(GC.md, "SATB Write Barriers").  The mark ends after a round of
+flushes that marks nothing new; the sweep is lazy, during
+allocation; a cycle is asked for ahead of the budget so that the
+mutators keep allocating through it (GC.md, "Pacing"); the heap grows
+and shrinks by mapping and unmapping regions.  Only a dump's
+compaction (`gc.c`, and verify mode's check) stops the world: it sets
+`gc_stw` with `gc_pending`, and `wait_for_gc` then blocks on
+`gc_lock`; `next_index` is snapshotted at its start, so a thread
+created during it is never read half-initialized.  The copying
+collector runs only for that compaction, holding the GC thread off
+meanwhile (see GC.md).
 
 Thread-related opcodes:
 
@@ -185,9 +205,9 @@ interpreter:
   store in the generated C.
 - `ON_PENDING`, polled at every call, return and backward branch,
   includes `gc_pending`: a thread in native code returns to its
-  dispatcher, which waits for the collection (the interpreter's loop
-  top, or `run_pending` in the call driver), so no native loop stalls
-  a collection.
+  dispatcher, which does its part of the handshake, or waits out a
+  pause (the interpreter's loop top, or `run_pending` in the call
+  driver), so no native loop holds up a collection.
 - The alarm clock is per thread: `register_set_t` holds it, the
   interpreter's locals are synchronized with it at every
   LOCALIZE/UNLOCALIZE, and native code reads and sets it there.
@@ -252,9 +272,11 @@ Thread Safety
   and lookup table, mapping and unmapping; STORE-REG of `free-ptr`
   and `cons-limit` (the copying collector's bump pointer and limit,
   meaningless with mark-sweep)
-- `gc_lock` -- held for the length of a collection; `wait_for_gc`,
-  parking and the blocking-call brackets leave their parked state
-  under it, so a stop-the-world that counted a thread stays stopped
+- `gc_lock` -- held for the length of a stop-the-world pause (a
+  dump), and by the GC thread while it does a parked thread's part of
+  a handshake round; `wait_for_gc`, parking and the blocking-call
+  brackets leave their parked state under it, so a pause that counted
+  a thread stays stopped and a scan of its stacks is never overtaken
 - `wp_lock` -- `ref_to_wp()` and `rebuild_wp_hashtable()` in `weak.c`
 - `dump_lock` -- DUMP-WORLD and LOAD-WORLD, in the interpreter and in
   native code
@@ -320,9 +342,10 @@ Performance
   free-list entry (the sweep makes one entry of each run of dead
   objects) or a region's virgin tail, so a heap of short-lived objects
   is allocated from without the lock in steady state too.
-- **Concurrent GC** (under `USE_MARK_SWEEP + THREADS`): The mark phase
-  runs mostly concurrently (only two brief STW pauses for initial mark
-  and remark), and sweep runs lazily during allocation.  The heap is
+- **Concurrent GC** (under `USE_MARK_SWEEP + THREADS`): The mark runs
+  concurrently with no global pause (each thread scans its own stacks
+  at a safepoint of its own, a few microseconds, when the GC thread
+  asks), and sweep runs lazily during allocation.  The heap is
   a set of 1 MB regions mapped on demand within a budget (three times
   the live data, never below the configured size, which starts at
   four times the default build's) and unmapped when they sweep empty;
@@ -452,8 +475,8 @@ Not required for the current thread support:
   that incremental
 - **Locks per stream**: `print` to a shared stream from several
   threads without interleaving (only `format` is atomic per call)
-- **Parallel marking** and **per-thread handshakes** (no global
-  pauses): GCEnhancements.md Phases 5 and 6; the GC thread and the
-  pacing (its Phase 3) are done
+- **Parallel marking**: GCEnhancements.md Phase 6; the GC thread and
+  the pacing (its Phase 3) and the handshakes in place of the pauses
+  (Phase 5) are done
 - **Parallel marking**: Multiple GC worker threads share the mark
   stack, reducing mark phase latency on multi-core systems

@@ -205,18 +205,18 @@ oak_mcache_fill(ref_t op, ref_t y_type, ref_t method, ref_t offset)
   if (!(seq & 1) && OAK_ATOMIC_CAS_SIZE(seqp, &seq, seq + 1))
     {
       OAK_ATOMIC_FENCE_RELEASE();
-      SATB_BARRIER(&REF_SLOT(op, OPERATION_CACHE_TYPE_OFF));
+      SATB_BARRIER(&REF_SLOT(op, OPERATION_CACHE_TYPE_OFF), y_type);
       OAK_ATOMIC_STORE_REF(&REF_SLOT(op, OPERATION_CACHE_TYPE_OFF), y_type);
-      SATB_BARRIER(&REF_SLOT(op, OPERATION_CACHE_METH_OFF));
+      SATB_BARRIER(&REF_SLOT(op, OPERATION_CACHE_METH_OFF), method);
       OAK_ATOMIC_STORE_REF(&REF_SLOT(op, OPERATION_CACHE_METH_OFF), method);
       OAK_ATOMIC_STORE_REF(&REF_SLOT(op, OPERATION_CACHE_TYPE_OFF_OFF),
 			   offset);
       OAK_ATOMIC_STORE_REF(seqp, seq + 2);
     }
 #else
-  SATB_BARRIER(&REF_SLOT(op, OPERATION_CACHE_TYPE_OFF));
+  SATB_BARRIER(&REF_SLOT(op, OPERATION_CACHE_TYPE_OFF), y_type);
   REF_SLOT(op, OPERATION_CACHE_TYPE_OFF) = y_type;
-  SATB_BARRIER(&REF_SLOT(op, OPERATION_CACHE_METH_OFF));
+  SATB_BARRIER(&REF_SLOT(op, OPERATION_CACHE_METH_OFF), method);
   REF_SLOT(op, OPERATION_CACHE_METH_OFF) = method;
   REF_SLOT(op, OPERATION_CACHE_TYPE_OFF_OFF) = offset;
 #endif
@@ -343,7 +343,12 @@ oak_find_method(ref_t op, ref_t obj_type, ref_t *method_ptr,
   if (cached == INT_TO_REF(0))
     oak_gmc_flush();		/* parked: methods changed since its last fill */
   else if (gmc_read(op, obj_type, method_ptr, type_ptr))
-    return true;
+    {
+      /* A raw ref from no root: during a mark, logged for the marker
+	 (the entry may predate the snapshot). */
+      SATB_READ_RAW(*method_ptr);
+      return true;
+    }
   find_method_type_pair(op, obj_type, method_ptr, type_ptr);
   if (*method_ptr != e_nil)
     gmc_write(op, obj_type, *method_ptr, *type_ptr);

@@ -4,10 +4,12 @@
 # defines (bench); it is compiled once, then run REPEAT times, and
 # the best CPU time in milliseconds is printed, as measured by
 # (get-time) around the call, so that emulator start up and loading
-# are not counted, with the longest and the 99th-percentile GC pause
-# of the whole run (--gc-stats, GC.md).  Use BENCHFLAGS='-r N' for a
-# different number of repetitions, and BENCHFLAGS='-o FILE' to also
-# save the results as "name ms pause-max pause-p99" lines; two such
+# are not counted, with the longest and the 99th-percentile stop of
+# one thread for the GC in the whole run (--gc-stats, GC.md: a
+# global pause where the collector stops the world, a thread's own
+# root scan with the concurrent collector).  Use BENCHFLAGS='-r N'
+# for a different number of repetitions, and BENCHFLAGS='-o FILE' to
+# also save the results as "name ms stop-max stop-p99" lines; two such
 # files can be compared with
 #   sh tests/bench.sh -c old.txt new.txt
 # BENCHFLAGS=-n compiles the benchmarks with --compile-native instead
@@ -86,9 +88,9 @@ if test -n "$parallel"; then
   exit 0
 fi
 
-echo "Oaklisp benchmarks: best of $repeat runs, CPU milliseconds; GC pauses in ms"
+echo "Oaklisp benchmarks: best of $repeat runs, CPU milliseconds; GC stops of one thread in ms"
 "$OAKLISP" --version
-printf '%-12s %8s %10s %10s\n' benchmark ms pause-max pause-p99
+printf '%-12s %8s %10s %10s\n' benchmark ms stop-max stop-p99
 test -z "$outfile" || : > "$outfile"
 
 if test "$compile" = exe; then

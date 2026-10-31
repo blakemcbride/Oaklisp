@@ -355,7 +355,6 @@ ms_region_free(ms_region_t *r)
     free(r->mark);
     free(r->freebm);
 #ifdef OAK_GC_VERIFY
-    free(r->verify_snap);
     free(r->verify_born);
 #endif
     free(r);
@@ -950,6 +949,9 @@ static bool tlab_free_none = true;
 
 #ifdef THREADS
 static void ms_blacken(ms_region_t *r, ref_t *start, ref_t *end);
+static void ms_scan_self(int idx, bool self);
+static volatile size_t gc_mark_epoch;
+static volatile size_t gc_scan_epoch[MAX_THREAD_COUNT];
 #endif
 
 static ref_t *
@@ -1063,6 +1065,22 @@ ms_alloc_slow_locked(size_t n_words, int idx)
     ref_t *p;
 
 #ifdef THREADS
+    /* A thread whose stacks are unscanned this cycle allocates only
+       white objects (its old TLAB's, below sweep_top, which the marker
+       traces when they are reachable).  Anything from here on would be
+       black -- a TLAB above sweep_top or blackened, a born-black
+       entry -- and a fresh object's initializing stores are not
+       barriered, so a reference held only by the unscanned stack and
+       stored into one would be lost.  So the thread scans itself first
+       (its stacks are synchronized for the slow path), under
+       alloc_lock, where the snapshot cannot come between the scan and
+       the allocation.  The round, if one is pending, is completed at
+       the thread's next safepoint; a thread created after the roots'
+       round holds only references the marker reaches, and scans
+       itself here all the same. */
+    if (gc_satb_active && gc_scan_epoch[idx] != gc_mark_epoch)
+	ms_scan_self(idx, true);
+
     /* The trigger: a cycle is asked for when the heap's occupancy --
        what the last mark found live, and what has been handed out
        since its snapshot -- comes within the headroom of the budget,
@@ -1256,13 +1274,18 @@ int gc_satb_active = 0;
  * stop-the-world there).
  *
  * Each buffer is private to one thread: only that thread appends to
- * it, and it is drained during a stop-the-world pause.
+ * it (the GC thread on its behalf while it is parked), and it hands
+ * the buffer over at each handshake.  The buffer carries the epoch
+ * of the cycle its entries belong to: entries logged after a cycle's
+ * last handshake, before the barrier went off, are stale by the next
+ * cycle, and are discarded at its first append.
  */
 
 #ifdef THREADS
 ref_t *satb_buffer_array[MAX_THREAD_COUNT];
 size_t satb_count_array[MAX_THREAD_COUNT];
 size_t satb_size_array[MAX_THREAD_COUNT];
+static size_t satb_epoch_array[MAX_THREAD_COUNT];
 #else
 ref_t *satb_buffer;
 size_t satb_count = 0;
@@ -1292,35 +1315,87 @@ satb_room(ref_t **bufp, size_t count, size_t *sizep)
 }
 
 #ifdef THREADS
-/* Full buffers, handed to the marker: it drains them concurrently
-   (ms_satb_drain_concurrent) between runs of the mark stack, so the
-   remark sees only each thread's last partial buffer. */
+/* The cycle's epoch, and each thread's scan state: a thread whose
+   gc_scan_epoch is not the cycle's has not scanned its stacks this
+   cycle, and its barrier logs the values it stores as well as the
+   ones it overwrites ("Handshakes", below).  The GC thread advances
+   the epoch before it turns the barrier on (a release), and the
+   barrier reads it after the flag (an acquire). */
+static volatile size_t gc_mark_epoch;
+static volatile size_t gc_scan_epoch[MAX_THREAD_COUNT];
+
+/* Buffers handed to the marker, full or at a handshake: it drains
+   them (ms_satb_drain_concurrent) between runs of the mark stack. */
 static oak_mutex_t satb_lock = OAK_MUTEX_INITIALIZER;
-static struct satb_full { ref_t *buf; size_t count; struct satb_full *next; }
-    *satb_full_list;
+static struct satb_full {
+    ref_t *buf; size_t count; size_t epoch; struct satb_full *next;
+} *satb_full_list;
 
-static void
-satb_append(ref_t v)
+/* The buffer of thread IDX is this cycle's: entries of an earlier
+   epoch are dropped. */
+static inline void
+satb_fresh(int idx)
 {
-    int idx = *(int *)oak_tls_get(index_key);
-
-    if (satb_count_array[idx] >= satb_size_array[idx]) {
-	if (satb_buffer_array[idx] != NULL && satb_count_array[idx] > 0) {
-	    struct satb_full *full = (struct satb_full *)xmalloc(sizeof *full);
-
-	    full->buf = satb_buffer_array[idx];
-	    full->count = satb_count_array[idx];
-	    oak_mutex_lock(&satb_lock);
-	    full->next = satb_full_list;
-	    satb_full_list = full;
-	    oak_mutex_unlock(&satb_lock);
-	    satb_buffer_array[idx] = NULL;
-	    satb_size_array[idx] = 0;
-	}
-	satb_room(&satb_buffer_array[idx], 0, &satb_size_array[idx]);
+    if (satb_epoch_array[idx] != gc_mark_epoch) {
+	satb_epoch_array[idx] = gc_mark_epoch;
 	satb_count_array[idx] = 0;
     }
+}
+
+/* Thread IDX's buffer goes to the marker, and it starts a fresh one. */
+static void
+satb_handoff(int idx)
+{
+    struct satb_full *full;
+
+    if (satb_buffer_array[idx] == NULL || satb_count_array[idx] == 0)
+	return;
+    full = (struct satb_full *)xmalloc(sizeof *full);
+    full->buf = satb_buffer_array[idx];
+    full->count = satb_count_array[idx];
+    full->epoch = satb_epoch_array[idx];
+    oak_mutex_lock(&satb_lock);
+    full->next = satb_full_list;
+    satb_full_list = full;
+    oak_mutex_unlock(&satb_lock);
+    satb_buffer_array[idx] = NULL;
+    satb_size_array[idx] = 0;
+    satb_count_array[idx] = 0;
+}
+
+static void
+satb_append(int idx, ref_t v)
+{
+    satb_fresh(idx);
+    if (satb_count_array[idx] >= satb_size_array[idx]) {
+	satb_handoff(idx);
+	satb_room(&satb_buffer_array[idx], 0, &satb_size_array[idx]);
+    }
     satb_buffer_array[idx][satb_count_array[idx]++] = v;
+}
+
+void
+satb_log_store(ref_t *addr, ref_t v)
+{
+    int idx = oak_thread_index_var;
+    ref_t old_val;
+
+    OAK_ATOMIC_FENCE_ACQUIRE();	/* the epoch, after the flag */
+    old_val = *addr;
+    /* Only pointer-tagged values (skip fixnums and immediates). */
+    if (old_val & PTR_MASK)
+	satb_append(idx, old_val);
+    if ((v & PTR_MASK) && gc_scan_epoch[idx] != gc_mark_epoch)
+	satb_append(idx, v);
+}
+
+void
+satb_log_value(ref_t v)
+{
+    if (v & PTR_MASK) {
+	OAK_ATOMIC_FENCE_ACQUIRE();
+	satb_append(oak_thread_index_var, v);
+    }
 }
 #else
 static void
@@ -1329,14 +1404,13 @@ satb_append(ref_t v)
     satb_room(&satb_buffer, satb_count, &satb_size);
     satb_buffer[satb_count++] = v;
 }
-#endif
 
 void
-satb_log_old(ref_t *addr)
+satb_log_store(ref_t *addr, ref_t v)
 {
     ref_t old_val = *addr;
 
-    /* Only log pointer-tagged values (skip fixnums and immediates). */
+    (void)v;
     if (old_val & PTR_MASK)
 	satb_append(old_val);
 }
@@ -1347,18 +1421,7 @@ satb_log_value(ref_t v)
     if (v & PTR_MASK)
 	satb_append(v);
 }
-
-void
-satb_flush_all(void)
-{
-#ifdef THREADS
-    extern int next_index;
-    for (int i = 0; i < next_index; i++)
-	satb_count_array[i] = 0;
-#else
-    satb_count = 0;
 #endif
-}
 
 
 /* ------------------------------------------------------------------ */
@@ -1403,6 +1466,8 @@ gc_safepoint_init(void)
     oak_cond_init(&gc_concurrent_done_cv);
     oak_cond_init(&gc_request_cv);
     oak_mutex_init(&satb_lock);
+    oak_mutex_init(&gc_hs_lock);
+    oak_cond_init(&gc_hs_cv);
 #endif
 }
 
@@ -1516,9 +1581,174 @@ ms_gc_release(void)
     oak_mutex_unlock(&gc_concurrent_lock);
 }
 
-/* Request all mutator threads to stop (STW pause).
-   Sets gc_pending and waits for all gc_ready[] flags.
-   Returns the thread count snapshot. */
+
+/* ------------------------------------------------------------------ */
+/*  Handshakes                                                         */
+/* ------------------------------------------------------------------ */
+
+/*
+ * A mark stops no thread for any other.  Its roots are taken one
+ * thread at a time: the GC thread asks for a round (gc_hs_request, a
+ * number; gc_pending makes every mutator look), and each mutator does
+ * its part at its next safepoint (ms_handshake_poll, from wait_for_gc,
+ * where its stacks are synchronized), or the GC thread does it for a
+ * thread parked, sleeping, waiting or blocked in C (gc_ready set:
+ * its stacks are synchronized too, and it leaves that state under
+ * gc_lock, which the GC thread holds meanwhile).  The round is over
+ * when every live thread's gc_hs_done is the request.
+ *
+ * The first handshake of a cycle (the thread's gc_scan_epoch is not
+ * the cycle's) retires the thread's TLAB and scans its registers and
+ * stacks into its barrier buffer, which the marker drains; every
+ * handshake hands the buffer over.  The barrier makes this sound
+ * (satb_log_store): it logs the value overwritten always, the
+ * snapshot's rule, and while the thread's stacks are unscanned the
+ * value stored too, so a reference held only by an unscanned stack
+ * and stored into an already-marked object survives the stack
+ * dropping it; a scanned stack holds only references the marker will
+ * reach (loaded from marked objects, logged, or allocated black).
+ *
+ * The mark ends by rounds of flushes: after one that marks nothing
+ * new (every buffer drained, the mark stack empty before and after),
+ * everything reachable is marked, whatever the mutators go on doing.
+ * An entry logged after a thread's flush in that round refers to an
+ * object the marker read before the overwrite -- or the object was
+ * found from an entry drained in the round, which marked it.
+ */
+static volatile size_t gc_hs_request;			/* the round asked for */
+static volatile size_t gc_hs_done[MAX_THREAD_COUNT];	/* the last done, per thread */
+/* The GC thread waits here between looks at the threads, and a thread
+   that has done its part signals it (without the lock: a signal lost
+   in the window costs the timed wait's millisecond, no more), so that
+   on one core the round ends when the last thread is in, not when its
+   slice ends. */
+static oak_mutex_t gc_hs_lock = OAK_MUTEX_INITIALIZER;
+static oak_cond_t gc_hs_cv = OAK_COND_INITIALIZER;
+
+static void ms_scan_thread_roots(int idx, void (*sink)(int, ref_t));
+
+static void
+ms_satb_sink(int idx, ref_t r)
+{
+    satb_append(idx, r);
+}
+
+/* Thread IDX's scan, the first handshake of a cycle: its TLAB
+   retired, its roots into its buffer, the buffer to the marker.  By
+   the thread itself (SELF) with its stacks synchronized -- at a
+   safepoint, or on the allocator's slow path before it allocates
+   anything black (ms_alloc_slow_locked) -- or by the GC thread for a
+   parked one, under gc_lock. */
+static void
+ms_scan_self(int idx, bool self)
+{
+    gc_timer_t scan;
+
+    gc_stats_begin(&scan, GC_EV_SCAN);
+    /* The TLAB carved before the snapshot: what is allocated from it
+       now would lie below sweep_top unmarked. */
+    ms_tlab_retire(tlab_cursor_array[idx], tlab_end_array[idx]);
+    tlab_cursor_array[idx] = NULL;
+    tlab_end_array[idx] = NULL;
+    tlab_base_array[idx] = NULL;
+    tlab_bm_array[idx] = NULL;
+    satb_fresh(idx);
+    ms_scan_thread_roots(idx, ms_satb_sink);
+    gc_scan_epoch[idx] = gc_mark_epoch;
+    satb_handoff(idx);
+    if (self)
+	gc_stats_end(&scan, GC_EV_SCAN, NULL);
+}
+
+/* Thread IDX's part of round ROUND: by the thread itself (SELF), at
+   a safepoint, or by the GC thread for a parked one, under gc_lock. */
+static void
+ms_handshake(int idx, size_t round, bool self)
+{
+    if (gc_scan_epoch[idx] != gc_mark_epoch)
+	ms_scan_self(idx, self);
+    satb_handoff(idx);
+    /* A release: the GC thread that sees the round done sees the
+       buffer on the list. */
+    OAK_ATOMIC_STORE_REF(&gc_hs_done[idx], round);
+    if (self)
+	oak_cond_broadcast(&gc_hs_cv);
+}
+
+/* A mutator at a safepoint, its stacks synchronized (wait_for_gc). */
+void
+ms_handshake_poll(int idx)
+{
+    size_t round = OAK_ATOMIC_LOAD_REF(&gc_hs_request);
+
+    if (gc_hs_done[idx] != round)
+	ms_handshake(idx, round, true);
+}
+
+/* A round: every live thread's handshake, by itself or by this
+   thread for the parked ones.  A thread created meanwhile joins the
+   round (its slot was reset when it was handed out); one that exits
+   leaves it.  Returns once all are in. */
+static void
+ms_handshake_round(const char *what)
+{
+    size_t round = gc_hs_request + 1;
+    gc_timer_t timer;
+
+    gc_stats_begin(&timer, GC_EV_ROUND);
+    OAK_ATOMIC_STORE_REF(&gc_hs_request, round);
+    gc_pending = true;
+    for (;;) {
+	bool all = true;
+	int n = next_index;
+
+	for (int i = 0; i < n; i++) {
+	    if (gc_thread_dead[i]
+		|| OAK_ATOMIC_LOAD_REF(&gc_hs_done[i]) == round)
+		continue;
+	    if (((volatile int *)gc_ready)[i]) {
+		oak_mutex_lock(&gc_lock);
+		if (gc_ready[i] && !gc_thread_dead[i]
+		    && gc_hs_done[i] != round)
+		    ms_handshake(i, round, false);
+		oak_mutex_unlock(&gc_lock);
+		if (OAK_ATOMIC_LOAD_REF(&gc_hs_done[i]) == round)
+		    continue;
+	    }
+	    all = false;
+	}
+	if (all)
+	    break;
+	oak_mutex_lock(&gc_hs_lock);
+	oak_cond_timedwait_ms(&gc_hs_cv, &gc_hs_lock, 1);
+	oak_mutex_unlock(&gc_hs_lock);
+    }
+    gc_pending = false;
+    gc_stats_end(&timer, GC_EV_ROUND, what);
+}
+
+/* A thread about to exit: its buffer goes to the marker (its stacks
+   go away, so nothing else of it is a root).  From the thread, before
+   it is marked dead; and again from its slot's destructor. */
+void
+ms_thread_exiting(int idx)
+{
+    satb_handoff(idx);
+}
+
+/* A slot handed back for reuse: its next occupant has no part in the
+   current round done, and no stacks scanned. */
+void
+ms_thread_slot_reset(int idx)
+{
+    gc_scan_epoch[idx] = 0;
+    OAK_ATOMIC_STORE_REF(&gc_hs_done[idx], 0);
+}
+
+#ifdef OAK_GC_VERIFY
+/* Request all mutator threads to stop (STW pause): verify mode's,
+   for its check at the end of a mark.  Sets gc_pending and waits for
+   all gc_ready[] flags.  Returns the thread count snapshot. */
 static int
 stw_request_pause(int my_index_val)
 {
@@ -1558,6 +1788,7 @@ stw_release(int my_index_val)
 	gc_ready[my_index_val] = 0;
     set_gc_flag(false);   /* gc_pending=false, unlocks gc_lock */
 }
+#endif /* OAK_GC_VERIFY */
 
 #endif /* THREADS */
 
@@ -1722,6 +1953,7 @@ ms_mark_target(ref_t ref, ref_t **objp)
 static ref_t **mark_stack;
 static size_t mark_stack_size;
 static size_t mark_stack_top;
+static unsigned long mark_stack_pushes;	/* objects marked, in all */
 
 #define MARK_STACK_INITIAL 4096
 
@@ -1746,6 +1978,7 @@ mark_stack_push(ref_t *obj)
 	}
     }
     mark_stack[mark_stack_top++] = obj;
+    mark_stack_pushes++;
 }
 
 static ref_t *
@@ -1758,8 +1991,10 @@ mark_stack_pop(void)
 /*
  * Mark an object in the heap and push it onto the mark stack
  * if not already marked.  For spatic objects, do nothing (they
- * are permanent and always considered live).
+ * are permanent and always considered live).  With the world
+ * stopped: the single-threaded cycle's, and verify mode's.
  */
+#if !defined(THREADS) || defined(OAK_GC_VERIFY)
 static void
 ms_mark_ref(ref_t ref)
 {
@@ -1778,12 +2013,14 @@ ms_mark_ref(ref_t ref)
 	mark_stack_push(p);
     }
 }
+#endif
 
 
 /*
  * Trace: pop objects from the mark stack, scan their fields,
- * mark any pointer-containing fields.
+ * mark any pointer-containing fields.  The single-threaded cycle's.
  */
+#ifndef THREADS
 static void
 ms_trace(void)
 {
@@ -1799,6 +2036,7 @@ ms_trace(void)
 	}
     }
 }
+#endif
 
 
 #ifdef THREADS
@@ -1821,6 +2059,15 @@ ms_mark_ref_concurrent(ref_t ref)
     r = ms_mark_target(ref, &p);
     if (r == NULL)
 	return;
+    /* Allocated since the snapshot (above its region's sweep_top):
+       implicitly live, never swept, and holding only references the
+       marker reaches by other means (a scanned thread stores nothing
+       else, an unscanned one allocates nothing there).  Not marked
+       and not traced -- a mutator that keeps overwriting fields with
+       fresh objects would otherwise feed the termination rounds for
+       as long as it allocates. */
+    if (p >= r->sweep_top)
+	return;
     idx = BM_IDX(r, p);
     bit = 1ULL << (idx % 64);
     old = OAK_ATOMIC_FETCH_OR_U64(&r->mark[idx / 64], bit);
@@ -1834,8 +2081,9 @@ ms_mark_ref_concurrent(ref_t ref)
  * fields with atomic marking.  The mark stack is only accessed by
  * the GC coordinator thread.
  */
-/* The full SATB buffers handed over so far: marked, atomically, and
-   freed.  True if there were any. */
+/* The SATB buffers handed over so far: marked, atomically, and
+   freed.  True if there were any.  A buffer of an earlier epoch
+   (entries logged after that cycle's last handshake) is dropped. */
 static bool
 ms_satb_drain_concurrent(void)
 {
@@ -1848,8 +2096,9 @@ ms_satb_drain_concurrent(void)
     if (list == NULL)
 	return false;
     for (; list; list = next) {
-	for (size_t j = 0; j < list->count; j++)
-	    ms_mark_ref_concurrent(list->buf[j]);
+	if (list->epoch == gc_mark_epoch)
+	    for (size_t j = 0; j < list->count; j++)
+		ms_mark_ref_concurrent(list->buf[j]);
 	next = list->next;
 	free(list->buf);
 	free(list);
@@ -1998,9 +2247,8 @@ ms_verify_report(const char *what, ref_t *from, size_t field, ref_t *obj)
     ms_region_t *r = ms_region_of(obj);
     size_t len = ms_objstart_extent(r, obj);
 
-    fprintf(stderr, "; GC VERIFY: missed %p %s in-snapshot %d (%zu words: %#lx %#lx %#lx)",
+    fprintf(stderr, "; GC VERIFY: missed %p %s (%zu words: %#lx %#lx %#lx)",
 	    (void *)obj, ms_verify_type_name(obj[0]),
-	    r->verify_snap ? BM_TEST(r->verify_snap, BM_IDX(r, obj)) != 0 : -1,
 	    len, (unsigned long)obj[0],
 	    (unsigned long)(len > 1 ? obj[1] : 0),
 	    (unsigned long)(len > 2 ? obj[2] : 0));
@@ -2037,23 +2285,6 @@ ms_verify_cycle_begin(void)
 	free(r->verify_born);
 	r->verify_born = (uint64_t *)xmalloc(bytes);
 	memset(r->verify_born, 0, bytes);
-	free(r->verify_snap);
-	r->verify_snap = NULL;
-    }
-}
-
-/* Verify mode: the marks so far become the snapshot (then cleared). */
-static void
-ms_verify_take_snapshot(void)
-{
-    ms_region_t *r;
-
-    for (r = ms_regions; r; r = r->next) {
-	size_t bytes = BM_WORDS(r) * sizeof(uint64_t);
-
-	r->verify_snap = (uint64_t *)xmalloc(bytes);
-	memcpy(r->verify_snap, r->mark, bytes);
-	memset(r->mark, 0, bytes);
     }
 }
 
@@ -2077,9 +2308,9 @@ ms_verify_marks(void)
 	memset(r->mark, 0, bytes);
     }
 
-    /* What the remark treats as live: everything reachable from the
-       roots, the objects allocated during the mark included (the
-       remark did not scan those: the weak-read barrier stands in). */
+    /* What must be marked: everything reachable from the roots now,
+       the objects allocated during the mark included (which the
+       concurrent mark never traced: the barriers stand in). */
     ms_mark_roots();
 
     while (mark_stack_top > 0) {
@@ -2148,51 +2379,13 @@ ms_verify_marks(void)
 }
 #endif
 
-/*
- * Drain all SATB buffers into the mark stack.
- * Called during the remark STW pause so that objects whose pointers
- * were overwritten during concurrent mark are traced.
- */
-void
-satb_drain_to_mark_stack(void)
-{
-#ifdef THREADS
-    extern int next_index;
-    struct satb_full *list, *next;
-
-    /* Full buffers handed over since the marker last looked, then
-       every thread's partial one. */
-    oak_mutex_lock(&satb_lock);
-    list = satb_full_list;
-    satb_full_list = NULL;
-    oak_mutex_unlock(&satb_lock);
-    for (; list; list = next) {
-	for (size_t j = 0; j < list->count; j++)
-	    ms_mark_ref(list->buf[j]);
-	next = list->next;
-	free(list->buf);
-	free(list);
-    }
-    for (int i = 0; i < next_index; i++) {
-	for (size_t j = 0; j < satb_count_array[i]; j++)
-	    ms_mark_ref(satb_buffer_array[i][j]);
-	satb_count_array[i] = 0;
-    }
-#else
-    for (size_t j = 0; j < satb_count; j++)
-	ms_mark_ref(satb_buffer[j]);
-    satb_count = 0;
-#endif
-}
-
-
 /* A root is worth a call only if it is a pointer not into spatic:
    nearly every word of spatic and of the stacks is a fixnum or points
    into spatic, and this is the collector's one pass over them. */
-#define MS_ROOT(r)							\
+#define MS_ROOT(sink, idx, r)						\
     do { ref_t _r = (r);						\
 	 if ((_r & PTR_MASK) && !SPATIC_PTR(ANY_TO_PTR(_r)))		\
-	     ms_mark_ref(_r); } while (0)
+	     (sink)((idx), _r); } while (0)
 
 /* Spatic space, with the world stopped: any pointer from the world
    image into the heap is a root.  The single-threaded cycle's and
@@ -2204,88 +2397,110 @@ ms_mark_spatic(void)
     ref_t *p;
 
     for (p = spatic.start; p < spatic.end; p++)
-	MS_ROOT(*p);
+	if ((*p & PTR_MASK) && !SPATIC_PTR(ANY_TO_PTR(*p)))
+	    ms_mark_ref(*p);
 }
 #endif
 
-/*
- * The roots a pause must scan: the VM registers and every thread's
- * stacks, which no barrier covers.  Spatic is scanned apart
- * (ms_mark_spatic; with threads concurrently, ms_mark_spatic_concurrent,
- * and not at the remark: stores into it are barriered like any).
- */
+/* The global registers and tables: roots no thread owns.  Into the
+   mark stack; with threads, by the GC thread, once every thread's
+   stacks are in (they are set at boot and change rarely, and a
+   value set after the snapshot came from a protected source). */
 static void
-ms_mark_thread_roots(void)
+ms_mark_global_roots(void)
 {
-    ref_t *p;
-
+    /* Atomically with threads: the mutators set bits meanwhile (born
+       black). */
 #ifdef THREADS
-    int my_index;
-    int gc_thread_count = next_index;
-    /* Skip the slots of threads that have exited: their stacks are gone. */
-#define FORTHREADS for (my_index=0; my_index<gc_thread_count; my_index++)	\
-		     if (!gc_thread_dead[my_index])
+#define MS_GLOBAL(r) ms_mark_ref_concurrent(r)
 #else
-#define FORTHREADS
+#define MS_GLOBAL(r) ms_mark_ref(r)
 #endif
-
-    /* Global VM registers */
-    ms_mark_ref(e_nil);
-    ms_mark_ref(e_t);
-    ms_mark_ref(e_boot_code);
-    ms_mark_ref(e_fixnum_type);
-    ms_mark_ref(e_loc_type);
-    ms_mark_ref(e_cons_type);
-    ms_mark_ref(e_env_type);
-    ms_mark_ref(e_object_type);
-    ms_mark_ref(e_segment_type);
-    ms_mark_ref(e_uninitialized);
-    ms_mark_ref(e_method_type);
-    ms_mark_ref(e_operation_type);
+    MS_GLOBAL(e_nil);
+    MS_GLOBAL(e_t);
+    MS_GLOBAL(e_boot_code);
+    MS_GLOBAL(e_fixnum_type);
+    MS_GLOBAL(e_loc_type);
+    MS_GLOBAL(e_cons_type);
+    MS_GLOBAL(e_env_type);
+    MS_GLOBAL(e_object_type);
+    MS_GLOBAL(e_segment_type);
+    MS_GLOBAL(e_uninitialized);
+    MS_GLOBAL(e_method_type);
+    MS_GLOBAL(e_operation_type);
 
     /* Tables stored as pointers with offset */
     if (e_subtype_table)
-	ms_mark_ref(PTR_TO_REF(e_subtype_table - 2));
+	MS_GLOBAL(PTR_TO_REF(e_subtype_table - 2));
     if (e_argless_tag_trap_table)
-	ms_mark_ref(PTR_TO_REF(e_argless_tag_trap_table - 2));
+	MS_GLOBAL(PTR_TO_REF(e_argless_tag_trap_table - 2));
     if (e_arged_tag_trap_table)
-	ms_mark_ref(PTR_TO_REF(e_arged_tag_trap_table - 2));
-
-    /* Per-thread registers */
-    FORTHREADS {
-	ms_mark_ref(PTR_TO_REF(e_env));
-	ms_mark_ref(e_code_segment);
-	ms_mark_ref(e_current_method);
-	ms_mark_ref(e_process);
-	ms_mark_ref(PTR_TO_LOC(e_bp));
-
-	/* GC examine buffer */
-	for (p = gc_examine_buffer; p < gc_examine_ptr; p++)
-	    MS_ROOT(*p);
-
-	/* Value stack */
-	for (p = value_stack.bp; p <= value_stack.sp; p++)
-	    MS_ROOT(*p);
-
-	/* Context stack */
-	for (p = context_stack.bp; p <= context_stack.sp; p++)
-	    MS_ROOT(*p);
-
-	/* Stack segments (linked lists in the heap) */
-	ms_mark_ref(value_stack.segment);
-	ms_mark_ref(context_stack.segment);
-    }
-
-#undef FORTHREADS
+	MS_GLOBAL(PTR_TO_REF(e_arged_tag_trap_table - 2));
+#undef MS_GLOBAL
 }
 
-/* Every root, with the world stopped: the single-threaded cycle's,
-   and verify mode's. */
+/* The roots one thread owns, which no barrier covers: its registers,
+   its examine buffer, its value and context stacks and their
+   segments.  Each goes to SINK: the mark stack (the single-threaded
+   cycle, verify mode) or the thread's barrier buffer (a handshake).
+   With threads the thread's stacks must be synchronized -- at a
+   safepoint of its own, or parked -- and nobody else may be scanning
+   them. */
+static void
+ms_scan_thread_roots(int idx, void (*sink)(int, ref_t))
+{
+    ref_t *p;
+#ifdef THREADS
+    int my_index = idx;
+#else
+    (void)idx;
+#endif
+
+    MS_ROOT(sink, idx, PTR_TO_REF(e_env));
+    MS_ROOT(sink, idx, e_code_segment);
+    MS_ROOT(sink, idx, e_current_method);
+    MS_ROOT(sink, idx, e_process);
+    MS_ROOT(sink, idx, PTR_TO_LOC(e_bp));
+
+    /* GC examine buffer */
+    for (p = gc_examine_buffer; p < gc_examine_ptr; p++)
+	MS_ROOT(sink, idx, *p);
+
+    /* Value stack */
+    for (p = value_stack.bp; p <= value_stack.sp; p++)
+	MS_ROOT(sink, idx, *p);
+
+    /* Context stack */
+    for (p = context_stack.bp; p <= context_stack.sp; p++)
+	MS_ROOT(sink, idx, *p);
+
+    /* Stack segments (linked lists in the heap) */
+    MS_ROOT(sink, idx, value_stack.segment);
+    MS_ROOT(sink, idx, context_stack.segment);
+}
+
 #if !defined(THREADS) || defined(OAK_GC_VERIFY)
+static void
+ms_mark_sink(int idx, ref_t r)
+{
+    (void)idx;
+    ms_mark_ref(r);
+}
+
+/* Every root, with the world stopped: the global ones, every live
+   thread's, and spatic.  The single-threaded cycle's, and verify
+   mode's. */
 static void
 ms_mark_roots(void)
 {
-    ms_mark_thread_roots();
+    ms_mark_global_roots();
+#ifdef THREADS
+    for (int i = 0; i < next_index; i++)
+	if (!gc_thread_dead[i])
+	    ms_scan_thread_roots(i, ms_mark_sink);
+#else
+    ms_scan_thread_roots(0, ms_mark_sink);
+#endif
     ms_mark_spatic();
 }
 #endif
@@ -2379,11 +2594,15 @@ static bool   lazy_sweep_active;	/* true when regions remain to sweep */
 void
 ms_prepare_lazy_sweep(void)
 {
+#ifndef THREADS
     /* The sweep frees what the mark did not reach, and its memory is
        used again: the global method cache's raw refs go first, and so
-       do the native call sites' (they are no roots either). */
+       do the native call sites' (they are no roots either).  With
+       threads they are flushed as the mark begins, and a hit during
+       it logs the method (SATB_READ_RAW). */
     oak_gmc_flush();
     oak_native_flush_sites();
+#endif
 
     /* Clear all free lists — they will be rebuilt incrementally
        as blocks are lazily swept -- and their entries' free bits. */
@@ -2638,19 +2857,20 @@ ms_post_gc_wp(void)
 /* ------------------------------------------------------------------ */
 
 /* A cycle: the mark (stop-the-world in a single-threaded build; with
-   threads concurrent, between two pauses, on the GC thread), the weak
-   pointers, the budget, and the start of the lazy sweep.  AMOUNT is
-   what the request that asked for it needs; with threads the most any
-   waiter needs is added to it.  Without threads there is no
-   alloc_lock; with threads it is taken here as needed and not held
-   on return. */
+   threads concurrent, on the GC thread, its roots taken by
+   handshakes), the weak pointers, the budget, and the start of the
+   lazy sweep.  AMOUNT is what the request that asked for it needs;
+   with threads the most any waiter needs is added to it.  Without
+   threads there is no alloc_lock; with threads it is taken here as
+   needed and not held on return. */
 static void
 ms_run_cycle(const char *reason, size_t amount)
 {
     long old_used;
     gc_timer_t cycle;
 #ifdef THREADS
-    gc_timer_t pause;
+    gc_ns_t t_mark;
+    unsigned rounds = 0;
 
     gc_stats_begin(&cycle, GC_EV_CYCLE);
     /* Finish any lazy sweep remaining from the previous cycle, a block
@@ -2678,13 +2898,14 @@ ms_run_cycle(const char *reason, size_t amount)
        its marks are cleared.  Objects allocated above sweep_top during
        the mark are implicitly live and will not be swept.
 
-       With threads, both this snapshot and the TLAB retirement happen
-       inside the initial-mark pause below instead of here: the TLAB
-       fast path in ALLOCATE_PROT deliberately takes no lock, so doing
-       either while the other mutators are still running races them --
-       the collector can zero a TLAB tail an instant after a mutator
-       has handed out an object in it, leaving a live object whose type
-       slot reads as zero. */
+       Without threads the one TLAB is retired first.  With threads
+       each thread retires its own at its first handshake: the TLAB
+       fast path in ALLOCATE_PROT takes no lock, so nobody else may
+       touch it while the thread runs, and what the thread allocates
+       from it between the snapshot and its handshake (below
+       sweep_top, unmarked) is covered by that handshake's scan of its
+       stacks and by the barrier's logging of what an unscanned thread
+       stores. */
 #ifndef THREADS
     ms_tlab_retire_all();
     ms_snapshot_tops();
@@ -2715,154 +2936,105 @@ ms_run_cycle(const char *reason, size_t amount)
     crash_recovery_installed = 0;
 
 #ifdef THREADS
+    /* === The snapshot, under alloc_lock (held since the sweep above):
+       the epoch (every thread unscanned, every buffer stale), born
+       black for what is allocated from free entries from now on, the
+       regions' sweep_tops, then the barrier.  A TLAB carved after
+       this is above its region's sweep_top or blackened. === */
+    gc_mark_epoch++;
+    gc_phase = GC_PHASE_CONCURRENT_MARK;
+    ms_snapshot_tops();
+
+    /* The allocation rate, for the pacing: what was handed out since
+       the last snapshot, over the time since; smoothed, half this
+       measure and half the last. */
     {
-	/* === STW PAUSE 1: Initial mark (scan roots) === */
-	gc_phase = GC_PHASE_INITIAL_MARK;
+	gc_ns_t now = gc_now();
+	double ms = ms_snapshot_ns ? (double)(now - ms_snapshot_ns) / 1e6 : 0;
+	double rate = ms > 0.01 ? (double)ms_since_snapshot / ms : 0;
 
-	/* Release alloc_lock so blocked threads can see gc_pending
-	   in their spin loops and park via wait_for_gc(). */
-	oak_mutex_unlock(&alloc_lock);
-
-	gc_stats_begin(&pause, GC_EV_INITIAL_MARK);
-	(void)stw_request_pause(MS_GC_THREAD_INDEX);
-#ifdef OAK_GC_VERIFY
-	ms_verify_stw_owner = MS_GC_THREAD_INDEX;
-#endif
-
+	if (rate > 0)
+	    ms_alloc_rate = ms_alloc_rate > 0 ? (ms_alloc_rate + rate) / 2 : rate;
 	if (trace_gc > 1)
-	    fprintf(stderr, "\n; STW initial mark...");
+	    fprintf(stderr, "\n; %zu words allocated in the %.1f ms since the"
+		    " last snapshot (%.0f/ms; smoothed %.0f/ms).",
+		    ms_since_snapshot, ms, rate, ms_alloc_rate);
+	ms_since_snapshot = 0;
+	ms_snapshot_ns = now;
+	t_mark = now;
+    }
+    OAK_ATOMIC_FENCE_RELEASE();	/* the epoch and the phase, then the flag */
+    gc_satb_active = 1;
+    oak_mutex_unlock(&alloc_lock);
 
-	/* The world is stopped, so no mutator can be inside the TLAB
-	   fast path.  Retire the TLABs and take the snapshot now. */
-	ms_tlab_retire_all();
-	ms_snapshot_tops();
+    /* The caches of raw refs, no roots: emptied now, and a hit during
+       the mark logs the method it yields (SATB_READ_RAW), so what the
+       sweep frees is in none of them. */
+    oak_gmc_flush();
+    oak_native_flush_sites();
 
-	/* The allocation rate, for the pacing: what was handed out since
-	   the last snapshot, over the time since; smoothed, half this
-	   measure and half the last. */
-	{
-	    gc_ns_t now = gc_now();
-	    double ms = ms_snapshot_ns ? (double)(now - ms_snapshot_ns) / 1e6 : 0;
-	    double rate = ms > 0.01 ? (double)ms_since_snapshot / ms : 0;
+    /* === The roots: each thread's at its own handshake, into its
+       barrier buffer; the global ones and spatic by this thread once
+       every stack is in (tracing earlier could read a TLAB tail not
+       yet retired as the object before it). === */
+    ms_handshake_round("roots");
+    rounds++;
+    if (trace_gc > 1) { fprintf(stderr, " roots"); fflush(stderr); }
 
-	    if (rate > 0)
-		ms_alloc_rate = ms_alloc_rate > 0 ? (ms_alloc_rate + rate) / 2 : rate;
-	    if (trace_gc > 1)
-		fprintf(stderr, "\n; %zu words allocated in the %.1f ms since the"
-			" last snapshot (%.0f/ms; smoothed %.0f/ms).",
-			ms_since_snapshot, ms, rate, ms_alloc_rate);
-	    ms_since_snapshot = 0;
-	    ms_snapshot_ns = now;
-	}
+    ms_mark_global_roots();
+    if (trace_gc > 1) { fprintf(stderr, "\n; Concurrent tracing..."); fflush(stderr); }
+    ms_mark_spatic_concurrent();
+    ms_trace_concurrent();
 
-	ms_mark_thread_roots();
-#ifdef OAK_GC_VERIFY
-	/* Trace the whole snapshot now into a copy, then start the
-	   real mark over from the roots. */
-	ms_mark_spatic();
-	ms_trace();
-	ms_verify_take_snapshot();
-	ms_mark_thread_roots();
-#endif
-	if (trace_gc > 1) { fprintf(stderr, " roots"); fflush(stderr); }
+    /* === Termination: rounds of flushes until one marks nothing. === */
+    for (;;) {
+	unsigned long before = mark_stack_pushes;
 
-	/* Activate SATB barriers before releasing mutators.
-	   This ensures every heap write during concurrent mark
-	   logs the old value for the remark phase. */
-	gc_satb_active = 1;
-	gc_phase = GC_PHASE_CONCURRENT_MARK;
-
-	/* === RELEASE: mutators resume during concurrent mark === */
-#ifdef OAK_GC_VERIFY
-	ms_verify_stw_owner = MS_NO_STW_OWNER;
-#endif
-	/* The pause ends with the release: timed before it, since once
-	   the mutators are let go this thread may not run again for a
-	   scheduler's slice (on one core it never does). */
-	{
-	    double ms = gc_stats_end(&pause, GC_EV_INITIAL_MARK, reason);
-	    stw_release(MS_GC_THREAD_INDEX);
-	    if (trace_gc > 1) {
-		fprintf(stderr, " %.3f ms.\n; Concurrent tracing...", ms);
-		fflush(stderr);
-	    }
-	}
-
-	/* === CONCURRENT MARK: spatic, then everything reachable === */
-	ms_mark_spatic_concurrent();
+	ms_handshake_round("flush");
+	rounds++;
 	ms_trace_concurrent();
+	if (mark_stack_pushes == before)
+	    break;
+    }
+    if (trace_gc > 1) {
+	fprintf(stderr, " done in %u rounds.", rounds);
+	fflush(stderr);
+    }
 
-	if (trace_gc > 1) {
-	    fprintf(stderr, " done.\n; STW remark...");
-	    fflush(stderr);
-	}
+#ifdef OAK_GC_VERIFY
+    /* With the world stopped (the mode's one pause): a fresh mark from
+       the roots as they are now, against the concurrent one. */
+    {
+	gc_timer_t pause;
 
-	/* === STW PAUSE 2: Remark === */
-	gc_phase = GC_PHASE_REMARK;
-	gc_stats_begin(&pause, GC_EV_REMARK);
+	gc_stats_begin(&pause, GC_EV_VERIFY);
 	(void)stw_request_pause(MS_GC_THREAD_INDEX);
-#ifdef OAK_GC_VERIFY
 	ms_verify_stw_owner = MS_GC_THREAD_INDEX;
-#endif
-
-	/* Retire TLABs allocated during concurrent mark. */
 	ms_tlab_retire_all();
-
-	/* What the mutators allocated meanwhile, for the pacing: what
-	   the allocator handed out since the snapshot.  Smoothed: half
-	   this cycle's, half what it was. */
-	{
-	    size_t during = ms_since_snapshot;
-
-	    ms_alloc_during_mark = ms_alloc_during_mark
-		? (ms_alloc_during_mark + during) / 2 : during;
-	    if (trace_gc > 1)
-		fprintf(stderr, "\n; %zu words allocated in the mark's %.2f ms"
-			" (smoothed %zu).", during,
-			(double)(gc_now() - ms_snapshot_ns) / 1e6,
-			ms_alloc_during_mark);
-	}
-
-	/* Drain SATB buffers — these contain old pointer values
-	   that were overwritten during concurrent mark and must
-	   be traced to maintain the snapshot-at-beginning invariant. */
-	{
-	    extern int next_index;
-	    gc_ns_t t0 = trace_gc > 2 ? gc_now() : 0, t1, t2;
-	    size_t entries = 0;
-
-	    for (int i = 0; i < next_index; i++)
-		entries += satb_count_array[i];
-	    satb_drain_to_mark_stack();
-	    t1 = trace_gc > 2 ? gc_now() : 0;
-
-	    /* Re-scan the registers and stacks, C arrays that no barrier
-	       covers.  Spatic is not rescanned: stores into it are
-	       barriered like any.  What was allocated during the mark
-	       is black and is not scanned: every object it can refer to
-	       was reachable at the snapshot (and is marked by the
-	       snapshot's rules), was allocated after it (black), or was
-	       read through a weak pointer (and logged, SATB_READ_WEAK). */
-	    ms_mark_thread_roots();
-	    t2 = trace_gc > 2 ? gc_now() : 0;
-
-	    /* Process all newly discovered references. */
-	    ms_trace();
-	    if (trace_gc > 2)
-		fprintf(stderr, "\n; Remark: %zu SATB entries %.3f ms, roots"
-			" %.3f ms, trace %.3f ms.", entries,
-			(t1 - t0) / 1e6, (t2 - t1) / 1e6, (gc_now() - t2) / 1e6);
-	}
-
-#ifdef OAK_GC_VERIFY
 	ms_verify_marks();
+	ms_verify_stw_owner = MS_NO_STW_OWNER;
+	gc_stats_end(&pause, GC_EV_VERIFY, reason);
+	stw_release(MS_GC_THREAD_INDEX);
+    }
 #endif
 
-	if (trace_gc > 1) { fprintf(stderr, " done."); fflush(stderr); }
+    /* The barrier goes off.  Entries logged from here to the next
+       cycle's first handshake are of this epoch and are dropped then
+       (satb_fresh); they refer to marked objects anyway. */
+    gc_satb_active = 0;
 
-	/* Deactivate SATB barriers. */
-	gc_satb_active = 0;
-	satb_flush_all();
+    /* What the mutators allocated meanwhile, for the pacing: what
+       the allocator handed out since the snapshot.  Smoothed: half
+       this cycle's, half what it was. */
+    {
+	size_t during = ms_since_snapshot;
+
+	ms_alloc_during_mark = ms_alloc_during_mark
+	    ? (ms_alloc_during_mark + during) / 2 : during;
+	if (trace_gc > 1)
+	    fprintf(stderr, "\n; %zu words allocated in the mark's %.2f ms"
+		    " (smoothed %zu).", during,
+		    (double)(gc_now() - t_mark) / 1e6, ms_alloc_during_mark);
     }
 #else
     /* Single-threaded: STW mark. */
@@ -2877,7 +3049,7 @@ ms_run_cycle(const char *reason, size_t amount)
 	fprintf(stderr, "\n; Mark complete.\n");
 
 #ifndef THREADS
-    /* --- Weak pointers (with threads: after the pause, below) --- */
+    /* --- Weak pointers (with threads: after the sweep starts, below) --- */
     if (trace_gc > 1)
 	fprintf(stderr, "; Scanning weak pointer table...");
     {
@@ -2889,7 +3061,9 @@ ms_run_cycle(const char *reason, size_t amount)
 #endif
 
     /* --- Sweep phase --- */
+#ifndef THREADS
     gc_phase = GC_PHASE_SWEEP;
+#endif
 
     /* Free the mark stack before sweeping — it's no longer needed. */
     free(mark_stack);
@@ -2903,43 +3077,33 @@ ms_run_cycle(const char *reason, size_t amount)
 	amount = gc_request_amount;
     gc_request_amount = 0;
     oak_mutex_unlock(&gc_concurrent_lock);
-#endif
 
+    /* The allocator's structures, under its lock: the budget, the
+       free lists and free bits cleared, the sweep started.  The weak
+       pointers are cleared after: until then a read of one tests the
+       mark bit (ms_weak_read, data.h), and the sweep, running
+       meanwhile so the mutators find room, leaves the mark bits alone
+       and resets no region while the clearing lasts.  Born black
+       stays on through the clearing (gc_weak_clearing), so a weak
+       pointer made to an object from a free entry survives. */
+    oak_mutex_lock(&alloc_lock);
+#endif
     /* The budget for the next cycle, from what the mark found. */
     ms_set_budget(amount);
 
     /* Prepare the lazy sweep: clear the free lists and their free
-       bits, flush the caches of raw refs.  Blocks will be swept on
-       demand by allocating threads (ms_lazy_sweep_one) once it is
-       started, below. */
+       bits.  Blocks will be swept on demand by allocating threads
+       (ms_lazy_sweep_one) once it is started, below. */
     ms_prepare_lazy_sweep();
 
     if (trace_gc > 1)
 	fprintf(stderr, "; Lazy sweep prepared (%zu regions).\n", ms_nregions);
 
 #ifdef THREADS
-    /* The weak pointers are cleared after the pause: until then a
-       read of one tests the mark bit (ms_weak_read, data.h).  The
-       sweep starts now all the same, so the mutators find room
-       meanwhile: it leaves the mark bits alone, and resets no region
-       while the clearing lasts. */
     gc_weak_clearing = 1;
     ms_start_lazy_sweep();
-#endif
     gc_phase = GC_PHASE_IDLE;
-
-#ifdef THREADS
-    /* Release all threads from the remark STW pause (timed before the
-       release, as above). */
-#ifdef OAK_GC_VERIFY
-    ms_verify_stw_owner = MS_NO_STW_OWNER;
-#endif
-    {
-	double ms = gc_stats_end(&pause, GC_EV_REMARK, reason);
-	stw_release(MS_GC_THREAD_INDEX);
-	if (trace_gc > 1)
-	    fprintf(stderr, "; Remark pause %.3f ms.\n", ms);
-    }
+    oak_mutex_unlock(&alloc_lock);
 
     /* --- Weak pointers, concurrently --- */
     if (trace_gc > 1)
@@ -2951,12 +3115,14 @@ ms_run_cycle(const char *reason, size_t amount)
 		    wp_count, wp_count != 1 ? "ies" : "y");
     }
     gc_weak_clearing = 0;
+#else
+    gc_phase = GC_PHASE_IDLE;
 #endif
 
     /* Sweep enough blocks now to satisfy the requested amount, so that
        the retry of whoever asked finds room (or the budget's).  With
-       threads this is after the pause, the lock taken a block at a
-       time: a big request could have the whole heap swept here. */
+       threads the lock is taken a block at a time: a big request
+       could have the whole heap swept here. */
     {
 #ifdef THREADS
 	oak_mutex_lock(&alloc_lock);
