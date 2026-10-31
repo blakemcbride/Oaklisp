@@ -20,7 +20,7 @@ if DOCS
 SUBDIRS += doc
 endif
 
-dist_doc_DATA = README.md AUTHORS COPYING BUILD.md ChangeLog NEWS
+dist_doc_DATA = README.md README.orig.md AUTHORS COPYING BUILD.md ChangeLog NEWS
 
 # oakc builds stand-alone executables out of the build tree (see
 # oakc.in); configure generates the script.
