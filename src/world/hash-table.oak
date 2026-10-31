@@ -176,55 +176,86 @@
 	     ((eq? (%tag ,k) %immediate-tag) (%data ,k))
 	     (else (object-hash ,k))))))
 
-(add-method (initialize (eq-hash-table table count size) self)
-  (set! count 0)
-  (set! size 17)
-  (set! table (make simple-vector size))
-  (dotimes (i size) (set! (nth table i) '()))
-  self)
+;;; TABLE is a vector of SIZE buckets, each an alist of entries (KEY .
+;;; VALUE) -- the pairs PRESENT? answers, which a caller may keep and
+;;; change -- the newest first.  Programs walk these ivars themselves
+;;; (doc/examples/unit-testing.oak), so this layout is part of the
+;;; interface.  The buckets are worked on by operations on the vector
+;;; itself, through %LOAD-BP-I, rather than one NTH or locative at a
+;;; time; the vector's length is read as LENGTH's method for it would.
 
-(add-method (present? (eq-hash-table table count size) self x)
-  (let ((t table))
-    (%assq x (%vref-nocheck t (modulo (eq-hash-key x) (length t))))))
+(let ((bucket (make operation))
+      (bucket-set (make operation))
+      (fill (make operation))
+      (move (make operation))
+      (push-entry (make operation)))
 
-(add-method ((setter present?) (eq-hash-table table count size) self x v)
-  (let* ((lslot (make-locative
-		 (nth table (modulo (eq-hash-key x) size))))
-	 (slot (contents lslot))
-	 (entry (%assq x slot)))
-    (if v
-	(if entry
-	    (set! (cdr entry) v)		;modify
-	    (block			;insert
-	     (set! (contents lslot)
-		  (cons (cons x v) slot))
-	     (set! count (+ count 1))
-	     (when (> (+ count count) size)
-	       (resize self (+ 1 (+ size size))))))
-	(if entry
-	    (block			;remove
-	     (set! (contents lslot)
-		  (del (lambda (k p) (eq? k (car p))) x slot))
-	     (set! count (- count 1)))
-	    #f)))			;noop
-  v)
+  ;; KEY's bucket in the buckets SELF.
+  (add-method (bucket (variable-length-mixin) self key)
+    (%load-bp-i (modulo (eq-hash-key key)
+			(- ((%slot 1) self) ((%slot 1) (get-type self))))))
 
+  ;; (SETTER PRESENT?) on the buckets SELF: the change in the count.
+  (add-method (bucket-set (variable-length-mixin) self x v)
+    (let* ((i (modulo (eq-hash-key x)
+		      (- ((%slot 1) self) ((%slot 1) (get-type self)))))
+	   (slot (%load-bp-i i))
+	   (entry (%assq x slot)))
+      (if v
+	  (if entry
+	      (block (set! (cdr entry) v) 0)		;modify
+	      (block					;insert
+		(set! (%load-bp-i i) (cons (cons x v) slot))
+		1))
+	  (if entry
+	      (block					;remove
+		(set! (%load-bp-i i)
+		      (del (lambda (k p) (eq? k (car p))) x slot))
+		-1)
+	      0))))					;noop
 
+  (add-method (fill (variable-length-mixin) self n)
+    (dotimes (i n)
+      (set! (%load-bp-i i) '())))
 
-(add-method (resize (eq-hash-table table count size) self new-size)
-  (let ((old-table table)
-	(old-size size)
-	(new-table (make simple-vector new-size)))
-    (dotimes (i new-size)
-      (set! (nth new-table i) '()))
-    (dotimes (i old-size)
-      (dolist (entry (nth old-table i))
-	(push (nth new-table
-		   (modulo (eq-hash-key (car entry)) new-size))
-	      entry)))
-    (set! table new-table)
-    (set! size new-size)
-    self))
+  ;; The entries of the N buckets SELF onto the front of the buckets
+  ;; NEW, of which there are NEW-SIZE, in order.
+  (add-method (move (variable-length-mixin) self n new new-size)
+    (dotimes (i n)
+      (dolist (entry (%load-bp-i i))
+	(push-entry new (modulo (eq-hash-key (car entry)) new-size) entry))))
+
+  (add-method (push-entry (variable-length-mixin) self j entry)
+    (set! (%load-bp-i j) (cons entry (%load-bp-i j))))
+
+  (add-method (initialize (eq-hash-table table count size) self)
+    (let ((t (make simple-vector 17)))
+      (fill t 17)
+      (set! count 0)
+      (set! size 17)
+      (set! table t))
+    self)
+
+  (add-method (present? (eq-hash-table table) self x)
+    (%assq x (bucket table x)))
+
+  (add-method ((setter present?) (eq-hash-table table count size) self x v)
+    (let ((d (bucket-set table x v)))
+      (unless (eq? d 0)
+	(set! count (+ count d))
+	(when (and (eq? d 1) (> (+ count count) size))
+	  (resize self (+ 1 (+ size size))))))
+    v)
+
+  (add-method (resize (eq-hash-table table count size) self new-size)
+    (let ((old-table table)
+	  (old-size size)
+	  (new-table (make simple-vector new-size)))
+      (fill new-table new-size)
+      (move old-table old-size new-table new-size)
+      (set! table new-table)
+      (set! size new-size)
+      self)))
 
 (define (make-eq-hash-table) (make eq-hash-table))
 
