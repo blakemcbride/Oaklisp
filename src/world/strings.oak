@@ -463,7 +463,15 @@
 ;;; word is masked, so that whatever sits in its padding stays out of
 ;;; the result.
 
-(let ((append-piece (make operation)))
+(let ((append-piece (make operation))
+      ;; One argument, checked as the general case below checks each:
+      ;; forced if forcible, then a string or an error.
+      (string-arg
+       (lambda (x)
+	 (if (eq? (get-type x) string)
+	     x
+	     (let ((x (if (is-a? x forcible) (force x) x)))
+	       (if (string? x) x (append-type-error "string" x)))))))
 
   (add-method (append-piece (variable-length-mixin) self n to at)
     (if (zero? n)
@@ -493,7 +501,51 @@
 			(bit-or acc (ash-left (bit-and low sw) shift)))
 		  (copy (+ i 1) (+ w 1) (ash-right sw rshift))))))))
 
+  ;; Two and three arguments, the usual cases, without the list of
+  ;; them the general case makes: checked in order, then copied in
+  ;; order.
+  (define (%append-2 a b)
+    (let* ((a (string-arg a))
+	   (b (string-arg b))
+	   (la (length a))
+	   (lb (length b))
+	   (len (+ la lb)))
+      (if (zero? len)
+	  ""
+	  (let* ((s (make string
+			  (quotient (+ len (- %chars-per-word 1))
+				    %chars-per-word)
+			  len))
+		 (to (make-locative (%vref s 0)))
+		 (at (append-piece a la to 0)))
+	    (append-piece b lb to at)
+	    s))))
+
+  (define (%append-3 a b c)
+    (let* ((a (string-arg a))
+	   (b (string-arg b))
+	   (c (string-arg c))
+	   (la (length a))
+	   (lb (length b))
+	   (lc (length c))
+	   (len (+ la lb lc)))
+      (if (zero? len)
+	  ""
+	  (let* ((s (make string
+			  (quotient (+ len (- %chars-per-word 1))
+				    %chars-per-word)
+			  len))
+		 (to (make-locative (%vref s 0)))
+		 (at (append-piece a la to 0))
+		 (at (append-piece b lb to at)))
+	    (append-piece c lc to at)
+	    s))))
+
   (add-method (append (string) . rest)
+    (cond
+     ((= (rest-length rest) 2) (%append-2 . rest))
+     ((= (rest-length rest) 3) (%append-3 . rest))
+     (else
     (listify-args
      (lambda (args)
        (iterate check ((l args) (len 0))
@@ -521,7 +573,7 @@
 		     (if (not (string? x))
 			 (append-type-error "string" x)
 			 (check (cdr l) (+ len (length x))))))))))
-     . rest)))
+     . rest)))))
 
 
 
