@@ -99,8 +99,19 @@ drop-in replacement.  What it adds and changes:
 * `make native-world` rebuilds the whole runtime natively; the
   emulator can run that world too.
 
-See Compiler.md for how to drive it, CompilerPlan.md for the design,
-and Speed.md for measurements against a C-compiled Dylan.
+See Compiler.md for how to drive it.  The design, in brief: the
+existing front end is kept as it is, up to the peephole-optimized
+bytecode, and that bytecode is what gets translated, block by block,
+into C functions.  Generated code keeps the emulator's value and
+context stacks, so the collector, `call/cc` and the thread system
+need nothing new, and in mixed mode an instruction without a C
+translation is simply handed back to the emulator.  Whole-program
+mode compiles each file twice: first to an interface summary
+(definitions with arity and inferred result type, assignments,
+escapes), then to code with every summary in hand, so calls resolve
+statically where the closed world allows and small functions inline
+across files.  The bytecode emulator and world remain the development
+environment and the REPL.
 
 ### Threads
 
@@ -150,7 +161,14 @@ bucket work on the vector, string `append` copies packed words, sort
 merges vectors and no longer recurses per element on lists, `throw`
 skips the unwinder when there is nothing to unwind, and a global
 (operation, type) method cache sits behind the operations' one-entry
-caches.  Speed.md records the before and after.
+caches.  Measured on ten small benchmark programs against the same
+programs compiled to C by a Dylan compiler, `oakc` executables went
+from about 20 times slower (geometric mean) to about 9 times slower
+with these fixes.  What remains is the shape of the generated code
+rather than the library: values live on the virtual machine's value
+stack instead of in C variables, every non-tail call pushes a context
+frame, and arithmetic checks tags wherever the type inference has not
+proved its operands.
 
 ### Documentation and tests
 
