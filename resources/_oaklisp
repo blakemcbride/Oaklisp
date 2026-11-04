@@ -29,6 +29,8 @@ _oaklisp() {
     '--size-seg-max[maximum flushed segment length, in refs]:size'
     '--trace-gc[trace garbage collection]:level (0-3)'
     '--verbose-gc[trace garbage collection]:level (0-3)'
+    '--gc-stats[report the GC pauses and stalls at exit]'
+    '--gc-threads[threads marking in parallel]:count'
     '--trace-traps[trace tag traps]'
     '--batch[disable trapping of SIGINT]'
     '--no-line-editing[read the terminal without GNU readline]'

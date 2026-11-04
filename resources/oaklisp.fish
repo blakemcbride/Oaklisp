@@ -29,6 +29,8 @@ complete -c oaklisp -n $before -l size-cxt-stk -x -d 'context stack buffer, in r
 complete -c oaklisp -n $before -l size-seg-max -x -d 'maximum flushed segment length, in refs'
 complete -c oaklisp -n $before -l trace-gc -x -a '0 1 2 3' -d 'trace garbage collection'
 complete -c oaklisp -n $before -l verbose-gc -x -a '0 1 2 3' -d 'trace garbage collection'
+complete -c oaklisp -n $before -l gc-stats -d 'report the GC pauses and stalls at exit'
+complete -c oaklisp -n $before -l gc-threads -x -d 'threads marking in parallel'
 complete -c oaklisp -n $before -l trace-traps -d 'trace tag traps'
 complete -c oaklisp -n $before -l batch -d 'disable trapping of SIGINT'
 complete -c oaklisp -n $before -l no-line-editing -d 'read the terminal without GNU readline'

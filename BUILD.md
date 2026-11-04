@@ -450,6 +450,23 @@ Running Oaklisp
 Emulator options go before --, Oaklisp options go after.
 "oaklisp --version" reports the emulator's architecture.
 
+Garbage collection options (GC.md): --size-heap N sets the heap in
+kilo-refs (512 by default, a budget the mark-sweep heap is mapped up
+to as needed and grows past only when the live data does; 128 with
+the copying collector); --gc-stats prints the pauses and stalls at
+exit, per kind: count, total, maximum, percentiles and a histogram;
+--trace-gc 1 to 3 prints each collection, then the budget's changes
+and each wait, then every handshake round and the report of
+--gc-stats; --gc-threads N sets how many threads mark in parallel in
+a threads build (by default one per CPU the process may run on, up to
+8).  OAKLISP_OPTIONS carries emulator options to a stand-alone
+executable.  The pauses on the benchmarks (GC.md, "Pause
+Statistics"): in a threads build a thread's longest stop is the scan
+of its own stacks, 0.004 to 0.010 ms, and nothing stops every thread
+but a dump; the default build stops for its mark, up to 5.4 ms on
+hash, 1.1 on sort and under 0.35 elsewhere; the copying collector for
+a whole collection, up to 6.5 ms on hash and 2.4 on sort.
+
 Debian Packages
 ===============
 

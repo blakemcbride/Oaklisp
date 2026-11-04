@@ -88,7 +88,7 @@ These emulator command-line flags affect GC behavior:
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--size-heap N` | 128 | Heap size in kilo-refs (1 ref = 8 bytes on 64-bit) |
+| `--size-heap N` | 512 (128 with the copying collector) | Heap size in kilo-refs (1 ref = 8 bytes on 64-bit); the mark-sweep budget's floor |
 | `--trace-gc V` | 0 | GC verbosity: 0=quiet, 1=summary, 2=detailed (each pause with its length), 3=very detailed (plus every pause and stall as it ends, and the report below) |
 | `--gc-stats` | off | report the pauses and stalls at exit (Pause Statistics, below) |
 | `--gc-threads N` | the CPUs, at most 8 | threads marking in parallel in the concurrent collector (the GC thread and N-1 markers; "Phase 3: Concurrent Mark"); the default is the CPUs the process may run on (its affinity mask), capped |
@@ -320,9 +320,10 @@ sweep that made it has passed it entirely, so any entry on the lists
 may be used.  The lists span all regions and are rebuilt from scratch
 each cycle.
 
-When a free-list block is larger than the request, the unused gap is
-zeroed with `memset` to prevent the copying GC's `scavenge()` from
-seeing stale pointer values.
+When the entry taken is larger than the request, the unused gap,
+which has no objstart bit and so counts as the new object's tail
+wherever the bitmap gives an extent, is zeroed: fixnum zeros, which
+nothing can misread as a pointer.
 
 ### Tier 2: Lazy sweep (after a collection)
 
@@ -832,6 +833,89 @@ because they write to newly created objects, not overwrite existing
 pointer fields.
 
 
+Rules for Instructions and Native Helpers
+=========================================
+
+What the collectors ask of every instruction in `loop.c`, every C
+function the generated code calls (`native-ops.c`, `native.c`,
+`dispatch.c`), and the C that `native-compiler.oak` emits.  The
+concurrent collector depends on each of them; a lapse shows up as a
+freed object still in use, rarely and far from its cause, which is
+what verify mode is for.
+
+**Allocation** goes through the `ALLOCATE` macros (data.h:
+`ALLOCATE`, `ALLOCATE_SS` with the interpreter's stack locals
+synchronized around it, `ALLOCATE1` keeping one ref across it) or
+`rt_allocate` in the helpers, never around them.  The fast path bumps
+the thread's TLAB and sets the objstart bit; the slow path takes
+`alloc_lock`, may scan the thread's roots, may wait for a cycle, and
+in a copying build may collect.  So an allocation is a safepoint
+(below).  A new object's initializing stores need no barrier, but
+every word of it is written before the next allocation or poll: a
+TLAB carved from a free run holds the dead objects' old words, and
+verify mode's mark reads a fresh object's fields as they are.
+
+**Heap stores.**  Every store of a ref into an existing heap object
+-- a slot, a cons cell, a vector element, an environment, the cell a
+locative names, a cache -- is `SATB_BARRIER(addr, v); *addr = v;` in
+C and `ON_STORE(addr, v)` in generated C, the barrier before the
+store so that it reads the old value.  A store into a stack or a
+register is not barriered.  native-parity.test greps the generated C
+for raw stores; the interpreter's ten sites are listed above.
+
+**Reads outside the roots.**  A value read through a weak pointer
+goes through `wp_to_ref`, which logs it during a mark and answers
+nil while the table is being cleared.  A cache of raw refs that no
+root covers (the global method cache, a native call site) logs what a
+hit yields (`SATB_READ_RAW`) and is flushed as a mark begins and when
+a world is loaded; a new one does the same, or holds a ref some root
+holds too.
+
+**Safepoints.**  With threads, a handshake round waits for every
+live thread to reach a safepoint, and a dump's pause for every thread
+to park: the interpreter polls at the top of its loop
+(`POLL_GC_SIGNALS`, every instruction) and generated code at every
+call, return and backward branch (`ON_PENDING`, `ON_POLL`), each with
+its stacks synchronized first (`value_stack.sp`, `context_stack.sp`
+and `e_pc` as the structures show them; `ON_SYNC`), since the
+handshake scans the stacks through them.  A C loop that can run for
+milliseconds -- over a long vector or string -- holds the GC thread's
+round for that long, so it polls too (`wait_for_gc`, stacks
+synchronized) or stays short.
+
+**Blocking.**  A thread that blocks in C -- a park, a sleep, a
+condition variable, a lock it may wait long for -- blocks as a parked
+thread: `gc_ready[i] = 1` before, with its stacks synchronized, and
+cleared under `gc_lock` after (`oak_thread_park`,
+`oak_thread_sleep_ms`, `ms_wait_cycle`), so that the GC thread does
+its handshake part for it and a pause counts it.  A lock taken on a
+hot path (`alloc_lock`) is taken with `trylock`, polling `gc_pending`
+while waiting, because a thread blocked on a mutex can take part in
+nothing and the holder may be waiting for the round.
+
+**Refs in C variables.**  Across a safepoint -- a poll, an
+allocation, a park -- a ref lives on a stack, in a register or in a
+heap object, never only in a C variable: a C variable is no root.
+With the copying collector the variable would hold a stale address;
+with the concurrent one a ref that was off the thread's stack when
+the handshake scanned it, and goes back on afterwards, has escaped
+the mark.  `ALLOCATE1` and `GC_MEMORY`/`GC_RECALL` keep a ref across
+an allocation in the interpreter; the C-locals lowering (`--ir`)
+reserves stack room before a run of locals (`ON_RESERVE`) so that no
+flush, which can collect, falls inside it.
+
+**Interior pointers.**  A ref into the middle of an object (a method
+inside the operation it was allocated with, a locative to a cell) is
+mapped by the objstart bitmap to its object and keeps it alive; a
+raw C pointer into an object is not a ref and keeps nothing alive.
+
+**Testing a change.**  `tests/gc-stress.test` in every mode; a
+threads build with `-DOAK_GC_VERIFY` run on it several times (a
+missed barrier is reported as a missed object, with its allocation
+site and its referrer's); native-parity.test for raw stores in
+generated C; `--gc-stats` for what a change costs in stops.
+
+
 Interaction Between the Two Collectors
 ======================================
 
@@ -901,8 +985,8 @@ Allocation Flow Summary
     └─ a region mapped past the budget (own cycle only) ──→ DONE
 
 
-                    USE_MARK_SWEEP (single-threaded)
-                    ================================
+                    USE_MARK_SWEEP (single-threaded, the default)
+                    =============================================
 
     The same, without the lock; ms_collect() is a STW mark, the
     sweep lazy.
@@ -921,8 +1005,8 @@ Allocation Flow Summary
     └─ bump pointer ──→ release lock, DONE
 
 
-                    Default (single-threaded, no USE_MARK_SWEEP)
-                    =============================================
+                    Copying (single-threaded, no USE_MARK_SWEEP)
+                    ============================================
 
     ┌─ bump pointer has space? ─── yes ──→ DONE
     │
@@ -1172,10 +1256,10 @@ an arbitrary value, not a type pointer.  Following it as a type pointer
 gives incorrect object lengths.  The objstart bitmap is the
 authoritative source of object boundaries.
 
-**Free-list gap zeroing.**  When a free-list block is larger than the
-request, the gap is zeroed.  This prevents the copying GC's linear
-`scavenge()` from seeing stale `PTR_TAG` values in the gap during a
-fallback collection.
+**Free-list gap zeroing.**  When the free-list entry taken is larger
+than the request, the gap is zeroed: it has no objstart bit, so the
+bitmap counts it as the new object's tail, and zeros are fixnums
+that no collector can misread as a pointer.
 
 **Lazy sweep.**  Rather than sweeping the entire heap in a single
 STW pass after marking, sweep runs incrementally during allocation.
@@ -1218,6 +1302,8 @@ Source Files
 | `gc.h` | Copying GC declarations, `GC_MEMORY`/`GC_RECALL` macros |
 | `data.h` | `ALLOCATE_PROT` macro (three variants), heap data structures |
 | `loop.c` | SATB barrier insertion sites, allocation instruction handlers, the safepoint poll |
+| `oak-native.h` | Generated code's side: `ON_STORE` (the barrier), `ON_PENDING`/`ON_POLL` (the safepoint), `ON_RESERVE` (no ref only in a C local) |
+| `dispatch.c` | The global method cache: raw refs, flushed as a mark begins, a hit logged (`SATB_READ_RAW`) |
 | `threads.c` | `wait_for_gc`: a thread's safepoint (a pause to wait out, or its handshake), the parked states (`gc_ready`), thread exit |
 | `oaklisp.c` | GC initialization (`ms_init`, `gc_safepoint_init`) |
 | `weak.c` | Weak pointer table processing (used by both collectors) |
@@ -1253,7 +1339,7 @@ These are compile-time constants in the header files:
 
 To limit maximum heap growth, compile with:
 ```sh
-make CPPFLAGS="-DUSE_MARK_SWEEP -DMAX_NEW_SPACE_SIZE=16000000"
+make CPPFLAGS="-DMAX_NEW_SPACE_SIZE=16000000"
 ```
 
 

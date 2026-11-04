@@ -92,6 +92,10 @@ report the garbage collector's pauses and stalls at exit (count,
 total, mean, maximum, percentiles and a histogram per kind; also at
 \-\-trace-gc 3)
 .TP
+.B \-\-gc-threads n
+threads marking in parallel, in an emulator built with threads;
+default: one per CPU the process may run on, at most 8
+.TP
 .B \-\-trace-traps
 trace tag traps
 .TP

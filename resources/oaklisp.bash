@@ -11,7 +11,8 @@ _oaklisp()
 
     local emulator_opts="--help --version --world --dump --dump-base
         --predump-gc --size-heap --size-val-stk --size-cxt-stk
-        --size-seg-max --trace-gc --verbose-gc --trace-traps --batch
+        --size-seg-max --trace-gc --verbose-gc --gc-stats --gc-threads
+        --trace-traps --batch
         --no-line-editing --trace-files --trace-segs --trace-valcon
         --trace-cxtcon --trace-stks --trace-instructions --trace-methods
         --trace-mcache --"
@@ -49,7 +50,7 @@ _oaklisp()
                 user-locale oaklisp-locale" -- "$cur"))
             return ;;
         --dump-base|--predump-gc|--size-heap|--size-val-stk|--size-cxt-stk|\
-        --size-seg-max|--trace-gc|--verbose-gc|--pthreads|--eval)
+        --size-seg-max|--trace-gc|--verbose-gc|--gc-threads|--pthreads|--eval)
             return ;;
     esac
 
