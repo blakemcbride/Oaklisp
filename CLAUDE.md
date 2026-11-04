@@ -16,22 +16,18 @@ doc/summary/        Concise programmer reference (LaTeX); the three PDFs are tra
 doc/examples/       Example Oaklisp programs
 man/man1/           Man page template (oaklisp.1.in)
 resources/          Desktop entry, icon, shell completions (bash, zsh, fish)
-prebuilt/           Prebuilt bootstrap artifacts, on the "prebuilt" branch only
-m4/                 Cached AX_* autoconf macros, on the "prebuilt" branch only
-debian/             Debian packaging
+prebuilt/           Generated bootstrap material (make prebuilt); never committed
 ```
 
 ### Branches
 
-- `main` — development: source only, never `prebuilt/` or `m4/`
-- `prebuilt` — `main` plus the generated material: `prebuilt/` (bytecode,
-  world images, PDFs, instr-data.c) and the cached `m4/` macros, as appropriate.
-- `pristine-tar` — Debian pristine-tar data
-
-The rule: commit source changes on `main`; every so often merge `main`
-into `prebuilt` and follow the merge with a commit that refreshes
-`prebuilt/` (`make prebuilt`).  Commit messages on `main` don't discuss
-prebuilt content; that goes in the refresh commit on `prebuilt`.
+This repository has one branch, `main`, and it carries source only:
+`prebuilt/` (the generated bootstrap material: bytecode, world images,
+PDFs, instr-data.c) and `m4/` are never committed.  `make prebuilt`
+makes `prebuilt/`, and make uses it when it is there.  Barak
+Pearlmutter's repository (https://github.com/barak/oaklisp) keeps such
+material on a `prebuilt` branch, and its Debian packaging on
+`debian/latest` and `pristine-tar`; neither is here.
 
 `main` and release tarballs (`make dist` deliberately omits `prebuilt/`)
 build from source alone with Guile 3 (`build-from-guile`, which make
@@ -490,16 +486,8 @@ oaklisp --world oakworld.bin -- \
 cd src/world && oaklisp --world oakworld.bin -- --compile sort --exit
 ```
 
-## Debian Packaging
+## Packaging and Branches
 
-Two binary packages:
-- **oaklisp** — Emulator binary + oakworld.bin + man page
-- **oaklisp-doc** — PDF documentation + examples
-
-Build with: `dpkg-buildpackage` or `debuild` (requires `gcc-multilib` for 32-bit mode on 64-bit hosts, `texlive` + `latexmk` for docs).
-
-## Git Branches
-
-- `main` — Development branch; source only (no `prebuilt/`, no `m4/`)
-- `prebuilt` — `main` plus `prebuilt/` and `m4/`, refreshed after each merge from `main`
-- `pristine-tar` — Debian pristine-tar data
+There is no `debian/` directory here: the Debian packaging (two binary
+packages, oaklisp and oaklisp-doc) lives in Barak Pearlmutter's
+repository.  The one branch is `main`; see Branches above.

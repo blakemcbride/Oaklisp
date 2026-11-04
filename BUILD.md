@@ -26,9 +26,9 @@ fixnums.  Oaklisp is self-hosting, so the build has to bootstrap
 somehow (see Bootstrapping below); make picks the first of these
 that it finds:
 
-- a world image in prebuilt/ (the "prebuilt" branch has it), or
-  prebuilt bytecode there: nothing beyond a C compiler is needed;
-- Guile 3: builds from source alone, which is how the "main" branch
+- a world image in prebuilt/ (made by "make prebuilt"; not in git),
+  or prebuilt bytecode there: nothing beyond a C compiler is needed;
+- Guile 3: builds from source alone, which is how a fresh checkout
   and release tarballs -- neither of which carries prebuilt/ -- are
   built.  Takes a quarter of a minute longer.
 
@@ -190,15 +190,17 @@ running Oaklisp.  There are two ways to break the circle.
 From source alone, with Guile 3: the Guile-hosted Oaklisp in
 src/cold-compiler/ loads the world's own macros and compiler from the
 .oak sources and runs them, so the .oa objects, and the cold world
-(via tool.oak), come straight from the sources.  This is what the
-"main" branch and the release tarballs made by "make dist" rely on,
-since neither carries prebuilt/; it is also how the Debian package is
-built.  Nothing is lost by it: the compiler is deterministic, so the
-objects are byte for byte what a native Oaklisp produces.
+(via tool.oak), come straight from the sources.  This is what a fresh
+checkout and the release tarballs made by "make dist" rely on, since
+neither carries prebuilt/; it is also how Barak Pearlmutter's Debian
+package is built.  Nothing is lost by it: the compiler is
+deterministic, so the objects are byte for byte what a native Oaklisp
+produces.
 
-With prebuilt material: the prebuilt/ directory, kept on the "prebuilt"
-branch of the git repository (not on "main", and not in tarballs),
-holds two kinds of bootstrap material, arranged by architecture:
+With prebuilt material: the prebuilt/ directory ("make prebuilt" makes
+it; it is not in git here, and not in tarballs; Barak Pearlmutter's
+repository keeps one on its "prebuilt" branch) holds two kinds of
+bootstrap material, arranged by architecture:
 
 	prebuilt/src/world/bc2-32/*.oa          compiled bytecode, for bc2 systems
 	prebuilt/src/world/bc4-64/*.oa          compiled bytecode, for bc4 systems
@@ -470,11 +472,10 @@ a whole collection, up to 6.5 ms on hash and 2.4 on sort.
 Debian Packages
 ===============
 
-	dpkg-buildpackage -us -uc
-
-Produces two packages:
-- oaklisp      -- emulator + world + man page
-- oaklisp-doc  -- PDF documentation + examples
+The Debian packaging (two packages: oaklisp, the emulator, world and
+man page; oaklisp-doc, the PDF documentation and examples) is in
+Barak Pearlmutter's repository, https://github.com/barak/oaklisp, on
+its debian/latest branch, not here.
 
 Troubleshooting
 ===============
@@ -483,8 +484,8 @@ Troubleshooting
     Make found neither an old world, nor prebuilt bytecode, nor
     Guile 3.  Install Guile 3 (guile-3.0; or point configure at one
     with --with-guile=PATH) to build from source alone, or get the
-    prebuilt/ directory from the "prebuilt" branch, or name an
-    installed world: make OLD_WORLD=/usr/lib/oaklisp/oakworld.bin
+    prebuilt/ directory from another build ("make prebuilt" there),
+    or name an installed world: make OLD_WORLD=/usr/lib/oaklisp/oakworld.bin
     (with OAKLISP=PATH if the emulator being built cannot run it).
 
 "world ... is for bc2-el32, this emulator is bc2-el64"

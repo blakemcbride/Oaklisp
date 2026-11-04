@@ -159,7 +159,7 @@ AC_PROG_INSTALL
 AC_PROG_SED
 AC_CHECK_PROGS([INDENT],[indent],[true])
 # The manuals are built with latexmk.  Without it, a tree that has
-# prebuilt/doc (the master branch) still has the PDFs, and doc's rules
+# prebuilt/doc (from "make prebuilt") still has the PDFs, and doc's rules
 # fall back on those; with neither, build no documentation rather than
 # fail in the middle of the build.
 AS_IF([test x${enable_docs} = xyes],

@@ -28,8 +28,9 @@ Prerequisites
 
 	brew install guile
 
-   If you have the prebuilt/ directory from the "prebuilt" branch,
-   or an installed Oaklisp world, you don't need Guile.
+   If you have a prebuilt/ directory from another build ("make
+   prebuilt" there), or an installed Oaklisp world, you don't need
+   Guile.
 
 Optional:
 
@@ -130,9 +131,10 @@ Troubleshooting
 
 "no way to build the world"
     Make found neither prebuilt/ nor Guile.  Install Guile
-    (brew install guile) or check out prebuilt/ from the "prebuilt"
-    branch.  If Guile is installed but not on your PATH, point
-    configure at it with --with-guile=$(brew --prefix guile)/bin/guile.
+    (brew install guile) or copy a prebuilt/ directory from another
+    build ("make prebuilt" there).  If Guile is installed but not on
+    your PATH, point configure at it with
+    --with-guile=$(brew --prefix guile)/bin/guile.
 
 "Permission denied" during make install
     The default prefix /usr/local needs sudo.  Use sudo make install,
