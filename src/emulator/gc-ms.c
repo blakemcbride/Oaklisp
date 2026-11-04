@@ -1197,9 +1197,21 @@ ms_allocate_slow(size_t words, char *reason)
     ref_t *p;
 
 #ifdef THREADS
-    while (oak_mutex_trylock(&alloc_lock) != 0) {
-	if (gc_pending)
-	    wait_for_gc();
+    /* Not a blocking lock: a thread blocked in one could not do its
+       part of a handshake round.  A spin, then yields: the GC thread
+       sweeping in the background holds the lock a block at a time,
+       and on one CPU a spinner would hold it off for its slice. */
+    {
+	int spins = 0;
+
+	while (oak_mutex_trylock(&alloc_lock) != 0) {
+	    if (gc_pending)
+		wait_for_gc();
+	    else if (++spins > 64)
+		oak_thread_yield();
+	    else
+		OAK_CPU_RELAX();
+	}
     }
 #endif
     p = ms_alloc_slow_locked(words, idx);
@@ -1452,11 +1464,14 @@ static int gc_requested;		/* a cycle is wanted */
 static const char *gc_request_reason;
 static size_t gc_request_amount;	/* the most a waiter needs */
 static unsigned long gc_cycles_done;
+static int gc_sweeping;			/* the GC thread sweeps in the background */
 static int gc_hold;			/* dumps and world loads in progress */
 static bool gc_thread_started;
 
 static void *ms_gc_thread_main(void *arg);
+static void ms_background_sweep(void);
 static bool ms_help_mark(int idx);
+static int ms_cpus;			/* the CPUs the process may run on */
 static volatile bool ms_run_open;
 static oak_mutex_t ms_work_lock = OAK_MUTEX_INITIALIZER;
 static oak_cond_t ms_work_cv = OAK_COND_INITIALIZER;
@@ -1579,7 +1594,7 @@ ms_gc_hold(void)
     gc_ready[idx] = 1;
     oak_mutex_lock(&gc_concurrent_lock);
     gc_hold++;
-    while (gc_concurrent_in_progress)
+    while (gc_concurrent_in_progress || gc_sweeping)
 	oak_cond_wait(&gc_concurrent_done_cv, &gc_concurrent_lock);
     oak_mutex_unlock(&gc_concurrent_lock);
     oak_mutex_lock(&gc_lock);
@@ -2120,7 +2135,6 @@ typedef struct OAK_CACHE_ALIGNED ms_worker {
 } ms_worker_t;
 
 static int ms_markers;			/* the GC thread and its markers */
-static int ms_cpus;			/* the CPUs the process may run on */
 static volatile bool ms_spin_ok;	/* this run: a CPU to spin on for each marker */
 static ms_worker_t ms_pool_workers[MAX_THREAD_COUNT];	/* 0 the GC thread's */
 static ms_worker_t ms_helper_workers[MAX_THREAD_COUNT];	/* a parked mutator's */
@@ -3638,8 +3652,57 @@ ms_gc_thread_main(void *arg)
 	gc_concurrent_in_progress = 0;
 	gc_cycles_done++;
 	oak_cond_broadcast(&gc_concurrent_done_cv);
+
+	/* The rest of the sweep, in the background (a dump or a world
+	   load waits for this to stop too). */
+	gc_sweeping = 1;
+	oak_mutex_unlock(&gc_concurrent_lock);
+	ms_background_sweep();
+	oak_mutex_lock(&gc_concurrent_lock);
+	gc_sweeping = 0;
+	oak_cond_broadcast(&gc_concurrent_done_cv);
     }
     return NULL;
+}
+
+/* The background sweep: after a cycle, the GC thread sweeps what is
+   left of the lazy sweep a block at a time, taking alloc_lock for
+   each, so that the allocating threads find free runs ready and
+   the next cycle has no sweep to finish -- until the sweep is done,
+   or a cycle is asked for (its start finishes the sweep, as before),
+   or a dump or a world load holds the collector off.  With more
+   threads than CPUs it yields between blocks: a mutator on the
+   sweeper's CPU would otherwise find the lock taken whenever it
+   ran. */
+static void
+ms_background_sweep(void)
+{
+    bool yields = oak_live_thread_count() + 1 > ms_cpus;
+    gc_timer_t timer;
+    unsigned long blocks = 0;
+
+    gc_stats_begin(&timer, GC_EV_SWEEP);
+    for (;;) {
+	bool stop, more;
+
+	oak_mutex_lock(&gc_concurrent_lock);
+	stop = gc_requested || gc_hold;
+	oak_mutex_unlock(&gc_concurrent_lock);
+	if (stop)
+	    break;
+	oak_mutex_lock(&alloc_lock);
+	more = ms_lazy_sweep_one();
+	oak_mutex_unlock(&alloc_lock);
+	if (!more)
+	    break;
+	blocks++;
+	if (yields)
+	    oak_thread_yield();
+    }
+    gc_stats_end(&timer, GC_EV_SWEEP, NULL);
+    if (trace_gc > 2)
+	fprintf(stderr, "; MS-GC: background sweep: %lu block%s.\n",
+		blocks, blocks == 1 ? "" : "s");
 }
 #endif
 

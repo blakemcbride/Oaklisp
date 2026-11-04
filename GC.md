@@ -448,7 +448,8 @@ compaction and verify mode's check are the exceptions).
 Every cycle runs on the GC thread (`ms_gc_thread_main`), started at
 the first request, so that no mutator is ever out of action for the
 length of a mark; it starts the marker threads that trace with it
-(`ms_markers_start`; Phase 3 below) at the same time.  None of them
+(`ms_markers_start`; Phase 3 below) at the same time, and between
+cycles it sweeps in the background (Lazy Sweep).  None of them
 has a slot in the thread arrays: they run no Oaklisp code, allocate
 nothing and hold no roots, so the handshake rounds ask nothing of
 them, and `%thread-count` does not count them; their index
@@ -677,6 +678,7 @@ reports what the concurrent mark missed ("Verify mode").
    largest request any waiter made to be met, or for the budget to
    allow mapping a region, and announces the cycle's end to the
    waiters
+6. Sweeps the rest in the background (Lazy Sweep)
 
 So the only stop a thread takes for a cycle is the scan of its own
 stacks, a few microseconds (Pause Statistics has the numbers); the
@@ -697,10 +699,22 @@ The sweep runs on demand, region by region:
   all); a TLAB's unused tail is retired -- zeroed, given an objstart
   bit -- when its thread replaces it, and at the thread's first
   handshake of a cycle, so no object's extent absorbs stale words
-- Called from `ms_alloc_slow_locked()` when free lists are empty
-- Naturally adapts sweep rate to allocation pressure
-- `ms_lazy_sweep_finish()` flushes remaining blocks at the start of
-  the next GC cycle
+- With threads, the GC thread sweeps in the background after each
+  cycle (`ms_background_sweep`): a block at a time under
+  `alloc_lock`, until the sweep is done, a cycle is asked for, or a
+  dump or a world load holds the collector off (`gc_sweeping`, which
+  `ms_gc_hold` waits out with the cycle), yielding between blocks
+  when the threads outnumber the CPUs; so the allocating threads
+  find free runs ready, and the next cycle has little or nothing to
+  finish.  A thread that needs a run before the sweeper reaches one
+  sweeps for it itself (`ms_alloc_slow_locked`), and the slow path
+  spins on `alloc_lock` only briefly before it yields
+  (`ms_allocate_slow`).  `--gc-stats` reports the sweeps as the GC
+  thread's *background sweep*
+- Without threads, called from `ms_alloc_slow_locked()` when the
+  free lists are empty, so the sweep rate follows the allocation
+  rate, and `ms_lazy_sweep_finish()` flushes the remaining blocks at
+  the start of the next cycle
 
 ### Pacing
 
@@ -1002,8 +1016,10 @@ The kinds:
   until the last thread has reached a safepoint.
 - **The GC thread's own time**, stalling nobody: the *concurrent
   cycle* is the whole cycle as the GC thread sees it, from finishing
-  the previous sweep to the end of the eager sweep, and a *handshake
-  round* is from its request to the last thread's part done.
+  the previous sweep to the end of the eager sweep, a *handshake
+  round* is from its request to the last thread's part done, and a
+  *background sweep* is the sweep after a cycle, from its start to
+  its end or interruption.
 - **Stalls of one thread**: a *root scan* (a thread scanning its own
   registers and stacks at its first handshake of a cycle), a
   *safepoint wait* (a thread parked while another held a pause), and
@@ -1163,6 +1179,8 @@ fallback collection.
 STW pass after marking, sweep runs incrementally during allocation.
 This eliminates the STW sweep pause entirely under `THREADS` and
 amortizes sweep cost across allocations in single-threaded mode.
+With threads the GC thread does most of it in the background after
+the cycle, so the allocating threads mostly find free runs ready.
 
 **Born-black allocation.**  Objects allocated from free lists during
 concurrent mark are below their region's `sweep_top` and would be

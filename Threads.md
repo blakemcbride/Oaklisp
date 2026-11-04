@@ -89,9 +89,9 @@ Global shared state:
                                        epoch and each thread's scanned
                                        state (read by its own barrier)
     free_list_heads[]               Segregated free lists
-    gc_requested, gc_hold,          The GC thread's requests, holds and
-      gc_cycles_done                   completed cycles, under
-                                       gc_concurrent_lock
+    gc_requested, gc_hold,          The GC thread's requests, holds,
+      gc_cycles_done, gc_sweeping      completed cycles and background
+                                       sweep, under gc_concurrent_lock
     satb_buffer_array[]             Per thread: old values overwritten,
                                        values stored while the thread's
                                        stacks are unscanned, values read
@@ -134,8 +134,9 @@ one overwritten, while the storing thread's stacks are unscanned
 GC thread and the marker threads it starts (`--gc-threads N`, by
 default one per CPU the process may run on, up to 8), with any
 mutator parked for want of memory helping; the mark ends after a
-round of flushes that marks nothing new; the sweep is lazy, during
-allocation; a cycle is asked for ahead of the budget so that the
+round of flushes that marks nothing new; the sweep is lazy, by the
+GC thread in the background after the cycle and by an allocating
+thread that needs a run before the sweeper reaches one; a cycle is asked for ahead of the budget so that the
 mutators keep allocating through it (GC.md, "Pacing"); the heap grows
 and shrinks by mapping and unmapping regions.  Only a dump's
 compaction (`gc.c`, and verify mode's check) stops the world: it sets
@@ -487,7 +488,3 @@ Not required for the current thread support:
   that incremental
 - **Locks per stream**: `print` to a shared stream from several
   threads without interleaving (only `format` is atomic per call)
-- **A background sweeper**: the lazy sweep runs in the allocating
-  threads; the GC thread could sweep between cycles instead
-  (GCEnhancements.md Phase 6 left it out: the mutators' slow paths
-  spin on `alloc_lock`, which a sweeper would hold much of the time)

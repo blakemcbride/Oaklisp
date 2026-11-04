@@ -46,6 +46,7 @@ enum gc_event {
   /* The GC thread's own time: stalls nobody. */
   GC_EV_CYCLE,		/* a concurrent cycle, as the GC thread sees it */
   GC_EV_ROUND,		/* a handshake round, request to last thread in */
+  GC_EV_SWEEP,		/* the background sweep after a cycle */
   /* Stalls of one thread. */
   GC_EV_SCAN,		/* a thread scanning its own stacks at a handshake */
   GC_EV_SAFEPOINT,	/* parked at a safepoint for a pause */

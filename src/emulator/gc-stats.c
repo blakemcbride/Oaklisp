@@ -76,6 +76,7 @@ static const char *const gc_event_name[GC_EV_COUNT] = {
   "  threads stopping",
   "concurrent cycle, GC thread",
   "handshake round, GC thread",
+  "background sweep, GC thread",
   "root scan, own stacks",
   "safepoint wait",
   "allocation wait",
