@@ -205,4 +205,38 @@ static inline int oak_atomic_cas_size_(volatile size_t *p, size_t *e, size_t v) 
 #endif
 
 
+/* ------------------------------------------------------------------ */
+/*  A pause in a spin loop                                             */
+/* ------------------------------------------------------------------ */
+
+/* OAK_CPU_RELAX(): tell the processor the thread is spinning, so that
+   it yields the core's resources to its sibling and does not
+   mispredict the exit. */
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
+#if defined(_MSC_VER)
+#include <intrin.h>
+#define OAK_CPU_RELAX() _mm_pause()
+#else
+#define OAK_CPU_RELAX() __builtin_ia32_pause()
+#endif
+#elif defined(__aarch64__) || defined(__arm__)
+#define OAK_CPU_RELAX() __asm__ __volatile__("yield" ::: "memory")
+#else
+#define OAK_CPU_RELAX() ((void)0)
+#endif
+
+/* OAK_CACHE_ALIGNED: on a variable or a struct type, so that what
+   one thread writes shares no cache line with what another does.
+   Two lines: the adjacent-line prefetcher pairs them. */
+#define OAK_CACHE_LINE 128
+#if defined(_MSC_VER)
+#define OAK_CACHE_ALIGNED __declspec(align(128))
+#elif defined(__GNUC__) || defined(__clang__)
+#define OAK_CACHE_ALIGNED __attribute__((aligned(128)))
+#elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+#define OAK_CACHE_ALIGNED _Alignas(128)
+#else
+#define OAK_CACHE_ALIGNED
+#endif
+
 #endif /* OAK_ATOMIC_H_INCLUDED */

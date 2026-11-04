@@ -31,6 +31,9 @@
  */
 
 #define _REENTRANT
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE		/* sched_getaffinity: the default marker count */
+#endif
 
 #include <stddef.h>
 #include <stdlib.h>
@@ -53,6 +56,7 @@
 #include <malloc.h>
 #else
 #include <sys/mman.h>
+#include <unistd.h>
 #ifndef MAP_ANONYMOUS
 #define MAP_ANONYMOUS MAP_ANON
 #endif
@@ -1263,6 +1267,11 @@ ms_tlab_retire_all(void)
 
 int gc_satb_active = 0;
 
+/* --gc-threads (gc.h): the threads marking in parallel with the
+   concurrent collector, 0 for the default; in every build, so that
+   the option is accepted in every build. */
+int gc_threads_wanted;
+
 /*
  * Dropping an entry would break the snapshot-at-the-beginning
  * invariant: an object whose last remaining reference was overwritten
@@ -1324,12 +1333,10 @@ satb_room(ref_t **bufp, size_t count, size_t *sizep)
 static volatile size_t gc_mark_epoch;
 static volatile size_t gc_scan_epoch[MAX_THREAD_COUNT];
 
-/* Buffers handed to the marker, full or at a handshake: it drains
-   them (ms_satb_drain_concurrent) between runs of the mark stack. */
-static oak_mutex_t satb_lock = OAK_MUTEX_INITIALIZER;
-static struct satb_full {
-    ref_t *buf; size_t count; size_t epoch; struct satb_full *next;
-} *satb_full_list;
+/* Buffers handed to the markers, full or at a handshake: packets of
+   refs on their work list ("Parallel marking", below). */
+static void ms_work_put(ref_t *buf, size_t count, size_t epoch, int kind);
+#define MS_WORK_REFS 0
 
 /* The buffer of thread IDX is this cycle's: entries of an earlier
    epoch are dropped. */
@@ -1346,18 +1353,10 @@ satb_fresh(int idx)
 static void
 satb_handoff(int idx)
 {
-    struct satb_full *full;
-
     if (satb_buffer_array[idx] == NULL || satb_count_array[idx] == 0)
 	return;
-    full = (struct satb_full *)xmalloc(sizeof *full);
-    full->buf = satb_buffer_array[idx];
-    full->count = satb_count_array[idx];
-    full->epoch = satb_epoch_array[idx];
-    oak_mutex_lock(&satb_lock);
-    full->next = satb_full_list;
-    satb_full_list = full;
-    oak_mutex_unlock(&satb_lock);
+    ms_work_put(satb_buffer_array[idx], satb_count_array[idx],
+		satb_epoch_array[idx], MS_WORK_REFS);
     satb_buffer_array[idx] = NULL;
     satb_size_array[idx] = 0;
     satb_count_array[idx] = 0;
@@ -1457,6 +1456,11 @@ static int gc_hold;			/* dumps and world loads in progress */
 static bool gc_thread_started;
 
 static void *ms_gc_thread_main(void *arg);
+static bool ms_help_mark(int idx);
+static volatile bool ms_run_open;
+static oak_mutex_t ms_work_lock = OAK_MUTEX_INITIALIZER;
+static oak_cond_t ms_work_cv = OAK_COND_INITIALIZER;
+static oak_cond_t ms_run_cv = OAK_COND_INITIALIZER;
 
 void
 gc_safepoint_init(void)
@@ -1465,7 +1469,9 @@ gc_safepoint_init(void)
     oak_mutex_init(&gc_concurrent_lock);
     oak_cond_init(&gc_concurrent_done_cv);
     oak_cond_init(&gc_request_cv);
-    oak_mutex_init(&satb_lock);
+    oak_mutex_init(&ms_work_lock);
+    oak_cond_init(&ms_work_cv);
+    oak_cond_init(&ms_run_cv);
     oak_mutex_init(&gc_hs_lock);
     oak_cond_init(&gc_hs_cv);
 #endif
@@ -1533,8 +1539,17 @@ ms_wait_cycle(const char *reason, size_t amount)
 	ms_gc_thread_start_locked();
 	oak_cond_broadcast(&gc_request_cv);
     }
-    while (gc_cycles_done < target)
-	oak_cond_wait(&gc_concurrent_done_cv, &gc_concurrent_lock);
+    /* Until the cycle ends: help the trace while one runs (a run
+       starting wakes the waiters here), else wait.  The run is tested
+       again under the lock: a run opened between the test and the
+       wait would otherwise be missed. */
+    while (gc_cycles_done < target) {
+	oak_mutex_unlock(&gc_concurrent_lock);
+	(void)ms_help_mark(idx);
+	oak_mutex_lock(&gc_concurrent_lock);
+	if (gc_cycles_done < target && !ms_run_open)
+	    oak_cond_wait(&gc_concurrent_done_cv, &gc_concurrent_lock);
+    }
     oak_mutex_unlock(&gc_concurrent_lock);
     /* Leave the parked state the way wait_for_gc does: under gc_lock,
        which the GC thread holds for the whole of a stop-the-world
@@ -1949,13 +1964,19 @@ ms_mark_target(ref_t ref, ref_t **objp)
 /*  Mark phase                                                         */
 /* ------------------------------------------------------------------ */
 
-/* Dynamically growing mark stack. */
+/* Objects marked, in all: the termination test's measure (a round
+   that marks nothing new ends the mark). */
+static unsigned long mark_stack_pushes;
+
+#define MARK_STACK_INITIAL 4096
+
+/* The mark stack of the single-threaded cycle and of verify mode's
+   check, with the world stopped; the concurrent mark's workers each
+   have their own (ms_worker_t). */
+#if !defined(THREADS) || defined(OAK_GC_VERIFY)
 static ref_t **mark_stack;
 static size_t mark_stack_size;
 static size_t mark_stack_top;
-static unsigned long mark_stack_pushes;	/* objects marked, in all */
-
-#define MARK_STACK_INITIAL 4096
 
 static void
 mark_stack_init(void)
@@ -1994,7 +2015,6 @@ mark_stack_pop(void)
  * are permanent and always considered live).  With the world
  * stopped: the single-threaded cycle's, and verify mode's.
  */
-#if !defined(THREADS) || defined(OAK_GC_VERIFY)
 static void
 ms_mark_ref(ref_t ref)
 {
@@ -2040,14 +2060,200 @@ ms_trace(void)
 
 
 #ifdef THREADS
+/* ------------------------------------------------------------------ */
+/*  Parallel marking                                                   */
+/* ------------------------------------------------------------------ */
+
 /*
- * Concurrent variant of ms_mark_ref — uses atomic bitmap operations
- * so the GC thread can mark concurrently with mutator allocations.
- * The mark stack is private to the GC thread so push/pop need not
- * be atomic.
+ * The concurrent mark is traced by several threads at once: the GC
+ * thread, the marker threads it starts (ms_markers in all, counting
+ * itself: --gc-threads, by default one per CPU the process may run
+ * on, at most MS_MAX_MARKERS), and any mutator parked for want of
+ * memory while a trace runs, which helps instead of idling
+ * (ms_help_mark, from ms_wait_cycle).
+ *
+ * Work is in packets on a shared list (ms_work_list, under
+ * ms_work_lock): refs to mark -- a thread's barrier buffer, handed
+ * over when full or at a handshake, its root scan among them
+ * (satb_handoff) -- a range of spatic to scan for roots, or marked
+ * objects to trace, which a worker exports from its own mark stack
+ * when another worker is waiting for work and the list is empty.  A
+ * worker traces from its own stack and takes a packet when that runs
+ * dry; a run of the trace is over when the list is empty and every
+ * worker is waiting: the last to go idle declares it done and wakes
+ * the others.  A packet of refs logged in an earlier cycle (its
+ * epoch) is dropped: its entries refer to objects marked then.
+ *
+ * Nothing a worker writes is read by another: the mark bits are set
+ * atomically (the first to set one traces the object), and the
+ * objstart and free bits, the regions' tops and the objects' fields
+ * are read as the single marker read them, racing with the mutators
+ * only, as before.  What each worker marks and traces is counted
+ * per worker and summed as it leaves the run.
  */
+#define MS_PACKET_SIZE 512		/* objects in a packet at most */
+#define MS_EXPORT_MIN 8			/* a stack worth exporting half of */
+#define MS_EXPORT_INTERVAL 256		/* marks between a worker's exports */
+#define MS_SPIN_NS 20000		/* a worker spins this long before sleeping */
+#define MS_SPATIC_CHUNK 16384		/* words of spatic per packet */
+#define MS_MAX_MARKERS 8		/* the default's cap */
+
+#define MS_WORK_OBJECTS 1		/* MS_WORK_REFS is 0 (above) */
+#define MS_WORK_RANGE 2
+
+struct ms_work {
+    ref_t *buf;		/* refs or objects, malloc'd; a range: into spatic */
+    size_t count;
+    size_t epoch;	/* refs: the cycle they were logged in */
+    int kind;
+    struct ms_work *next;
+};
+
+/* A worker's state, written by it at every push: on cache lines of
+   its own, or the workers slow each other down to a crawl. */
+typedef struct OAK_CACHE_ALIGNED ms_worker {
+    ref_t **stack;
+    size_t size, top;
+    unsigned long pushes;	/* objects it marked this run */
+    unsigned long exported_at;	/* pushes at its last export */
+    size_t words;		/* words it traced this run */
+} ms_worker_t;
+
+static int ms_markers;			/* the GC thread and its markers */
+static int ms_cpus;			/* the CPUs the process may run on */
+static volatile bool ms_spin_ok;	/* this run: a CPU to spin on for each marker */
+static ms_worker_t ms_pool_workers[MAX_THREAD_COUNT];	/* 0 the GC thread's */
+static ms_worker_t ms_helper_workers[MAX_THREAD_COUNT];	/* a parked mutator's */
+
+/* The list and the run, under ms_work_lock (defined with the GC
+   thread's state, above, with the condition variables: ms_work_cv
+   for the workers -- a packet, the run's end, a new run -- and
+   ms_run_cv for the GC thread waiting for the workers to leave).
+   The two every push reads are on a line the rest never dirties. */
+static struct {
+    struct ms_work *volatile list;
+    volatile int idle;		/* workers spinning or asleep for want of work */
+} OAK_CACHE_ALIGNED ms_work;
+#define ms_work_list ms_work.list
+#define ms_work_idle ms_work.idle
+static OAK_CACHE_ALIGNED volatile int ms_work_active;	/* workers not asleep for want of work */
+static int ms_work_waiting;		/* of the idle, asleep */
+static bool ms_work_done;		/* the run is over */
+static size_t ms_run_number;		/* the marker threads wake for a new one */
+static int ms_run_members, ms_run_left;	/* workers in the run, and out of it */
+static unsigned long ms_run_pushes;	/* the run's sums */
+static size_t ms_run_words;
+/* Counts for --trace-gc 3, under the lock. */
+static unsigned long ms_dbg_exports, ms_dbg_packets, ms_dbg_moved,
+    ms_dbg_spins, ms_dbg_sleeps, ms_dbg_takes;
+
+static struct ms_work *
+ms_work_new(ref_t *buf, size_t count, size_t epoch, int kind)
+{
+    struct ms_work *w = (struct ms_work *)xmalloc(sizeof *w);
+
+    w->buf = buf;
+    w->count = count;
+    w->epoch = epoch;
+    w->kind = kind;
+    return w;
+}
+
+/* A packet onto the list, a waiting worker woken.  From the mutators
+   (a barrier buffer), the GC thread (a parked thread's buffer, under
+   gc_lock; spatic) and the workers (an export). */
 static void
-ms_mark_ref_concurrent(ref_t ref)
+ms_work_put(ref_t *buf, size_t count, size_t epoch, int kind)
+{
+    struct ms_work *w = ms_work_new(buf, count, epoch, kind);
+
+    oak_mutex_lock(&ms_work_lock);
+    w->next = ms_work_list;
+    ms_work_list = w;
+    if (ms_work_waiting > 0)
+	oak_cond_signal(&ms_work_cv);
+    oak_mutex_unlock(&ms_work_lock);
+}
+
+static inline void
+ms_worker_push_raw(ms_worker_t *w, ref_t *obj)
+{
+    if (OAK_UNLIKELY(w->top >= w->size)) {
+	w->size = w->size ? 2 * w->size : MARK_STACK_INITIAL;
+	w->stack = (ref_t **)realloc(w->stack, w->size * sizeof(ref_t *));
+	if (!w->stack) {
+	    fprintf(stderr, "gc-ms: mark stack realloc failed\n");
+	    exit(EXIT_FAILURE);
+	}
+    }
+    w->stack[w->top++] = obj;
+}
+
+/* The bottom half of the worker's stack to the list, in packets, the
+   sleeping workers woken: a worker is idle and the list is empty
+   (read without the lock: a stale reading costs a packet, or delays
+   one by a push), and this worker has marked MS_EXPORT_INTERVAL
+   objects since its last export -- so a worker filling its stack
+   from a wide object (a big vector, a hash table's buckets) exports
+   hundreds at a time, not a handful at every push.  The bottom of
+   the stack holds the oldest entries, the biggest subtrees of a deep
+   structure: a worker tracing a tree with a stack never deeper than
+   the tree gives the bulk of it away. */
+static void
+ms_worker_export(ms_worker_t *w)
+{
+    size_t n = w->top / 2, from = 0;
+    struct ms_work *head = NULL, *tail = NULL;
+    int packets = 0;
+
+    while (from < n) {
+	size_t k = n - from;
+	ref_t *buf;
+	struct ms_work *pk;
+
+	if (k > MS_PACKET_SIZE)
+	    k = MS_PACKET_SIZE;
+	buf = (ref_t *)xmalloc(k * sizeof(ref_t));
+	for (size_t i = 0; i < k; i++)
+	    buf[i] = (ref_t)(uintptr_t)w->stack[from + i];
+	from += k;
+	pk = ms_work_new(buf, k, 0, MS_WORK_OBJECTS);
+	pk->next = head;
+	head = pk;
+	if (tail == NULL)
+	    tail = pk;
+	packets++;
+    }
+    memmove(w->stack, w->stack + n, (w->top - n) * sizeof(ref_t *));
+    w->top -= n;
+    w->exported_at = w->pushes;
+    oak_mutex_lock(&ms_work_lock);
+    ms_dbg_exports++;
+    ms_dbg_packets += packets;
+    ms_dbg_moved += w->top;
+    tail->next = ms_work_list;
+    ms_work_list = head;
+    if (ms_work_waiting > 0) {
+	if (packets > 1)
+	    oak_cond_broadcast(&ms_work_cv);
+	else
+	    oak_cond_signal(&ms_work_cv);
+    }
+    oak_mutex_unlock(&ms_work_lock);
+}
+
+/*
+ * Mark an object atomically and push it on the worker's stack if it
+ * was unmarked.  A reference to an object allocated since the
+ * snapshot (above its region's sweep_top) is ignored: implicitly
+ * live, never swept, and holding only references the marker reaches
+ * by other means (a scanned thread stores nothing else, an unscanned
+ * one allocates nothing there).  Not marked and not traced -- a
+ * mutator that keeps overwriting fields with fresh objects would
+ * otherwise feed the termination rounds for as long as it allocates.
+ */
+static inline void
+ms_mark_ref_concurrent(ms_worker_t *w, ref_t ref)
 {
     ms_region_t *r;
     ref_t *p;
@@ -2059,91 +2265,323 @@ ms_mark_ref_concurrent(ref_t ref)
     r = ms_mark_target(ref, &p);
     if (r == NULL)
 	return;
-    /* Allocated since the snapshot (above its region's sweep_top):
-       implicitly live, never swept, and holding only references the
-       marker reaches by other means (a scanned thread stores nothing
-       else, an unscanned one allocates nothing there).  Not marked
-       and not traced -- a mutator that keeps overwriting fields with
-       fresh objects would otherwise feed the termination rounds for
-       as long as it allocates. */
     if (p >= r->sweep_top)
 	return;
     idx = BM_IDX(r, p);
     bit = 1ULL << (idx % 64);
+#ifdef MS_EXPERIMENT_PLAIN_MARK
+    if (r->mark[idx / 64] & bit)
+	return;
+    r->mark[idx / 64] |= bit;
+    old = 0;
+#else
     old = OAK_ATOMIC_FETCH_OR_U64(&r->mark[idx / 64], bit);
-    if (!(old & bit))
-	mark_stack_push(p);
+#endif
+    if (old & bit)
+	return;
+    ms_worker_push_raw(w, p);
+    w->pushes++;
+    if (w->top >= MS_EXPORT_MIN
+	&& w->pushes - w->exported_at >= MS_EXPORT_INTERVAL
+	&& ms_work_idle > 0 && ms_work_list == NULL)
+	ms_worker_export(w);
 }
 
-
-/*
- * Concurrent trace: pop objects from the mark stack and scan their
- * fields with atomic marking.  The mark stack is only accessed by
- * the GC coordinator thread.
- */
-/* The SATB buffers handed over so far: marked, atomically, and
-   freed.  True if there were any.  A buffer of an earlier epoch
-   (entries logged after that cycle's last handshake) is dropped. */
-static bool
-ms_satb_drain_concurrent(void)
+static inline void
+ms_worker_trace(ms_worker_t *w, ref_t *obj)
 {
-    struct satb_full *list, *next;
+    size_t len = ms_objstart_extent(ms_region_of(obj), obj);
 
-    oak_mutex_lock(&satb_lock);
-    list = satb_full_list;
-    satb_full_list = NULL;
-    oak_mutex_unlock(&satb_lock);
-    if (list == NULL)
-	return false;
-    for (; list; list = next) {
-	if (list->epoch == gc_mark_epoch)
-	    for (size_t j = 0; j < list->count; j++)
-		ms_mark_ref_concurrent(list->buf[j]);
-	next = list->next;
-	free(list->buf);
-	free(list);
+    w->words += len;
+    for (size_t i = 0; i < len; i++) {
+	ref_t val = obj[i];
+	if (val & PTR_MASK)
+	    ms_mark_ref_concurrent(w, val);
     }
+}
+
+/* Without the lock: a packet, or the run's end, or the spin's time
+   up, or nobody else active to make a packet. */
+static void
+ms_worker_spin(void)
+{
+    gc_ns_t t0 = gc_now();
+
+    while (ms_work_list == NULL && !ms_work_done && ms_work_active > 1
+	   && gc_now() - t0 < MS_SPIN_NS)
+	OAK_CPU_RELAX();
+}
+
+/* A worker's run: its stack, then packets, until the run is done.  A
+   worker out of work spins a while before it sleeps, the packets
+   being small against the cost of a wake-up -- unless the markers
+   and the mutators together outnumber the CPUs (ms_spin_ok, set for
+   the run), when a spinning marker would take a CPU from a mutator
+   or from a marker with work. */
+static void
+ms_worker_run(ms_worker_t *w)
+{
+    bool spun = !ms_spin_ok;
+
+    for (;;) {
+	struct ms_work *pk;
+
+	while (w->top > 0)
+	    ms_worker_trace(w, w->stack[--w->top]);
+
+	oak_mutex_lock(&ms_work_lock);
+	while ((pk = ms_work_list) == NULL) {
+	    if (!spun && ms_work_active > 1) {
+		ms_dbg_spins++;
+		ms_work_idle++;
+		oak_mutex_unlock(&ms_work_lock);
+		ms_worker_spin();
+		oak_mutex_lock(&ms_work_lock);
+		ms_work_idle--;
+		spun = true;
+		continue;
+	    }
+	    if (--ms_work_active == 0) {
+		/* The last one in: nothing to take, nobody to make more. */
+		ms_work_done = true;
+		oak_cond_broadcast(&ms_work_cv);
+		oak_mutex_unlock(&ms_work_lock);
+		return;
+	    }
+	    ms_work_idle++;
+	    ms_work_waiting++;
+	    ms_dbg_sleeps++;
+	    while (ms_work_list == NULL && !ms_work_done)
+		oak_cond_wait(&ms_work_cv, &ms_work_lock);
+	    ms_work_waiting--;
+	    ms_work_idle--;
+	    if (ms_work_done) {
+		oak_mutex_unlock(&ms_work_lock);
+		return;
+	    }
+	    ms_work_active++;
+	}
+	ms_work_list = pk->next;
+	ms_dbg_takes++;
+	oak_mutex_unlock(&ms_work_lock);
+	spun = !ms_spin_ok;
+	w->exported_at = w->pushes;
+
+	switch (pk->kind) {
+	case MS_WORK_REFS:
+	    if (pk->epoch == gc_mark_epoch)
+		for (size_t j = 0; j < pk->count; j++)
+		    ms_mark_ref_concurrent(w, pk->buf[j]);
+	    free(pk->buf);
+	    break;
+	case MS_WORK_OBJECTS:
+	    for (size_t j = 0; j < pk->count; j++)
+		ms_worker_push_raw(w, (ref_t *)(uintptr_t)pk->buf[j]);
+	    free(pk->buf);
+	    break;
+	case MS_WORK_RANGE:
+	    /* Spatic: any pointer from the world image into the heap
+	       is a root.  The mutators write it meanwhile, under the
+	       barrier: a word read old was there since the snapshot,
+	       and one read new refers to what the snapshot's rules
+	       mark anyway, while what was overwritten is in a barrier
+	       buffer. */
+	    for (size_t j = 0; j < pk->count; j++) {
+		ref_t v = pk->buf[j];
+		if ((v & PTR_MASK) && !SPATIC_PTR(ANY_TO_PTR(v)))
+		    ms_mark_ref_concurrent(w, v);
+	    }
+	    break;
+	}
+	free(pk);
+    }
+}
+
+/* Out of the run: the worker's counts into the run's, the GC thread
+   told. */
+static void
+ms_worker_leave(ms_worker_t *w)
+{
+    oak_mutex_lock(&ms_work_lock);
+    ms_run_pushes += w->pushes;
+    ms_run_words += w->words;
+    w->pushes = 0;
+    w->words = 0;
+    ms_run_left++;
+    oak_cond_broadcast(&ms_run_cv);
+    oak_mutex_unlock(&ms_work_lock);
+}
+
+/* A marker thread: a worker for every run. */
+static void *
+ms_marker_thread_main(void *arg)
+{
+    ms_worker_t *w = (ms_worker_t *)arg;
+    int *idx = (int *)xmalloc(sizeof(int));
+    size_t seen = 0;
+
+    *idx = MS_GC_THREAD_INDEX;
+    oak_tls_set(index_key, idx);
+    oak_thread_index_var = MS_GC_THREAD_INDEX;
+    for (;;) {
+	oak_mutex_lock(&ms_work_lock);
+	while (ms_run_number == seen)
+	    oak_cond_wait(&ms_work_cv, &ms_work_lock);
+	seen = ms_run_number;
+	oak_mutex_unlock(&ms_work_lock);
+	ms_worker_run(w);
+	ms_worker_leave(w);
+    }
+    return NULL;
+}
+
+/* The CPUs this process may run on. */
+static int
+ms_cpu_count(void)
+{
+#ifdef _WIN32
+    SYSTEM_INFO si;
+
+    GetSystemInfo(&si);
+    return si.dwNumberOfProcessors > 0 ? (int)si.dwNumberOfProcessors : 1;
+#else
+    long n;
+#ifdef CPU_COUNT
+    cpu_set_t set;
+
+    if (sched_getaffinity(0, sizeof set, &set) == 0)
+	return CPU_COUNT(&set);
+#endif
+    n = sysconf(_SC_NPROCESSORS_ONLN);
+    return n > 0 ? (int)n : 1;
+#endif
+}
+
+/* The markers, started with the GC thread: ms_markers - 1 threads
+   besides it. */
+static void
+ms_markers_start(void)
+{
+    int n = gc_threads_wanted;
+
+    ms_cpus = ms_cpu_count();
+    if (n <= 0) {
+	n = ms_cpus;
+	if (n > MS_MAX_MARKERS)
+	    n = MS_MAX_MARKERS;
+    }
+    if (n > MAX_THREAD_COUNT)
+	n = MAX_THREAD_COUNT;
+    ms_markers = 1;
+    for (int i = 1; i < n; i++) {
+	oak_thread_t t;
+
+	if (oak_thread_create(&t, ms_marker_thread_main,
+			      &ms_pool_workers[i]) != 0) {
+	    fprintf(stderr, "; MS-GC: cannot start marker thread %d of %d.\n",
+		    i, n - 1);
+	    break;
+	}
+	ms_markers++;
+    }
+    if (trace_gc > 1)
+	fprintf(stderr, "; MS-GC: %d thread%s mark%s.\n", ms_markers,
+		ms_markers == 1 ? "" : "s", ms_markers == 1 ? "s" : "");
+}
+
+/* A run of the trace, by the GC thread: every marker, and whoever
+   joins, until the list is empty and all are idle.  The roots the
+   GC thread marked into its own stack and the packets on the list
+   are the run's start. */
+static void
+ms_trace_parallel(void)
+{
+    gc_ns_t t0 = gc_now();
+
+    ms_spin_ok = ms_markers + oak_live_thread_count() <= ms_cpus;
+    oak_mutex_lock(&ms_work_lock);
+    ms_work_done = false;
+    ms_work_active = ms_markers;
+    ms_run_members = ms_markers;
+    ms_run_left = 0;
+    ms_run_pushes = 0;
+    ms_run_words = 0;
+    ms_run_number++;
+    ms_run_open = true;
+    oak_cond_broadcast(&ms_work_cv);
+    oak_mutex_unlock(&ms_work_lock);
+    /* The mutators parked for want of memory: they help. */
+    oak_mutex_lock(&gc_concurrent_lock);
+    oak_cond_broadcast(&gc_concurrent_done_cv);
+    oak_mutex_unlock(&gc_concurrent_lock);
+
+    ms_worker_run(&ms_pool_workers[0]);
+    ms_worker_leave(&ms_pool_workers[0]);
+
+    oak_mutex_lock(&ms_work_lock);
+    while (ms_run_left < ms_run_members)
+	oak_cond_wait(&ms_run_cv, &ms_work_lock);
+    ms_run_open = false;
+    mark_stack_pushes += ms_run_pushes;
+    marked_words += ms_run_words;
+    if (trace_gc > 2) {
+	fprintf(stderr, "\n; run %zu: %d members, %lu marked, %zu words,"
+		" %lu exports (%lu packets, %lu moved), %lu takes,"
+		" %lu spins, %lu sleeps, %.2f ms\n",
+		ms_run_number, ms_run_members, ms_run_pushes, ms_run_words,
+		ms_dbg_exports, ms_dbg_packets, ms_dbg_moved, ms_dbg_takes,
+		ms_dbg_spins, ms_dbg_sleeps, (double)(gc_now() - t0) / 1e6);
+	ms_dbg_exports = ms_dbg_packets = ms_dbg_moved = ms_dbg_takes =
+	    ms_dbg_spins = ms_dbg_sleeps = 0;
+    }
+    oak_mutex_unlock(&ms_work_lock);
+}
+
+/* A mutator parked for a cycle (ms_wait_cycle): a worker in the run,
+   if one is open.  Returns whether it was. */
+static bool
+ms_help_mark(int idx)
+{
+    ms_worker_t *w = &ms_helper_workers[idx];
+    int saved_crash_recovery;
+
+    oak_mutex_lock(&ms_work_lock);
+    if (!ms_run_open || ms_work_done) {
+	oak_mutex_unlock(&ms_work_lock);
+	return false;
+    }
+    ms_run_members++;
+    ms_work_active++;
+    oak_mutex_unlock(&ms_work_lock);
+    /* As on the GC thread: a bad pointer aborts rather than
+       longjmping into the interpreter. */
+    saved_crash_recovery = crash_recovery_installed;
+    crash_recovery_installed = 0;
+    ms_worker_run(w);
+    crash_recovery_installed = saved_crash_recovery;
+    ms_worker_leave(w);
     return true;
 }
 
+/* Spatic, in ranges, onto the list. */
 static void
-ms_trace_concurrent(void)
+ms_work_put_spatic(void)
 {
-    for (;;) {
-	while (mark_stack_top > 0) {
-	    ref_t *obj = mark_stack_pop();
-	    size_t len = ms_objstart_extent(ms_region_of(obj), obj);
+    for (ref_t *p = spatic.start; p < spatic.end; p += MS_SPATIC_CHUNK) {
+	size_t n = (size_t)(spatic.end - p);
 
-	    marked_words += len;
-	    for (size_t i = 0; i < len; i++) {
-		ref_t val = obj[i];
-		if (val & PTR_MASK)
-		    ms_mark_ref_concurrent(val);
-	    }
-	}
-	/* The stack is empty: the barrier buffers handed over
-	   meanwhile, and whatever they lead to. */
-	if (!ms_satb_drain_concurrent())
-	    break;
+	if (n > MS_SPATIC_CHUNK)
+	    n = MS_SPATIC_CHUNK;
+	ms_work_put(p, n, 0, MS_WORK_RANGE);
     }
 }
 
-/* Spatic, scanned concurrently: any pointer from the world image
-   into the heap is a root.  The mutators write it meanwhile, under
-   the barrier: a word read old was there since the snapshot, and one
-   read new refers to what the snapshot's rules mark anyway, while
-   what was overwritten is in a barrier buffer. */
+/* The GC thread's own sink, for the global roots. */
 static void
-ms_mark_spatic_concurrent(void)
+ms_worker0_sink(int idx, ref_t r)
 {
-    ref_t *p;
-
-    for (p = spatic.start; p < spatic.end; p++) {
-	ref_t r = *p;
-
-	if ((r & PTR_MASK) && !SPATIC_PTR(ANY_TO_PTR(r)))
-	    ms_mark_ref_concurrent(r);
-    }
+    (void)idx;
+    ms_mark_ref_concurrent(&ms_pool_workers[0], r);
 }
 
 #endif /* THREADS */
@@ -2402,20 +2840,15 @@ ms_mark_spatic(void)
 }
 #endif
 
-/* The global registers and tables: roots no thread owns.  Into the
-   mark stack; with threads, by the GC thread, once every thread's
-   stacks are in (they are set at boot and change rarely, and a
-   value set after the snapshot came from a protected source). */
+/* The global registers and tables: roots no thread owns.  To SINK:
+   the mark stack, or with threads the GC thread's own worker, once
+   every thread's stacks are in (they are set at boot and change
+   rarely, and a value set after the snapshot came from a protected
+   source). */
 static void
-ms_mark_global_roots(void)
+ms_mark_global_roots(void (*sink)(int, ref_t))
 {
-    /* Atomically with threads: the mutators set bits meanwhile (born
-       black). */
-#ifdef THREADS
-#define MS_GLOBAL(r) ms_mark_ref_concurrent(r)
-#else
-#define MS_GLOBAL(r) ms_mark_ref(r)
-#endif
+#define MS_GLOBAL(r) (sink)(0, (r))
     MS_GLOBAL(e_nil);
     MS_GLOBAL(e_t);
     MS_GLOBAL(e_boot_code);
@@ -2480,6 +2913,7 @@ ms_scan_thread_roots(int idx, void (*sink)(int, ref_t))
 }
 
 #if !defined(THREADS) || defined(OAK_GC_VERIFY)
+/* The mark stack as a sink. */
 static void
 ms_mark_sink(int idx, ref_t r)
 {
@@ -2493,7 +2927,7 @@ ms_mark_sink(int idx, ref_t r)
 static void
 ms_mark_roots(void)
 {
-    ms_mark_global_roots();
+    ms_mark_global_roots(ms_mark_sink);
 #ifdef THREADS
     for (int i = 0; i < next_index; i++)
 	if (!gc_thread_dead[i])
@@ -2921,7 +3355,9 @@ ms_run_cycle(const char *reason, size_t amount)
     }
 
     ms_clear_marks();
+#if !defined(THREADS) || defined(OAK_GC_VERIFY)
     mark_stack_init();
+#endif
     marked_words = 0;
 #if defined(THREADS) && defined(OAK_GC_VERIFY)
     ms_verify_cycle_begin();
@@ -2981,10 +3417,14 @@ ms_run_cycle(const char *reason, size_t amount)
     rounds++;
     if (trace_gc > 1) { fprintf(stderr, " roots"); fflush(stderr); }
 
-    ms_mark_global_roots();
-    if (trace_gc > 1) { fprintf(stderr, "\n; Concurrent tracing..."); fflush(stderr); }
-    ms_mark_spatic_concurrent();
-    ms_trace_concurrent();
+    ms_mark_global_roots(ms_worker0_sink);
+    if (trace_gc > 1) {
+	fprintf(stderr, "\n; Concurrent tracing, %d thread%s...", ms_markers,
+		ms_markers == 1 ? "" : "s");
+	fflush(stderr);
+    }
+    ms_work_put_spatic();
+    ms_trace_parallel();
 
     /* === Termination: rounds of flushes until one marks nothing. === */
     for (;;) {
@@ -2992,7 +3432,7 @@ ms_run_cycle(const char *reason, size_t amount)
 
 	ms_handshake_round("flush");
 	rounds++;
-	ms_trace_concurrent();
+	ms_trace_parallel();
 	if (mark_stack_pushes == before)
 	    break;
     }
@@ -3065,10 +3505,12 @@ ms_run_cycle(const char *reason, size_t amount)
     gc_phase = GC_PHASE_SWEEP;
 #endif
 
+#if !defined(THREADS) || defined(OAK_GC_VERIFY)
     /* Free the mark stack before sweeping — it's no longer needed. */
     free(mark_stack);
     mark_stack = NULL;
     mark_stack_size = 0;
+#endif
 
 #ifdef THREADS
     /* The waiters' needs, and the eager sweep for them below. */
@@ -3178,6 +3620,7 @@ ms_gc_thread_main(void *arg)
     *idx = MS_GC_THREAD_INDEX;
     oak_tls_set(index_key, idx);
     oak_thread_index_var = MS_GC_THREAD_INDEX;
+    ms_markers_start();
     oak_mutex_lock(&gc_concurrent_lock);
     for (;;) {
 	const char *reason;

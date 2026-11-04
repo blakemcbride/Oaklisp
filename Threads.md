@@ -53,7 +53,7 @@ Key files and `#ifdef THREADS` sections:
 | `data.h` | Per-thread register macros, the per-thread alarm clock in `register_set_t`, `ALLOCATE_PROT` (the TLAB fast path), GC buffer arrays |
 | `loop.c` | Opcodes 67-72, `POLL_GC_SIGNALS()`, the method cache's striped seqlock reads, the NATIVE instruction's hand-over |
 | `gc.c` | `FORTHREADS` macro, per-thread root scanning, the stop-the-world handshake |
-| `gc-ms.c`, `gc-ms.h` | Concurrent mark-sweep: the GC thread and the pacing, the handshake rounds, the region heap and its lookup table, TLABs, SATB barrier buffers, the coalescing sweep, the budget, verify mode |
+| `gc-ms.c`, `gc-ms.h` | Concurrent mark-sweep: the GC thread and the pacing, the handshake rounds, the parallel markers, the region heap and its lookup table, TLABs, SATB barrier buffers, the coalescing sweep, the budget, verify mode |
 | `oaklisp.c`, `embed-native.c` | The two entry points: thread 0 through `oak_thread0_init`, the thread entry (`loop` or the native call driver) |
 | `stacks.c` | Thread index retrieval in `init_stacks()`, a thread's exit on context underflow |
 | `dispatch.h`, `dispatch.c` | `oak_mcache_read`/`oak_mcache_fill`: the operations' method caches under their striped sequence counts, for the interpreter and native code; the global method cache (`gmc_read`/`gmc_write`, an entry under its own sequence count; `oak_gmc_flush`, an epoch bump by CAS) |
@@ -99,8 +99,16 @@ Global shared state:
                                        caches, and the thread's own roots
                                        at its handshake; a full buffer, and
                                        the buffer at every handshake, goes
-                                       to satb_full_list (satb_lock) for
-                                       the marker
+                                       to the markers' work list
+    ms_work_list, ms_work_active,   The markers' work list and the run
+      ms_work_idle, ms_work_done,      (gc-ms.c, "Parallel marking"), under
+      ms_run_*                         ms_work_lock; the list and the idle
+                                       count are also read without it by a
+                                       marker deciding whether to export
+    ms_pool_workers[],              A mark stack per marker thread and
+      ms_helper_workers[]              per parked mutator helping, each
+                                       used by its one thread, in a run it
+                                       joined under ms_work_lock
     wp_table[]                      Cleared after a mark under wp_lock,
                                        readers testing liveness meanwhile
                                        (gc_weak_clearing, ms_weak_alive)
@@ -122,8 +130,11 @@ stacks synchronized), the GC thread does the part itself under
 exits hands its buffer over and is skipped; one created during a
 round joins it.  The barrier logs the value stored, as well as the
 one overwritten, while the storing thread's stacks are unscanned
-(GC.md, "SATB Write Barriers").  The mark ends after a round of
-flushes that marks nothing new; the sweep is lazy, during
+(GC.md, "SATB Write Barriers").  The trace runs in parallel on the
+GC thread and the marker threads it starts (`--gc-threads N`, by
+default one per CPU the process may run on, up to 8), with any
+mutator parked for want of memory helping; the mark ends after a
+round of flushes that marks nothing new; the sweep is lazy, during
 allocation; a cycle is asked for ahead of the budget so that the
 mutators keep allocating through it (GC.md, "Pacing"); the heap grows
 and shrinks by mapping and unmapping regions.  Only a dump's
@@ -345,7 +356,8 @@ Performance
 - **Concurrent GC** (under `USE_MARK_SWEEP + THREADS`): The mark runs
   concurrently with no global pause (each thread scans its own stacks
   at a safepoint of its own, a few microseconds, when the GC thread
-  asks), and sweep runs lazily during allocation.  The heap is
+  asks), traced in parallel by the GC thread and its marker threads,
+  and sweep runs lazily during allocation.  The heap is
   a set of 1 MB regions mapped on demand within a budget (three times
   the live data, never below the configured size, which starts at
   four times the default build's) and unmapped when they sweep empty;
@@ -475,8 +487,7 @@ Not required for the current thread support:
   that incremental
 - **Locks per stream**: `print` to a shared stream from several
   threads without interleaving (only `format` is atomic per call)
-- **Parallel marking**: GCEnhancements.md Phase 6; the GC thread and
-  the pacing (its Phase 3) and the handshakes in place of the pauses
-  (Phase 5) are done
-- **Parallel marking**: Multiple GC worker threads share the mark
-  stack, reducing mark phase latency on multi-core systems
+- **A background sweeper**: the lazy sweep runs in the allocating
+  threads; the GC thread could sweep between cycles instead
+  (GCEnhancements.md Phase 6 left it out: the mutators' slow paths
+  spin on `alloc_lock`, which a sweeper would hold much of the time)

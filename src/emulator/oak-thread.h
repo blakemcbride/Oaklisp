@@ -101,6 +101,10 @@ static __inline void oak_cond_broadcast(oak_cond_t *cv) {
     WakeAllConditionVariable(cv);
 }
 
+static __inline void oak_cond_signal(oak_cond_t *cv) {
+    WakeConditionVariable(cv);
+}
+
 /* Wait at most MS milliseconds: 1 if woken, 0 on timeout. */
 static __inline int oak_cond_timedwait_ms(oak_cond_t *cv, oak_mutex_t *m, long ms) {
     return SleepConditionVariableCS(cv, m, (DWORD)ms) ? 1 : 0;
@@ -243,6 +247,10 @@ static inline void oak_cond_wait(oak_cond_t *cv, oak_mutex_t *m) {
 
 static inline void oak_cond_broadcast(oak_cond_t *cv) {
     pthread_cond_broadcast(cv);
+}
+
+static inline void oak_cond_signal(oak_cond_t *cv) {
+    pthread_cond_signal(cv);
 }
 
 /* Wait at most MS milliseconds: 1 if woken, 0 on timeout. */

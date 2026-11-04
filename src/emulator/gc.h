@@ -58,6 +58,10 @@ extern bool gc_stw;
 extern oak_mutex_t gc_lock;
 #endif
 
+/* --gc-threads (gc-ms.c): threads marking in parallel in the
+   concurrent collector; 0 is the default.  Accepted in every build. */
+extern int gc_threads_wanted;
+
 extern void set_gc_flag (bool flag);
 extern int get_next_index();
 extern void free_registers(void *arg);

@@ -359,26 +359,27 @@ the mark-sweep collector by itself (a bump allocation into a
 thread-local buffer, a sweep that makes one free entry of each run of
 dead objects, a heap of 1 MB regions mapped on demand within a budget
 that starts at four times the default build's, its cycles on a GC
-thread of their own) runs the benchmarks within a few percent of the
-default build's speed, and the thread support (per-thread registers,
+thread of their own, marking in parallel with marker threads where
+there are CPUs, --gc-threads) runs the benchmarks within a few
+percent of the default build's speed, and the thread support (per-thread registers,
 the lock-free allocation fast path, the guarded sections) costs up to
 about 10% on top.  Measured with "make bench" on the same world, FAST
 builds pinned to one core, the GC thread sharing it (ratio of CPU
-time to the default build; the -DTHREADS column from 2026-10-29, its
-code unchanged since):
+time to the default build, 2026-11-04; the -DTHREADS column from
+2026-10-29, its code unchanged since):
 
 	                  -DTHREADS   -DUSE_MARK_SWEEP   both (--enable-threads)
-	tak                  1.15           1.05              1.02
-	fib                  1.10           1.07              1.08
-	bignum               1.18           0.94              0.92
-	sort                 1.10           1.05              1.02
-	cons                 1.30           0.92              0.79
-	strings              1.22           1.14              1.12
-	hash                 1.09           1.09              1.08
-	dispatch             1.06           1.04              1.01
-	eval                 1.17           1.02              1.01
-	format               1.15           1.03              1.05
-	compile              1.22           1.00              1.00
+	tak              1.15           1.02              1.05
+	fib              1.10           1.03              1.11
+	bignum           1.18           0.94              0.92
+	sort             1.10           1.04              1.04
+	cons             1.30           0.87              0.87
+	strings          1.22           1.01              1.00
+	hash             1.09           1.07              1.14
+	dispatch         1.06           1.00              1.05
+	eval             1.17           1.03              1.07
+	format           1.15           1.00              1.07
+	compile          1.22           1.00              1.00
 
 These ratios move with the interpreter's code layout as much as with
 the collector: between the region-heap commit and the one before it,

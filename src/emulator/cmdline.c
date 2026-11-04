@@ -32,6 +32,7 @@
 #include "oak-getopt.h"
 #include "config.h"
 #include "data.h"
+#include "gc.h"
 #include "gc-stats.h"
 #include "xmalloc.h"
 #include "cmdline.h"
@@ -49,6 +50,7 @@ enum {
   DUMP_BASE_ARG,
   PREDUMP_GC_ARG,
   HEAP_ARG,
+  GC_THREADS_ARG,
   VALSIZ_ARG,
   CXTSIZ_ARG,
   MAX_SEG_ARG,
@@ -131,6 +133,10 @@ usage(char *prog)
 	  "\t--trace-gc v         0=quiet, 3=very detailed; default=0\n"
 	  "\t--verbose-gc v       synonym for --trace-gc\n"
 	  "\t--gc-stats           report GC pauses and stalls at exit\n"
+#if defined(THREADS) && defined(USE_MARK_SWEEP)
+	  "\t--gc-threads n       threads marking in parallel; default: the\n"
+	  "\t                      CPUs the process may run on, at most 8\n"
+#endif
 	  "\t--trace-traps        trace tag traps\n"
 	  "\t--batch              disable trapping of SIGINT\n"
 	  "\t--native-module file load a natively compiled module\n"
@@ -266,6 +272,7 @@ parse_cmd_line(int argc, char **argv)
 	{"size-seg-max", required_argument, 0, MAX_SEG_ARG},
 	{"trace-gc", required_argument, 0, VERBOSE_GC_ARG},
 	{"gc-stats", no_argument, &gc_stats_on, true},
+	{"gc-threads", required_argument, 0, GC_THREADS_ARG},
 	{"trace-traps", no_argument, &trace_traps, true},
 	{"batch", no_argument, &batch_mode, true},
 	{"no-line-editing", no_argument, &no_line_editing, true},
@@ -334,6 +341,10 @@ parse_cmd_line(int argc, char **argv)
 
 	case PREDUMP_GC_ARG:
 	  gc_before_dump = atoi(optarg);
+	  break;
+
+	case GC_THREADS_ARG:
+	  gc_threads_wanted = positive_arg(optarg, "--gc-threads");
 	  break;
 
 	case HEAP_ARG:
