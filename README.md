@@ -12,13 +12,9 @@ the Oaklisp dialect of Lisp.  The compiler compiles Oaklisp source
 code into byte-code for the included Oaklisp emulator / virtual
 machine, and, in this repository, into C as well.
 
-This repository is a fork of Oaklisp, located at
-
-*  https://github.com/blakemcbride/Oaklisp
-
-Oaklisp was created by Kevin J. Lang and Barak A. Pearlmutter, who
-have developed and maintained it since 1986.  The original project
-lives at
+This repository is a fork of Oaklisp.  Oaklisp was created by Kevin
+J. Lang and Barak A. Pearlmutter, who have developed and maintained
+it since 1986.  The original project lives at
 
 *  https://github.com/barak/oaklisp
 
