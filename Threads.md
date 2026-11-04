@@ -8,9 +8,10 @@ passes in every configuration, `threads-stress.test`,
 and the concurrent collector passes its verify mode.  Off by default.
 
 Enable with: `./configure --enable-threads`, which builds the emulator
-with OS threads and the concurrent mark-sweep collector they require
-(`-DTHREADS -DUSE_MARK_SWEEP`).  Portable across Linux, macOS and
-Windows (see `Portability.md` and `Windows.md`).
+with OS threads (`-DTHREADS`) and makes the mark-sweep collector, the
+default build's as well (`-DUSE_MARK_SWEEP`), concurrent.  Portable
+across Linux, macOS and Windows (see `Portability.md` and
+`Windows.md`).
 
 Green threads (`delay`, `future`, `process-run-fn`) work in every
 build.  With threads, `--pthreads N` runs the lightweight scheduler
@@ -468,14 +469,14 @@ concurrent cycle for a missed object.
 
 | Config | Flags | Result |
 |--------|-------|--------|
-| 1 | Default (copying GC) | all pass (the thread tests skip) |
-| 2 | `USE_MARK_SWEEP` | all pass (the thread tests skip) |
-| 3 | `THREADS` | all pass |
+| 1 | Copying GC (`--disable-mark-sweep`) | all pass (the thread tests skip) |
+| 2 | `USE_MARK_SWEEP` (the default) | all pass (the thread tests skip) |
+| 3 | `THREADS` (`--enable-threads --disable-mark-sweep`) | all pass |
 | 4 | `THREADS + USE_MARK_SWEEP` (`--enable-threads`) | all pass |
 
-Only configurations 1 and 4 can be configured; 2 and 3 take the flags
-by hand (`CPPFLAGS=-DTHREADS` or `-DUSE_MARK_SWEEP` to configure), and
-run the bytecode tests against a world built elsewhere.
+Every configuration can be configured, and each ran the whole suite
+in a tree of its own, with its own world and native world
+(2026-11-04, GCEnhancements.md Phase 7).
 
 
 Future Enhancements

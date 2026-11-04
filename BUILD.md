@@ -48,8 +48,12 @@ Option                    Default   Description
                                     with a warning, when there is neither
                                     latexmk nor prebuilt/doc)
 --enable-ndebug           yes       High-speed mode (sets -DFAST)
---enable-threads          no        Native threads with concurrent GC
-                                    (not for native code; see below)
+--enable-mark-sweep       yes       The mark-sweep collector on a heap of
+                                    regions (GC.md); --disable-mark-sweep
+                                    builds the copying collector
+--enable-threads          no        Native threads; the mark-sweep
+                                    collector then runs concurrently
+                                    (see Thread Support below)
 --enable-cold-linker      no        Build oak-cold-linker, a C version of
                                     the cold linker (see Bootstrapping)
 --with-instructions-per-ref=N  4/2  16-bit instructions per code ref:
@@ -348,27 +352,30 @@ Thread Support
 
 	./configure --enable-threads
 
-builds the emulator with native (pthread) threads and the concurrent
-mark-sweep collector they require (-DTHREADS -DUSE_MARK_SWEEP), which
-is off by default.  Green threads (DELAY, FUTURE, PROCESS-RUN-FN)
-work without it.  With --pthreads N the interpreter, the bytecode
-compiler and natively compiled code run on N OS threads (several
-compilations can run at once in futures), and make-thread starts OS
-threads of its own; see Threads.md.  Unused, the option costs little:
-the mark-sweep collector by itself (a bump allocation into a
-thread-local buffer, a sweep that makes one free entry of each run of
-dead objects, a heap of 1 MB regions mapped on demand within a budget
-that starts at four times the default build's, its cycles on a GC
-thread of their own, marking in parallel with marker threads where
-there are CPUs, --gc-threads) runs the benchmarks within a few
-percent of the default build's speed, and the thread support (per-thread registers,
-the lock-free allocation fast path, the guarded sections) costs up to
-about 10% on top.  Measured with "make bench" on the same world, FAST
-builds pinned to one core, the GC thread sharing it (ratio of CPU
-time to the default build, 2026-11-04; the -DTHREADS column from
-2026-10-29, its code unchanged since):
+builds the emulator with native (pthread) threads (-DTHREADS), off by
+default, and makes the mark-sweep collector, the default build's as
+well (-DUSE_MARK_SWEEP), concurrent.  Green threads (DELAY, FUTURE,
+PROCESS-RUN-FN) work without it.  With --pthreads N the interpreter,
+the bytecode compiler and natively compiled code run on N OS threads
+(several compilations can run at once in futures), and make-thread
+starts OS threads of its own; see Threads.md.  Unused, the option
+costs little:
+the mark-sweep collector (a bump allocation into a thread-local
+buffer, a sweep that makes one free entry of each run of dead
+objects, a heap of 1 MB regions mapped on demand within a budget that
+starts at four times the copying collector's heap; with threads, its
+cycles on a GC thread of their own, marking in parallel with marker
+threads where there are CPUs, --gc-threads) runs the benchmarks
+within a few percent of the copying collector's speed, and the thread
+support (per-thread registers, the lock-free allocation fast path,
+the guarded sections) costs up to about 10% on top.  Measured with
+"make bench" on the same world, FAST builds pinned to one core, the
+GC thread sharing it (ratio of CPU time to the copying collector's
+build, --disable-mark-sweep, 2026-11-04; the threads-with-copying
+column from 2026-10-29, its code unchanged since):
 
-	                  -DTHREADS   -DUSE_MARK_SWEEP   both (--enable-threads)
+	                  THREADS alone  USE_MARK_SWEEP    both
+	                  (copying)      (the default)     (--enable-threads)
 	tak              1.15           1.02              1.05
 	fib              1.10           1.03              1.11
 	bignum           1.18           0.94              0.92
@@ -393,7 +400,21 @@ and the handshakes' commit moved strings from 1.05 to 1.12 with the
 same count of instructions and branches executed (perf: 5.96 billion
 each) and 23% more branch mispredictions, while most of the others
 moved down.  Take the table as bounds, not as the cost of any one
-feature.
+feature.  Instruction counts, which the layout cannot move (perf
+stat over three repetitions of each benchmark, 2026-11-04), put the
+mark-sweep collector at 0.5 to 4.5% fewer instructions than the
+copying collector on eight of the eleven benchmarks, within 0.4% on
+hash and dispatch, and 1.4% more on eval; its peak memory is 0.5 to
+4 MB more on the small benchmarks (the 4 MB default budget against a
+1 MB heap) and 15% (sort) and 7% (hash) less on the big ones, which
+need no second semispace.  Two configured trees of the same sources
+(./configure against ./configure --disable-mark-sweep, the same day)
+showed the layout's reach: the mark-sweep one ran strings at 1.19x
+and tak, which never allocates, at 1.09x, executing 0.5 to 1% fewer
+instructions and the same branches, with twice the branch
+mispredictions and 1.6 times the instruction-cache misses, nearly
+all of them in the interpreter loop; the hand builds above, the
+same code linked in another order, ran strings at 1.01x.
 
 With threads in use, "tests/bench.sh -p 4" (four copies of tak, each
 on an OS thread, against the same on one thread, wall clock) runs

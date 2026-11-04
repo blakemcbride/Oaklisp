@@ -66,8 +66,21 @@ AM_CONDITIONAL([ENABLE_THREADS], [test x${enable_threads} = xyes])
 # Natively compiled code built outside the emulator's own Makefile
 # (oakc, the native runtime library) must see the same definitions.
 AS_IF([test x${enable_threads} = xyes],
-      [OAKC_THREADS="-DTHREADS -DUSE_MARK_SWEEP"],[OAKC_THREADS=])
+      [OAKC_THREADS="-DTHREADS"],[OAKC_THREADS=])
 AC_SUBST([OAKC_THREADS])
+
+# The collector: the mark-sweep collector on a heap of regions (GC.md),
+# which is the concurrent collector of the threads build, or the
+# copying collector, the original one.
+AC_MSG_CHECKING([enable_mark_sweep])
+AC_ARG_ENABLE([mark-sweep],
+       [AS_HELP_STRING([--disable-mark-sweep],[use the copying garbage collector instead of the mark-sweep collector (default=mark-sweep; with --enable-threads, the copying collector stops every thread for each collection)])],,
+       [enable_mark_sweep=yes])
+AC_MSG_RESULT([$enable_mark_sweep])
+AM_CONDITIONAL([MARK_SWEEP], [test x${enable_mark_sweep} = xyes])
+AS_IF([test x${enable_mark_sweep} = xyes],
+      [OAKC_GC="-DUSE_MARK_SWEEP"],[OAKC_GC=])
+AC_SUBST([OAKC_GC])
 
 AC_MSG_CHECKING([enable_cold_linker])
 AC_ARG_ENABLE([cold-linker],
@@ -281,6 +294,9 @@ AS_CASE([${oak_endian}], [eb],[oak_endian_name=big], [oak_endian_name=little])
 oak_chars_per_word=`expr \( ${oak_word_size} - 2 \) / 8`
 AS_IF([test x${enable_ndebug} = xyes],
       [oak_debug="no, high speed build"],[oak_debug=yes])
+AS_IF([test x${enable_mark_sweep} != xyes],[oak_gc="copying, stop the world"],
+      [test x${enable_threads} = xyes],[oak_gc="mark-sweep, concurrent"],
+      [oak_gc="mark-sweep, stop the world for the mark"])
 AS_IF([test x${enable_docs} != xyes],[oak_docs=no],
       [test x${LATEXMK} != xfalse],[oak_docs="yes, with ${LATEXMK}"],
       [oak_docs="from prebuilt/doc"])
@@ -299,6 +315,7 @@ ${PACKAGE_NAME} ${PACKAGE_VERSION} is configured for ${host}:
   compiler                ${CC} ${CFLAGS}
   debugging code          ${oak_debug}
   native threads          ${enable_threads}
+  garbage collector       ${oak_gc}
   GNU readline            ${have_readline}
   C cold linker           ${enable_cold_linker}
   documentation           ${oak_docs}

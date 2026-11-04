@@ -426,7 +426,7 @@ $(NATDIR)/liboaknat.a: $(NATDIR)/oakworld.bin
 	set -e; cd $(NATDIR); \
 	rm -f liboaknat.a oak-runtime-modules.h modexterns modrefs; \
 	for c in *.c; do \
-	  $(CC) $(CFLAGS) @OAKC_FAST@ @OAKC_THREADS@ -DHAVE_CONFIG_H -DON_STATIC \
+	  $(CC) $(CFLAGS) @OAKC_FAST@ @OAKC_THREADS@ @OAKC_GC@ -DHAVE_CONFIG_H -DON_STATIC \
 	    -I$(abs_top_srcdir)/src/emulator -I$(abs_top_builddir) \
 	    -c -o $${c%.c}.o $$c; \
 	  p=`sed -n 's/^\#define ON_PREFIX[ 	]*//p' $$c`; \

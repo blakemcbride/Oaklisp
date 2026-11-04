@@ -128,6 +128,10 @@ environment and the REPL.
 
 ### Garbage collection
 
+* The mark-sweep collector is the default build's collector as well,
+  its mark a stop-the-world pause without threads; it executes no more
+  instructions than the copying collector on the benchmarks, pauses
+  for less, and `--disable-mark-sweep` builds the copying collector.
 * The mark-sweep collector works on a heap of 1 MB regions mapped on
   demand and unmapped when empty, with no copying fallback; the
   copying collector only compacts the heap for a world dump.

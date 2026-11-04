@@ -67,13 +67,14 @@ you need to compile the source files manually or create a build
 script.  A minimal approach:
 
     cl /O2 /DHAVE_CONFIG_H /I. /I../.. ^
-       /DDEFAULT_WORLD=\"oakworld.bin\" /DFAST ^
+       /DDEFAULT_WORLD=\"oakworld.bin\" /DFAST /DUSE_MARK_SWEEP ^
        cmdline.c data.c gc.c gc-ms.c instr.c loop.c ^
        oaklisp.c signals.c stacks.c threads.c timers.c ^
        weak.c worldio.c xmalloc.c ^
        /Fe:oaklisp.exe
 
-For threaded builds, add `/DTHREADS /DUSE_MARK_SWEEP`.
+For threaded builds, add `/DTHREADS`; for the copying collector
+instead of the mark-sweep one, leave out `/DUSE_MARK_SWEEP`.
 
 For oak-cold-linker:
 

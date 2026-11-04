@@ -18,40 +18,38 @@ flags:
 
 | Flag | Default | Effect |
 |------|---------|--------|
-| `USE_MARK_SWEEP` | off | Enable the mark-sweep GC for normal collections |
+| `USE_MARK_SWEEP` | on | The mark-sweep collector for normal collections (configure's default; `--disable-mark-sweep` leaves it out) |
 | `THREADS` | off | Enable pthread-based multi-threading |
 
 The four resulting configurations:
 
 | # | Flags | Primary GC | Allocation | Threading |
 |---|-------|-----------|------------|-----------|
-| 1 | (none) | Copying | Bump pointer | Single |
-| 2 | `USE_MARK_SWEEP` | Mark-sweep (STW) | TLAB + free list + bump | Single |
-| 3 | `THREADS` | Copying | Bump pointer + `alloc_lock` | Multi |
-| 4 | `USE_MARK_SWEEP + THREADS` | Mark-sweep (concurrent) | TLABs + free list + bump | Multi |
+| 1 | (none): `--disable-mark-sweep` | Copying | Bump pointer | Single |
+| 2 | `USE_MARK_SWEEP`: the default | Mark-sweep (STW) | TLAB + free list + bump | Single |
+| 3 | `THREADS`: `--enable-threads --disable-mark-sweep` | Copying | Bump pointer + `alloc_lock` | Multi |
+| 4 | `USE_MARK_SWEEP + THREADS`: `--enable-threads` | Mark-sweep (concurrent) | TLABs + free list + bump | Multi |
 
 How to build each:
 
 ```sh
-# After ./configure:
+# Config 1: Copying GC, single-threaded
+./configure --disable-mark-sweep
 
-# Config 1: Default (copying GC, single-threaded)
-make
-
-# Config 2: Mark-sweep, single-threaded
-make CPPFLAGS="-DUSE_MARK_SWEEP"
+# Config 2: Default (mark-sweep, single-threaded)
+./configure
 
 # Config 3: Copying GC, multi-threaded
-make CPPFLAGS="-DTHREADS"
+./configure --enable-threads --disable-mark-sweep
 
 # Config 4: Concurrent mark-sweep, multi-threaded
 ./configure --enable-threads
 make
 ```
 
-`--enable-threads` gives config 4; configs 2 and 3 have no configure
-option and need the flags passed by hand.  All four pass the test
-suite (see Threads.md, Testing).  Adding `-DOAK_GC_VERIFY` to a
+`--enable-threads` gives config 4 and `--disable-mark-sweep` config 1
+(the two together config 3).  All four pass the test suite (see
+Threads.md, Testing).  Adding `-DOAK_GC_VERIFY` to a
 threads build makes every concurrent mark-sweep cycle check itself:
 see "Verify mode" below.
 
@@ -96,9 +94,10 @@ These emulator command-line flags affect GC behavior:
 | `--gc-threads N` | the CPUs, at most 8 | threads marking in parallel in the concurrent collector (the GC thread and N-1 markers; "Phase 3: Concurrent Mark"); the default is the CPUs the process may run on (its affinity mask), capped |
 | `--predump-gc B` | 1 | Run GC before world dump: 0=no, 1=yes |
 
-The default heap is 128 kilo-refs = 128K × 8 bytes = 1 MB on 64-bit
-systems.  This is sufficient for most interactive use and compilation
-of individual `.oak` files.
+The default heap is 512 kilo-refs = 512K × 8 bytes = 4 MB on 64-bit
+systems, a budget the mark-sweep heap is mapped up to as needed
+(128K, 1 MB, with the copying collector).  This is sufficient for
+most interactive use and compilation of individual `.oak` files.
 
 The `OAKWORLD` environment variable sets the default world file path.
 `OAKLISP_OPTIONS` holds emulator options as they would be written
@@ -159,7 +158,8 @@ so the next collection allocates a larger new space.  The mark-sweep
 collector applies the same rule to its *budget* after a cycle
 (`ms_set_budget`, from the words its mark traced), and maps regions up
 to it (Heap Layout, below); its heap also starts four times bigger
-(`DEFAULT_NEWSPACE`, 512K words), since every cycle scans spatic and
+(`DEFAULT_NEWSPACE`, 512K words against the copying collector's
+128K), since every cycle scans spatic and
 the roots and marks the live data whatever the heap size.  An optional
 `MAX_NEW_SPACE_SIZE` compile-time cap limits both.
 
@@ -226,7 +226,8 @@ A non-moving mark-sweep collector.  Objects are never relocated, which
 means locatives and raw code pointers require no fixup — a prerequisite
 for concurrent collection.
 
-Enabled by defining `USE_MARK_SWEEP` at compile time.
+Enabled by defining `USE_MARK_SWEEP` at compile time: configure's
+default, left out by `--disable-mark-sweep`.
 
 
 Heap Layout
@@ -1092,8 +1093,9 @@ commits earlier the two pauses, scanning the stacks only, were 0.17
 ms on hash and 0.01 to 0.06 elsewhere, and three commits earlier,
 with the spatic scan, the barrier drain and the weak table inside
 them, 1.1 and 0.21 to 0.43.  In config 2 the pause is the stop-the-world
-mark of the live data, which is why hash and eval pause 1.0 to 4.8
-ms there (Phase 7 of GCEnhancements.md is about that build).  In
+mark of the live data, which is why hash and eval pause 1.0 to 5.4
+ms there, against the copying collector's 1.0 to 6.5 (config 2 is
+the default build since Phase 7 of GCEnhancements.md).  In
 `gc-stress.oak` on four threads (config 4, `--size-heap 256`, 24
 cycles in 0.65 s, pinned to eight P-core threads, 2026-11-04) no
 thread stopped another: each thread's root scan took at most 0.03 ms
@@ -1112,7 +1114,7 @@ thread's own time per run, stalling nobody, was 30 to 36 ms with one
 marker and 13 to 14 with four (the longest cycle 3.6 to 5.3 ms down
 to 1.3 to 2.5); on the 13-million-word heap of "Phase 3" the mark
 took 33 ms with one marker and 9 with eight.  The same
-program in the default build (95 copying collections) paused at most
+program in config 1, copying (95 collections), paused at most
 1.2 ms, p50 0.47, 3.0% of the run, and in config 2 (141 cycles) at
 most 0.70 ms, p50 0.36, 2.7%.  Four copies of tak on four OS threads
 (`tests/bench.sh -p 4`, config 4) ran 3.95 times faster than on one,
@@ -1229,7 +1231,7 @@ These are compile-time constants in the header files:
 
 | Constant | Value | File | Description |
 |----------|-------|------|-------------|
-| `DEFAULT_NEWSPACE` | 128 (512 with mark-sweep) | `data.h` | Default heap size in kilo-refs; the mark-sweep budget's floor |
+| `DEFAULT_NEWSPACE` | 512 (128 with the copying collector) | `data.h` | Default heap size in kilo-refs; the mark-sweep budget's floor |
 | `RECLAIM_FACTOR` | 3 | `gc.c` | Copying GC target: live data should be < 1/3 of heap |
 | `MS_RECLAIM_FACTOR` | 3 | `gc-ms.c` | The mark-sweep budget: three times the live data |
 | `MS_REGION_LOG2_BYTES` | 20 | `gc-ms.h` | A chunk is 1 MB; regions are spans of chunks |
@@ -1258,18 +1260,28 @@ make CPPFLAGS="-DUSE_MARK_SWEEP -DMAX_NEW_SPACE_SIZE=16000000"
 Recommendations
 ===============
 
-**For single-threaded use:**  The default build (Config 1, copying GC).
+**For single-threaded use:**  The default build (Config 2, the
+mark-sweep collector with a stop-the-world mark; "Phase 7" in
+GCEnhancements.md has the decision).  It executes within 1.4% of the
+copying collector's instructions on every benchmark, fewer on most,
+its pauses are the marks, shorter than the copying collections on
+every benchmark but eval (hash: at most 5.4 ms against 6.5), and its
+heap is mapped on demand, with no second semispace: on the small
+benchmarks it takes 0.5 to 4 MB more (the 4 MB default budget), on
+sort and hash 15% and 7% less.  Config 1 (`--disable-mark-sweep`) is
+the copying collector, as before.
 
 **For multi-threaded use:**  Config 4 (`THREADS + USE_MARK_SWEEP`) is
 strongly recommended.  The concurrent mark-sweep collector stops no
 thread for another (a thread's one stop is the scan of its own
 stacks, microseconds; the sweep is lazy), and TLABs eliminate
 allocation lock contention for the common case.
-Config 3 (`THREADS` alone) has longer pauses (every collection is a
-stop-the-world copy) and all allocations contend on `alloc_lock`.
+Config 3 (`--enable-threads --disable-mark-sweep`) has longer pauses
+(every collection is a stop-the-world copy) and all allocations
+contend on `alloc_lock`.
 
-**Heap sizing:**  The default 128K refs (1 MB; 512K, 4 MB, with
-mark-sweep) is adequate for interactive use.  For compiling large
+**Heap sizing:**  The default 512K refs (4 MB; 128K, 1 MB, with the
+copying collector) is adequate for interactive use.  For compiling large
 files or running allocation-heavy programs, 1024-4096K (8-32 MB) is
 recommended.  The GC automatically expands the heap when needed, but
 starting larger avoids unnecessary early collections; with mark-sweep

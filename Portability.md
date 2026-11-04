@@ -141,7 +141,8 @@ Their users:
 - `configure.ac` — `__WORDSIZE` fallback, stdatomic.h/windows.h
   detection, graceful pthread handling
 - `src/emulator/Makefile.am` — the headers in the source list;
-  USE_MARK_SWEEP turned on with THREADS
+  THREADS and USE_MARK_SWEEP from configure (`--enable-threads`,
+  `--disable-mark-sweep`)
 - `src/emulator/data.h` — no `<pthread.h>`, standard integer types,
   guarded `<unistd.h>`, ALLOCATE_PROT macros on the portable layer
 - `src/emulator/threads.h`, `threads.c` — thread types and calls
