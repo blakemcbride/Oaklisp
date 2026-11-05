@@ -152,6 +152,16 @@
 		    (v (false-if-exception (string->number s r))))
 	       (if (and v (inexact? v)) (retry) (list s r)))))
 	 (lambda (s r) (false-if-exception (string->number s r))))
+   ;; Decimals, exactly: Guile reads #e1.5 as 3/2.
+   (list 'parse-decimal
+	 (lambda ()
+	   (let* ((w (number->string (abs (rand-int))))
+		  (f (string-append (make-string (rnd 3) #\0)
+				    (number->string (rnd (expt 10 (rnd 30))))))
+		  (s (string-append (pick '("" "-" "+"))
+				    (if (zero? (rnd 4)) "" w) "." f)))
+	     (list s)))
+	 (lambda (s) (string->number (string-append "#e" s))))
    (list 'read-datum
 	 (lambda ()
 	   (let* ((x (rand-rat))

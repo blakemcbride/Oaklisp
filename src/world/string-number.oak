@@ -20,7 +20,9 @@
 ;;; (STRING->NUMBER STRING [RADIX]): the number STRING spells in RADIX
 ;;; (default 10), or #f if it spells none.  Accepted: the #b #o #d #x
 ;;; radix prefixes, the #e #i exactness prefixes (every number here is
-;;; exact, so they change nothing), a sign, and an integer or a ratio.
+;;; exact, so they change nothing), a sign, and an integer, a ratio, or
+;;; a decimal, read exactly as the reader reads one: digits in RADIX on
+;;; either side of the point, not both sides empty, so 1.5 is 3/2.
 
 (define (%string->number str radix)
   (let ((end (length str)))
@@ -48,7 +50,15 @@
 		   (let ((num (digits i k radix))
 			 (den (digits (+ k 1) j radix)))
 		     (and num den (not (zero? den)) (/ num den))))
+		  ((eq? (nth str k) #\.) (decimal i k j radix))
 		  (else (look (+ k 1))))))
+
+	 ((decimal i k j radix)
+	  ;; The point is at K.
+	  (let ((whole (if (= i k) 0 (digits i k radix)))
+		(frac (if (= (+ k 1) j) 0 (digits (+ k 1) j radix))))
+	    (and whole frac (or (< i k) (< (+ k 1) j))
+		 (+ whole (/ frac (expt radix (- j k 1)))))))
 
 	 ((signed i j radix)
 	  (cond ((= i j) #f)

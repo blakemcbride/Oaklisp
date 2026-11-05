@@ -42,6 +42,10 @@
 	(cons 'read-radix (lambda (s r) (string->number s r)))
 	(cons 'read-prefixed (lambda (s) (string->number s)))
 	(cons 'parse-junk (lambda (s r) (string->number s r)))
+	(cons 'parse-decimal
+	      (lambda (s)
+		(let ((n (string->number s)))
+		  (and (= n (read (make string-input-stream s))) n))))
 	(cons 'read-datum (lambda (s) (read (make string-input-stream s))))))
 
 ;;; The same answer, in the same form.

@@ -256,6 +256,21 @@
 		   (= (- q) (read-string (append "-" s)))
 		   (= q (string->number (append "+" s)))))))
 
+(property "decimals" cases
+	  (lambda () (list (abs (rand-int)) (rand 7) (+ 2 (rand 35)) (pick '("" "-" "+"))))
+	  (lambda (w places r sign)
+	    (let* ((f (rand (expt r places)))
+		   (fs (bind ((#*print-radix r)) (format #f "~A" f)))
+		   (fs (if (zero? places) ""
+			   (append (make-string (- places (length fs)) #\0) fs)))
+		   (ws (bind ((#*print-radix r)) (format #f "~A" w)))
+		   (s (append sign (if (and (zero? w) (> places 0) (zero? (rand 2))) "" ws)
+			      "." fs))
+		   (q (+ w (/ f (expt r places))))
+		   (q (if (equal? sign "-") (- q) q)))
+	      (and (= q (string->number s r))
+		   (= q (bind ((#*input-base r)) (read-string s)))))))
+
 ;;;; Printing and reading data.
 
 (define (rand-char) (%fixnum->character (rand 256)))
