@@ -1059,7 +1059,7 @@
 	(string=? name "...")
 	(let ((c (string-ref name 0)))
 	  (or (not (eq? (oak-char-syntax c) 'constituent))
-	      (if (char=? c #\-)
+	      (if (memv c '(#\- #\+))
 		  (n1 1)
 		  (n1.5 0 c)))))))
 

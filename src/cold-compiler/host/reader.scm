@@ -136,10 +136,11 @@
 	  (else (string->symbol str)))))
 
 (define (oak-parse-number str base)
-  ;; ['-']<digit>+['/'<digit>+]  |  ['-']<digit>+'.'<digit>*  |  ['-']'.'<digit>+
+  ;; [sign]<digit>+['/'<digit>+]  |  [sign]<digit>+'.'<digit>*  |  [sign]'.'<digit>+
+  ;; with the sign '-' or '+'
   (let* ((len (string-length str))
 	 (neg? (and (> len 0) (char=? (string-ref str 0) #\-)))
-	 (start (if neg? 1 0)))
+	 (start (if (and (> len 0) (memv (string-ref str 0) '(#\- #\+))) 1 0)))
     (define (digits from to)
       ;; value of digits str[from,to) or #f if any isn't a digit or empty
       (and (< from to)

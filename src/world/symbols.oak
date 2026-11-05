@@ -122,11 +122,12 @@
 ;;;
 ;;; Only the last condition is hairy.  We use a DFA, with states:
 ;;;        --n1--  --n2--        --n3--   --n4--
-;;;  ['-'] <digit> <digit>* ['/' <digit> <digit>*]
-;;;  ['-'] <digit> <digit>* ['.'         <digit>*]
-;;;  ['-']                   '.' <digit> <digit>*
-;;; The initial '-' doesn't get a state because it's handled (along with
-;;; initial non-terminating macro chars) by some prologue code.
+;;;  [sign] <digit> <digit>* ['/' <digit> <digit>*]
+;;;  [sign] <digit> <digit>* ['.'         <digit>*]
+;;;  [sign]                   '.' <digit> <digit>*
+;;; The initial sign, '-' or '+', doesn't get a state because it's
+;;; handled (along with initial non-terminating macro chars) by some
+;;; prologue code.
 
 (add-method (requires-slashification? (symbol print-name) self)
   ;; It is somewhat unfortunate that || |.| and |...| get interned because
@@ -217,7 +218,7 @@
 	  (let* ((c (nth print-name 0))
 		 (c-syntax (nth standard-read-table c)))
 	    (or (not (eq? c-syntax 'constituent))
-		(if (eq? c #\-)
+		(if (or (eq? c #\-) (eq? c #\+))
 		    (n1 1)
 		    (n1.5 0 c c-syntax))))))))
 

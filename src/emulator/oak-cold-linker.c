@@ -361,9 +361,11 @@ static sexp_t *parse_atom(parser_t *p, int first_char)
 
 #undef ATOM_PUSH
 
-    /* Try to parse as integer.  An escaped token is always a symbol. */
+    /* Try to parse as integer, with the reader's optional sign, '-' or
+       '+'.  An escaped token is always a symbol. */
     if (!escaped &&
-        ((buf[0] == '-' && len > 1 && isdigit((unsigned char)buf[1])) ||
+        (((buf[0] == '-' || buf[0] == '+') && len > 1
+          && isdigit((unsigned char)buf[1])) ||
          isdigit((unsigned char)buf[0]))) {
         char *end;
         long long val;

@@ -249,6 +249,13 @@
 			     (bind ((#*print-radix (cdr p))) (format #f "~A" q)))))
 	      (and (= q (string->number s)) (= q (read-string s))))))
 
+(property "a leading sign reads" cases (lambda () (list (abs (rand-rat))))
+	  (lambda (q)
+	    (let ((s (format #f "~A" q)))
+	      (and (= q (read-string (append "+" s)))
+		   (= (- q) (read-string (append "-" s)))
+		   (= q (string->number (append "+" s)))))))
+
 ;;;; Printing and reading data.
 
 (define (rand-char) (%fixnum->character (rand 256)))

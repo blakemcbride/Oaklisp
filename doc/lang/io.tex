@@ -199,7 +199,12 @@ Analogous constructors can be added with the settable operation
 \df{hash-bracket-option}.
 
 \fv{input-base}
-\doc{The radix in which numbers will be read.}
+\doc{The radix in which numbers will be read.  A token is read as a
+number when it is an optional sign, \texttt{-} or \texttt{+}, and
+digits in this radix, a ratio such as \texttt{-3/4}, or digits with a
+decimal point, read exactly (\texttt{1.5} is \texttt{3/2}).  So
+\texttt{+5} is the number 5, and a symbol of that name prints as
+\texttt{|+5|}.}
 
 \fv{features}
 \doc{A list of ``features'' present in the current implementation,
