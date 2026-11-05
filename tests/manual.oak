@@ -1,0 +1,139 @@
+;;; The examples of the manuals (doc/lang, doc/summary), each checked
+;;; against the result the manual states.  Run in user-locale, where
+;;; the manuals' readers start.  modes.test runs it in every mode.
+
+(define (check name got expected)
+  (if (equal? got expected)
+      (format #t "PASS ~A~%" name)
+      (format #t "FAIL ~A: got ~S expected ~S~%" name got expected))
+  (flush standard-output))
+
+;;; LOAD binds these to abbreviate its progress reports; not wanted here.
+(set! #*print-length #f)
+(set! #*print-level #f)
+
+;; Language manual: types.
+(check "coercer string" ((coercer string) '(#\f #\o #\o)) "foo")
+(check "coerce to own type" (let ((s "abc")) (eq? ((coercer string) s) s)) #t)
+(check "is-a? object" (list (is-a? 3 object) (is-a? "x" object) (is-a? '() object)) '(#t #t #t))
+(check "nil is not 'nil" (eq? nil 'nil) #f)
+(check "() is #f" (eq? '() #f) #t)
+
+;; Sequences.
+(check "last-pair" (list (last-pair '(a b c)) (last-pair '(a b c . d))) '((c) (c . d)))
+(check "append dotted" (append '(1 2) 3) '(1 2 . 3))
+(check "destructure"
+       (let ((x '(1 (2) 3 4)))
+	 (destructure (a (b) . c) x (list a b c)))
+       '(1 2 (3 4)))
+
+;; Side effects and locatives.
+(define foo (list 'a 'b))
+(set! (car foo) 'bar)
+(check "set! car" foo '(bar b))
+(set! (contents (make-locative (car foo))) 'baz)
+(check "set! contents of locative" foo '(baz b))
+
+;; Delays.
+(check "delay forced by +" (+ 2 (delay 3)) 5)
+
+;; Fluids.
+(set! (fluid manual-fluid) 1)
+(check "set! fluid" (fluid manual-fluid) 1)
+(check "bind fluid" (bind ((#*manual-fluid 2)) (fluid manual-fluid)) 2)
+
+;; Methods.
+(define-instance cons-1 operation)
+(add-method (cons-1 x) (cons x 1))
+(check "method on object" (list (cons-1 'a) (cons-1 2)) '((a . 1) (2 . 1)))
+(define-instance dog type '() (list object))
+(define-instance stupid-dog type '() (list dog))
+(define-instance see-stranger operation)
+(add-method (see-stranger (dog) self stranger) 3)
+(add-method (see-stranger (stupid-dog) self stranger)
+  (+ (^super dog see-stranger self stranger)
+     (^super dog see-stranger self stranger)))
+(check "^super" (list (see-stranger (make dog) 'x) (see-stranger (make stupid-dog) 'x)) '(3 6))
+(define (rest-user a . rest) (list a (rest-length rest)))
+(check "rest-length" (rest-user 1 2 3) '(1 2))
+
+;; Numbers.
+(check "n-ary <" (list (< 1 2 3) (< 1 3 2)) '(#t #f))
+(check "truncate" (map truncate '(7/2 -7/2)) '(3 -3))
+(check "truncate as the manual defines it"
+       (map (lambda (x) (if (negative? x) (ceiling x) (floor x))) '(7/2 -7/2))
+       '(3 -3))
+(check "fraction display styles"
+       (map (lambda (style)
+	      (bind ((#*fraction-display-style style)) (format #f "~A" (/ -5 3))))
+	    '(normal fancy float))
+       '("-5/3" "-1 2/3" "-1.6666666666"))	; the manual sets the space as a dot
+
+;; Delays print as forcible-print-magic says; the default is transparent.
+(let ((d (delay 'foo)))
+  (check "delay printed transparently" (format #f "~A" d) "FOO")
+  (check "delay printed plainly"
+	 (subseq (bind ((#*forcible-print-magic #f)) (format #f "~A" d)) 0 8)
+	 "#<DELAY ")
+  (check "delay printed indicated"
+	 (subseq (bind ((#*forcible-print-magic 'indicate)) (format #f "~A" d)) 0 12)
+	 "#[DELAY FOO "))
+
+;; Threads chapter: the atomic operations on a cell.
+(define cell (list 5))
+(check "compare-and-swap hit" (list (compare-and-swap (make-locative (car cell)) 5 6) cell) '(5 (6)))
+(check "compare-and-swap miss" (list (compare-and-swap (make-locative (car cell)) 5 7) cell) '(6 (6)))
+(check "fetch-and-add" (list (fetch-and-add (make-locative (car cell)) 10) cell) '(6 (16)))
+
+;; The summary: macros.  A DEFINE-SYNTAX macro takes effect once its
+;; file is loaded, so modes.test checks ADD from the file after this.
+(define-syntax (add a b)
+  `(+ ,a ,b))
+(check "gensym" (symbol? (gensym 'tmp)) #t)
+
+;; Named let.
+(let loop ((v 0))
+  (if (!= v 10)
+      (block
+       (print v standard-output)
+       (newline standard-output)
+       (loop (1+ v)))))
+
+;; Printing.
+(check "format #f" (format #f "~A and ~S" 'x "y") "X and \"y\"")
+
+;; Locales.
+(define my-locale (make locale (list system-locale)))
+(check "eval in a locale" (eval '(+ 1 2) my-locale) 3)
+
+;; Types, instance variables, methods.
+(define MyClass (make Type '(iv1 iv2) (list Object)))
+(define i1 (make MyClass))
+(define-instance imSet-iv1 operation)
+(add-method (imSet-iv1 (MyClass iv1) self a)
+	    (set! iv1 a))
+(define-instance imGet-iv1 operation)
+(add-method (imGet-iv1 (MyClass iv1) self)
+	    iv1)
+(imSet-iv1 i1 33)
+(check "instance variable" (imGet-iv1 i1) 33)
+(add-method (initialize (MyClass iv1 iv2) self arg1)
+  (set! iv1 arg1)
+  (set! iv2 44)
+  self)
+(define-instance imGet-iv2 operation)
+(add-method (imGet-iv2 (MyClass iv2) self) iv2)
+(define i2 (make MyClass 88))
+(check "initialize" (list (imGet-iv1 i2) (imGet-iv2 i2)) '(88 44))
+
+;; Class variables, through a metatype.
+(define metaMyClass2 (make Type '(cv1 cv2) (list Type)))
+(define MyClass2 (make metaMyClass2 '(iv1 iv2) (list Object)))
+(define-instance cmSet-cv1 operation)
+(add-method (cmSet-cv1 (metaMyClass2 cv1) self a)
+	    (set! cv1 a))
+(define-instance cmGet-cv1 operation)
+(add-method (cmGet-cv1 (metaMyClass2 cv1) self)
+	    cv1)
+(cmSet-cv1 MyClass2 33)
+(check "class variable" (cmGet-cv1 MyClass2) 33)

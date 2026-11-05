@@ -94,11 +94,11 @@ Targets: `build-from-old-world` (compile and `tool.oak`-link with `$(OAKLISP)` =
 - **Guile**: `src/cold-compiler/oak-bootstrap.scm` compiles everything in one run (`guile.stamp`); it hosts the world's own compiler, so output is byte-identical. It has `--target`, `--load`, `--eval`. It cannot run `instruction-table.oak`'s `dump-instruction-table`, so `src/emulator/instr-data.c` (debugging builds only) comes from the world just built, an old world, or `prebuilt/`; `make dist` ships it.
 - **Cold link**: `tool.oak`, in the old world or under Guile; both produce byte-identical `.cold` files (symbols laid out in first-seen order).
 
-The compiler reaches a fixpoint: `make check` runs `check-fixpoint`, `check-cold-linkers`, `check-guile-compile` in `src/world`.
+The compiler reaches a fixpoint: `make check` runs `check-fixpoint`, `check-native-fixpoint`, `check-threaded-fixpoint`, `check-executable-fixpoint` (the compiler as an oakc executable, `compile-main.oak`: straight C, or with `--interpreter` for a source with `local-syntax`, whose expander the compiler evaluates), `check-cold-linkers`, `check-guile-compile` in `src/world`.
 
 ### Tests and benchmarks
 
-`make check` runs `tests/*.test` (automake test driver; logs in `tests/*.log`). Test programs `tests/*.oak` print `PASS`/`FAIL` lines; `tests/testlib.sh` has the helpers. `make bench` runs `tests/bench.sh` (`-r N`, `-o file`, `-c old new`; `-n` compiles the benchmarks natively, `-x` builds them as stand-alone executables with oakc, `-w` as whole-program executables, so all four compare: bytecode, mixed native, separate and whole-program compilation; every run reports its GC pauses and stalls with `--gc-stats`, and the longest and the p99 stop of one thread are columns of the table). `tests/gc-stress.test` is the collectors' load test (GC.md): `gc-stress.oak` on four OS threads under `--size-heap 256`, run as bytecode, mixed native and oakc executables in every mode, then `weak-young.oak` (weak pointers to objects made during a mark, held only by an old object). Note that `--load` binds `#*print-length`/`#*print-level`; the test programs reset them. `make -C src/world check-native-fixpoint` (run by consistency.test when the native world exists) recompiles every source with the native world's compiler and demands byte-identical objects.
+`make check` runs `tests/*.test` (automake test driver; logs in `tests/*.log`). Test programs `tests/*.oak` print `PASS`/`FAIL` lines; `tests/testlib.sh` has the helpers. `make bench` runs `tests/bench.sh` (`-r N`, `-o file`, `-c old new`; `-n` compiles the benchmarks natively, `-x` builds them as stand-alone executables with oakc, `-w` as whole-program executables, so all four compare: bytecode, mixed native, separate and whole-program compilation; every run reports its GC pauses and stalls with `--gc-stats`, and the longest and the p99 stop of one thread are columns of the table). `tests/gc-stress.test` is the collectors' load test (GC.md): `gc-stress.oak` on four OS threads under `--size-heap 256`, run as bytecode, mixed native and oakc executables in every mode, then `weak-young.oak` (weak pointers to objects made during a mark, held only by an old object). `tests/modes.test` is differential testing: the examples (doc/examples, src/misc, tak and prolog), the manuals' examples (`tests/manual.oak`, each checked against the result the manual states) and the test programs not otherwise built as executables run as bytecode, mixed native and oakc executables (separate, `-w`, `--ir`), and every mode must print what the bytecode prints, which must report no failure. Note that `--load` binds `#*print-length`/`#*print-level`; the test programs reset them. `make -C src/world check-native-fixpoint` (run by consistency.test when the native world exists) recompiles every source with the native world's compiler and demands byte-identical objects.
 
 `make prebuilt` refreshes `prebuilt/` (bytecode as `bc2-32` or `bc4-64` per this system's packing, this machine's world, instr-data.c, PDFs).
 
@@ -318,7 +318,8 @@ of `oak-native.h`.
   share one name space in the emulator.
 - Tests: `native.test`; `native-parity.test` compiles every
   `tests/*.oak` both ways and compares the output; `standalone.test`
-  builds and runs stand-alone executables.
+  builds and runs stand-alone executables; `modes.test` runs the
+  examples in every mode and compares them with the bytecode.
 - With `--enable-threads` too: generated code and the helpers reach
   their thread's registers and stacks through `oak_thread_index_var`
   (`my_index` in oak-native.h), every heap store is an `ON_STORE`
@@ -353,7 +354,10 @@ runtime: `make -C src/world native-world` first.
   an instruction without a C translation is an error; there are none
   left - the full instruction set is translated, `native-ops.c`
   holding the C of the big ones and `dispatch.c` the method search,
-  both shared with the interpreter).
+  both shared with the interpreter), with the sources before it
+  loaded, as `--load` in order would leave them, so their macros (and
+  the functions those call) expand in it; their top-level code runs
+  at build time.
 - At build time `bake-file` (load-file.oak) links each compiled file
   into the native world without running it, collecting one operation
   per file in `*baked-program*`, and the world is dumped; the
@@ -361,7 +365,9 @@ runtime: `make -C src/world native-world` first.
   `oak_main_native` (embed-native.c), whose engine is the native call
   driver `oak_native_run` (native-ops.c) - a small funcall/trap/signal
   dispatcher, not an interpreter.  At run time `(run-baked-program)`
-  runs the files in order.
+  makes the program's locale current (`*baked-locale*`, which
+  `bake-file` records; the image is dumped in system-locale, where the
+  built-in command line can name it) and runs the files in order.
 - Preemption works in compiled code: `ON_PENDING`/`ON_POLL`
   (oak-native.h) count the shared alarm clock (`oak_timer_*`, data.c)
   that ENABLE-ALARMS drives, and the driver (and the emulator's NATIVE
@@ -397,7 +403,11 @@ runtime: `make -C src/world native-world` first.
   only on world bindings the program never defines, assigns or passes
   around go in an early prelude baked before the program, so its
   top-level code takes the guards; the rest in the prelude baked
-  after it.  Redefinition misses the guards and falls back.  Small single-definition never-assigned functions
+  after it.  The preludes are baked by `bake-prelude`: their cells are
+  made in the program's locale, and they link in a locale inheriting
+  that one and system-locale, since they name system helpers
+  (`%native-method-for`) a program in user-locale cannot see.
+  Redefinition misses the guards and falls back.  Small single-definition never-assigned functions
   inline across files (their bodies travel in the `.ois`); the
   abstract-stack inference drops tag checks on proven operands,
   cross-file via the summaries' result types, and fuses a comparison

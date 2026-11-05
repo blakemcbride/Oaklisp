@@ -115,7 +115,17 @@
 	   (op (car sig))
 	   (cdr-info (cdr sig))
 	   (bit (and (pair? cdr-info) (oak-list? (car cdr-info))))
-	   (type-info (if bit (car cdr-info) (list (bm-quoted-object))))
+	   ;; As macros0.oak: the type itself for an operation made on
+	   ;; the spot (LAMBDA), the global OBJECT for any other.
+	   (type-info (cond (bit (car cdr-info))
+			    ((and (pair? op)
+				  (let ((m (car op)))
+				    (or (eq? m 'MAKE)
+					(and (pair? m) (eq? (car m) 'QUOTE)
+					     (pair? (cdr m))
+					     (eq? (cadr m) (variable-ref *make-cell*))))))
+			     (list (bm-quoted-object)))
+			    (else (list 'OBJECT))))
 	   (args (if bit (cdr cdr-info) cdr-info))
 	   (typ (car type-info))
 	   (ivars (cdr type-info)))

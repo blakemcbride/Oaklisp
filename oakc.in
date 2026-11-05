@@ -35,7 +35,9 @@
 #   --keep           keep the work directory and say where it is
 #
 # The executable is C through and through: each source is compiled to
-# C (strict mode - everything must translate), the program is linked
+# C (strict mode - everything must translate) with the sources before
+# it loaded, so that their macros expand in it (their top-level code
+# runs at build time, as under --load), the program is linked
 # into the native world at build time (bake-file) and the world dumped,
 # and the generated main.c carries that image as data, registers the
 # program's and the runtime's native modules, and enters the native
@@ -115,13 +117,20 @@ test $keep = yes || trap 'rm -rf "$work"' 0
 test $keep = yes && echo "oakc: work directory $work"
 
 # 1. Compile each source to C, strictly: an executable has no emulator
-#    to escape to.  compile_one STEM BASE BINDS runs the compiler with
-#    the given extra fluid bindings; the C compiler never runs in the
-#    emulator (oakc compiles below, with -DON_STATIC).
+#    to escape to.  compile_one STEM BASE BINDS BEFORE runs the
+#    compiler with the given extra fluid bindings, after loading the
+#    sources BEFORE it, as --load in order would leave them: their
+#    macros, and the functions those macros call, are there to expand
+#    this file (their top-level code runs at build time).  The C
+#    compiler never runs in the emulator (oakc compiles below, with
+#    -DON_STATIC).
 compile_one() {
+  loads=
+  for p in $4; do loads="$loads (load \"$p\" $locale)"; done
   "$OAKLISP" --batch $RUNTIME_MODS --world "$WORLD" -- \
     --locale compiler-locale \
     --outdir "$work" \
+    --eval "(block$loads #t)" \
     --eval "(bind ((#*compiler-noisiness 0) (#*native-strict? #t) (#*native-emit-only? #t) $irbind$3) (native-compile-file $locale \"$1\"))" \
     --exit >"$work/$2.compile.log" 2>&1 \
     || { cat "$work/$2.compile.log" >&2; fail "compiling $1 failed"; }
@@ -132,14 +141,16 @@ compile_one() {
 objs=
 prefixes=
 bases=
+before=
 for src in $sources; do
   test -f "$src" || fail "no such file: $src"
   case $src in *.oak) ;; *) fail "$src: sources are .oak files";; esac
   base=$(basename "$src" .oak)
   stem=${src%.oak}
   echo "oakc: compiling $src"
-  compile_one "$stem" "$base" ""
+  compile_one "$stem" "$base" "" "$before"
   bases="$bases $base:$stem"
+  before="$before $src"
 done
 
 # 1b. Whole-program: with every summary in hand, compile everything
@@ -152,17 +163,19 @@ if test $wp = yes; then
   for b in $bases; do
     sumlist="$sumlist \"$work/${b%%:*}\""
   done
+  before=
   for b in $bases; do
     base=${b%%:*}; stem=${b#*:}
     prefix=$(sed -n 's/^;oaklisp-summary prefix=//p' "$work/$base.ois")
     test -n "$prefix" || fail "no prefix in $base.ois"
     echo "oakc: compiling $base.oak (whole program)"
-    compile_one "$stem" "$base" "(#*native-whole-program? #t) (#*native-force-prefix \"$prefix\") (#*native-summaries (native-read-summaries (list $sumlist)))"
+    compile_one "$stem" "$base" "(#*native-whole-program? #t) (#*native-force-prefix \"$prefix\") (#*native-summaries (native-read-summaries (list $sumlist)))" "$before"
+    before="$before $stem.oak"
   done
   cat "$work"/*.needs > "$work/prelude.oak" 2>/dev/null
   if grep -qi '^(define' "$work/prelude.oak"; then
     echo "oakc: compiling the link-time prelude"
-    compile_one "$work/prelude" "prelude" ""
+    compile_one "$work/prelude" "prelude" "" ""
     bases="$bases prelude:$work/prelude"
     sources="$sources $work/prelude.oak"
   fi
@@ -172,7 +185,7 @@ if test $wp = yes; then
   cat "$work"/*.early-needs > "$work/early-prelude.oak" 2>/dev/null
   if grep -qi '^(define' "$work/early-prelude.oak"; then
     echo "oakc: compiling the early link-time prelude"
-    compile_one "$work/early-prelude" "early-prelude" ""
+    compile_one "$work/early-prelude" "early-prelude" "" ""
     bases="$bases early-prelude:$work/early-prelude"
     sources="$work/early-prelude.oak $sources"
   fi
@@ -211,7 +224,11 @@ echo "oakc: baking the world"
 cmd="'$OAKLISP' --batch $RUNTIME_MODS --world '$WORLD' --dump '$work/baked.bin' -- --locale system-locale"
 for src in $sources; do
   base=$(basename "$src" .oak)
-  cmd="$cmd --eval '(bake-file $locale \"$work/$base\")'"
+  case $src in
+    "$work/prelude.oak"|"$work/early-prelude.oak") bake=bake-prelude;;
+    *) bake=bake-file;;
+  esac
+  cmd="$cmd --eval '($bake $locale \"$work/$base\")'"
 done
 if test $strip = yes; then
   # The executable's command line still looks up RUN-BAKED-PROGRAM and
@@ -219,12 +236,12 @@ if test $strip = yes; then
   keepsyms="run-baked-program $(printf '%s\n' "$evals" \
     | tr -c 'A-Za-z0-9%*/+<>=!?^._~-' '\n' \
     | grep -E '^[A-Za-z%*/+<>=!?^._~-]' | sort -u | tr '\n' ' ')"
-  # The locale names go too, so the program's locale is taken first.
-  cmd="$cmd --eval '(let ((l $locale)) (strip-locales (quote ($keepsyms))) (set! #*current-locale l))'"
-else
-  cmd="$cmd --locale $locale"
+  cmd="$cmd --eval '(strip-locales (quote ($keepsyms)))'"
 fi
-# The executable starts in the program's locale.
+# The world is dumped in system-locale, where the executable's command
+# line finds RUN-BAKED-PROGRAM whatever the program's locale; that makes
+# the program's locale, which bake-file recorded, current before it
+# runs the program, so the program and the --eval forms run in it.
 cmd="$cmd --exit"
 eval "$cmd" > "$work/bake.log" 2>&1 || { cat "$work/bake.log" >&2
 					 fail "baking failed"; }

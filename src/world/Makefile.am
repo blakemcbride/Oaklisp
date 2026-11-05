@@ -572,6 +572,48 @@ check-native-fixpoint: $(ALLOAFILES)
 	    exit $$rc ); \
 	fi
 
+# The compiler as a stand-alone executable (oakc, compile-main.oak)
+# recompiles every source to objects byte-identical to the bytecode
+# world's: straight C, the native call driver running the native
+# world's compiler with no interpreter linked in.  A source that
+# defines a macro for its own compilation (LOCAL-SYNTAX) has the
+# compiler evaluate the expander, which needs bytecode ("bytecode
+# reached"); that source is compiled by the --interpreter executable
+# instead, everything native but the evaluation.  Needs "make
+# native-world" first.
+check-executable-fixpoint: $(ALLOAFILES)
+	@if test ! -f $(NATDIR)/liboaknat.a; then \
+	  echo "check-executable-fixpoint: no native runtime (make native-world); skipped"; \
+	else \
+	  rm -rf executable-fixpoint-check && $(MKDIR_P) executable-fixpoint-check && \
+	  cd executable-fixpoint-check && \
+	  for e in c i; do \
+	    case $$e in c) flag=;; i) flag=--interpreter;; esac; \
+	    $(abs_top_builddir)/oakc $$flag $(abs_srcdir)/compile-main.oak \
+	      --eval '(compile-from-argline)' -o compile-$$e > oakc-$$e.log 2>&1 \
+	      || { cat oakc-$$e.log; echo "check-executable-fixpoint: oakc failed"; exit 1; }; \
+	  done; \
+	  rc=0; c=0; i=0; \
+	  for f in $(ALLOAFILES:.oa=); do \
+	    loc=system-locale; \
+	    case " $(COMPFILES:.oa=) " in *" $$f "*) loc=compiler-locale;; esac; \
+	    case $$f in system-version) src=$(abs_builddir)/$$f;; *) src=$(abs_srcdir)/$$f;; esac; \
+	    if OAKWORLD=/nonexistent ./compile-c $$loc $(OAK_BYTECODE_ARCH) . $$src > $$f.log 2>&1; then \
+	      c=`expr $$c + 1`; \
+	    elif grep -q 'bytecode reached' $$f.log \
+	      && OAKWORLD=/nonexistent ./compile-i $$loc $(OAK_BYTECODE_ARCH) . $$src > $$f.log 2>&1; then \
+	      i=`expr $$i + 1`; \
+	    else \
+	      echo "$$f: compile failed (see `pwd`/$$f.log)"; rc=1; continue; \
+	    fi; \
+	    tail -n +2 $$f.oa > cmp1.tmp; tail -n +2 ../$$f.oa > cmp2.tmp; \
+	    cmp -s cmp1.tmp cmp2.tmp \
+	      || { echo "$$f.oa: the compiler executable's object differs"; rc=1; }; \
+	  done; \
+	  test $$rc = 0 && echo "check-executable-fixpoint: the compiler as an executable reproduces the world's objects ($$c in straight C, $$i with --interpreter)."; \
+	  exit $$rc; \
+	fi
+
 # The Guile-hosted compiler must produce the same objects as the
 # native one.  Needs Guile.
 check-guile-compile: oakworld.bin $(ALLOAFILES)
@@ -619,18 +661,18 @@ check-cold-linkers: oakworld.bin new.cold $(TOOLFILES)
 	rm -f linkcheck-*.cold linkcheck-*.sym; \
 	exit $$rc
 
-.PHONY: check-fixpoint check-native-fixpoint check-threaded-fixpoint check-guile-compile \
+.PHONY: check-fixpoint check-native-fixpoint check-threaded-fixpoint check-executable-fixpoint check-guile-compile \
  check-cold-linkers
 
 CLEANFILES = guile.stamp
 
 clean-local: clean-world
 	rm -rf prebuilt-tmp fixpoint-check native-fixpoint-check \
-	  threaded-fixpoint-check guile-check guile-cache
+	  threaded-fixpoint-check executable-fixpoint-check guile-check guile-cache
 
 # Remove the world saved by rebuild-world (kept by "make clean" so
 # that build-from-old-world can be repeated).
 distclean-local:
 	rm -f old-oakworld.bin
 
-EXTRA_DIST = $(ALLOAFILESNONGEN:.oa=.oak) $(GRAVY)
+EXTRA_DIST = $(ALLOAFILESNONGEN:.oa=.oak) $(GRAVY) compile-main.oak

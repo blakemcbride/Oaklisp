@@ -230,10 +230,20 @@
 ;;; without running it, collecting one operation per file, and the
 ;;; world is then dumped into the executable.  At run time its built-in
 ;;; command line calls RUN-BAKED-PROGRAM, which runs them in order.
+;;; The world is dumped in system-locale, where that command line can
+;;; name RUN-BAKED-PROGRAM whatever the program's locale; the program's
+;;; locale, recorded by BAKE-FILE, is made current before the program
+;;; runs, so it and the executable's --eval forms run in it, as they
+;;; would after --locale and --load.
 
 (define *baked-program* '())
+(define *baked-locale* #f)
 
 (define (bake-file the-locale file)
+  (set! *baked-locale* the-locale)
+  (bake-segment the-locale file))
+
+(define (bake-segment the-locale file)
   (let ((seg (with-open-file (s (append file ".oa") in)
 	       ;; The header lines are for the dynamic loader; the
 	       ;; executable's modules are linked in, so skip them.
@@ -253,7 +263,30 @@
 			   %empty-environment)))))
     'baked))
 
+;;; A whole-program executable's link-time preludes (oakc -w) define
+;;; cells the program reads, so the cells must be the program's; but
+;;; they also name the system's own helpers (%NATIVE-METHOD-FOR and
+;;; friends, and the types the guards compare), which the program's
+;;; locale need not see.  So the cells a prelude defines are made in
+;;; the program's locale first (the early prelude is baked before the
+;;; program has made them), and the prelude is linked in a locale
+;;; inheriting the program's and then system-locale.
+
+(define (bake-prelude the-locale file)
+  (with-open-file (s (append file ".oak") in)
+    (iterate aux ()
+      (let ((form (read s)))
+	(unless (eq? form the-eof-token)
+	  (when (and (pair? form) (eq? (car form) 'define)
+		     (pair? (cdr form)) (symbol? (cadr form))
+		     (not (variable? the-locale (cadr form))))
+	    (set! (variable-here? the-locale (cadr form)) #t))
+	  (aux)))))
+  (bake-segment (make locale (list the-locale system-locale)) file))
+
 (define (run-baked-program)
+  (when *baked-locale*
+    (set! #*current-locale *baked-locale*))
   (dolist (op *baked-program*)
     (op)))
 

@@ -1,0 +1,216 @@
+#!/bin/sh
+# Differential testing: one program, every mode, the same output.
+# The example programs (doc/examples, src/misc, src/world's tak and
+# prolog), the manuals' examples (manual.oak) and the test programs
+# that other tests run in fewer modes are each compiled to bytecode,
+# compiled natively (mixed mode), and built by oakc as stand-alone
+# executables: separately compiled, whole-program (-w) and with the
+# C-locals lowering (--ir).  Every mode must print what the bytecode
+# prints, so a difference is a bug in one of them, found without
+# writing down what the right answer is; and the bytecode run must
+# report no failure or error, which is what catches a mistake every
+# mode shares.
+#
+# The native modes are skipped without a C compiler, the executables
+# without the native runtime (make -C src/world native-world), the
+# thread examples without threads.
+. "$(dirname "$0")/testlib.sh"
+OAKC=$top_builddir/oakc
+rm -rf modes && mkdir modes && cd modes || exit 99
+work=$(pwd)
+
+exe=yes
+test -x "$OAKC" && test -f "$top_builddir/src/world/native/liboaknat.a" || exe=no
+native=yes
+threads=no
+case $(oak -- --eval '(print (%threads-enabled?) standard-output)' --exit 2>&1 | tail -c 3) in
+  *T*) threads=yes;;
+esac
+status=0
+programs=0
+
+# What a program prints, less what the loader says about it: the
+# boot banner, the files it loaded and the globals it installed.
+clean() {
+  sed -e 's/^Warm booting \.*//' \
+    | grep -a -v -e '^Loaded ' -e '^Variables installed in ' -e '^$'
+}
+
+# compare NAME MODE: the mode's output against the bytecode's.
+compare() {
+  if cmp -s "$1/bc.out" "$1/$2.out"; then
+    echo "ok $1 $2"
+  else
+    echo "FAIL $1 $2: differs from the bytecode"
+    diff "$1/bc.out" "$1/$2.out" | head -20
+    status=1
+  fi
+}
+
+# compile NAME MODE HOW LOCALE BASE...: compile each file with HOW
+# (compile-file or native-compile-file) in LOCALE, with the ones
+# before it loaded for their macros.  Fails if an object is missing.
+compile() {
+  cname=$1; cmode=$2; how=$3; clocale=$4; shift 4
+  before=
+  for b; do
+    (cd "$cname/$cmode" && oak -- --locale $clocale $before --locale system-locale \
+       --eval "(bind ((#*compiler-noisiness 0)) ($how $clocale \"$b\"))" \
+       --exit > "$b.compile.log" 2>&1)
+    test -f "$cname/$cmode/$b.oa" \
+      || { echo "FAIL $cname $cmode: no object for $b"
+	   tail -5 "$cname/$cmode/$b.compile.log"; status=1; return 1; }
+    before="$before --load $b"
+  done
+}
+
+# program NAME LOCALE [--interpreter] FILE...: FILE is a path without
+# .oak, the program's files in load order (a driver last, written
+# below).  --interpreter builds the executables with the interpreter,
+# for a program that evaluates code at run time.
+program() {
+  name=$1; locale=$2; shift 2
+  oakcflags=
+  if test "x$1" = x--interpreter; then oakcflags=--interpreter; shift; fi
+  rm -rf "$name"; mkdir "$name" "$name/bc" "$name/nat" "$name/exe"
+  bases=
+  for f; do
+    for d in bc nat exe; do cp "$f.oak" "$name/$d/"; done
+    bases="$bases $(basename "$f")"
+  done
+  loads=
+  for b in $bases; do loads="$loads --load $b"; done
+
+  # Bytecode, the reference: it must print something and report no
+  # failure.
+  compile $name bc compile-file $locale $bases || return
+  (cd "$name/bc" && oak -- --locale $locale $loads --exit 2>&1) | clean > "$name/bc.out"
+  grep -q . "$name/bc.out" || { echo "FAIL $name: no output from the bytecode"; status=1; return; }
+  if grep -a -q -e '^FAIL' -e 'An error occurred' -e '^Error:' -e '^\*\*\* ' "$name/bc.out"; then
+    echo "FAIL $name: the bytecode run reports a failure"
+    grep -a -e '^FAIL' -e 'An error occurred' -e '^Error:' -e '^\*\*\* ' "$name/bc.out" | head -5
+    status=1; return
+  fi
+  programs=$((programs + 1))
+
+  # Mixed mode.
+  if test $native = yes; then
+    if compile $name nat native-compile-file $locale $bases; then
+      if test -f "$name/nat/$(basename "$1").so"; then
+	(cd "$name/nat" && oak -- --locale $locale $loads --exit 2>&1) | clean > "$name/nat.out"
+	compare $name nat
+      else
+	echo "no native module built (no C compiler or dlopen?): native modes skipped"
+	native=no; exe=no
+      fi
+    fi
+  fi
+
+  # Stand-alone executables, run with no world in sight.
+  test $exe = yes || return
+  srcs=
+  for b in $bases; do srcs="$srcs $b.oak"; done
+  for m in exe exe-w exe-ir; do
+    case $m in
+      exe) flags=;;
+      exe-w) flags=-w;;
+      exe-ir) flags=--ir;;
+    esac
+    (cd "$name/exe" && "$OAKC" --locale $locale $oakcflags $flags $srcs -o $m \
+       > $m.oakc.log 2>&1) \
+      || { echo "FAIL $name $m: oakc failed"; tail -5 "$name/exe/$m.oakc.log"
+	   status=1; continue; }
+    (cd "$name/exe" && OAKWORLD=/nonexistent ./$m 2>&1) | clean > "$name/$m.out"
+    compare $name $m
+  done
+}
+
+# A driver: NAME.oak in the work directory, holding the forms read
+# from standard input, after a SHOW that prints a value on a line.
+driver() {
+  { echo '(set! #*print-length #f)'
+    echo '(set! #*print-level #f)'
+    echo '(define (show x) (print x standard-output) (newline standard-output))'
+    cat; } > "$work/$1.oak"
+}
+
+ex=$top_srcdir/doc/examples
+
+driver bank-run <<'EOF'
+(run-all-tests unit-tests)
+EOF
+program bank user-locale "$ex/bank-example" "$ex/unit-testing" \
+  "$ex/test-bank-example" "$work/bank-run"
+
+driver misc-run <<'EOF'
+(run-all-tests unit-tests)
+EOF
+program misc-tests user-locale "$ex/unit-testing" \
+  "$top_srcdir/src/misc/testing-tests" "$work/misc-run"
+
+driver change-run <<'EOF'
+(show (map change '(5 100 1000 10000)))
+EOF
+program change user-locale "$ex/change" "$work/change-run"
+
+driver uniq-run <<'EOF'
+(show (uniq '(a b a c b a)))
+EOF
+program uniq user-locale "$top_srcdir/src/misc/uniq" "$work/uniq-run"
+
+driver tak-run <<'EOF'
+(show (list (tak 18 12 6) (tak2 18 12 6) (macnine 1)))
+EOF
+program tak user-locale "$top_srcdir/src/world/tak" "$work/tak-run"
+
+# The logic programming system uses the system's internals.
+driver prolog-run <<'EOF'
+(show (collect-solutions (p-append ,x ,y (1 2 3))))
+(show (collect-solutions (p-member ,x (a b c))))
+(show (collect-solutions (p-reverse (1 2 3 4) ,x)))
+(show (collect-solutions (p-length (a b c) ,n)))
+(show (collect-solutions (ancestor ,x dave)))
+(show (collect-solutions (pfact 6 ,f)))
+(show (collect-solutions (noah (a b c d) ,x)))
+(show (collect-solutions (p-member2 ,x (1 2 3))))
+(show (collect-solutions (p-delete b (a b c b) ,x)))
+EOF
+program prolog system-locale "$top_srcdir/src/world/prolog" \
+  "$top_srcdir/src/world/prolog-examples" "$work/prolog-run"
+
+driver manual-run <<'EOF'
+(check "define-syntax, used in the next file" (add 1 2) 3)
+EOF
+program manual user-locale "$testdir/manual" "$work/manual-run"
+
+if test $threads = yes; then
+  driver threads-run <<'EOF'
+(show (parallel-map (lambda (n) (* n n)) '(1 2 3 4 5)))
+(show (producer-consumer 200))
+EOF
+  program thread-examples user-locale "$ex/parallel-map" \
+    "$ex/producer-consumer" "$work/threads-run"
+fi
+
+# The test programs that the other tests do not build as executables.
+program io system-locale "$testdir/io"
+program locales user-locale --interpreter "$testdir/locales"
+program restargs system-locale "$testdir/restargs"
+driver compile-me-run <<'EOF'
+(show (list (count-to 10) (bigger) (rest-test 1 2 3)))
+EOF
+program compile-me user-locale "$testdir/compile-me" "$work/compile-me-run"
+for f in "$testdir"/bench-*.oak; do
+  b=$(basename "$f" .oak)
+  driver $b-run <<'EOF'
+(show (bench))
+EOF
+  case $b in
+    bench-eval) program $b system-locale --interpreter "$testdir/$b" "$work/$b-run";;
+    *) program $b system-locale "$testdir/$b" "$work/$b-run";;
+  esac
+done
+
+test $exe = yes || echo "no native runtime (make -C src/world native-world): executables not built"
+echo "$programs programs compared across the modes"
+exit $status

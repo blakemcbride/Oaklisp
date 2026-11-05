@@ -91,11 +91,23 @@
 	     (let* ((bit (and cdr-info-part
 			      (pair? cdr-info-part)
 			      (list? (car cdr-info-part))))
-		    (type-info (if bit
-				   (car cdr-info-part)
-				   ;; This hack makes (ADD-METHOD (X Y) ...)
-				   ;; put #<Type OBJECT> in the .oa file.
-				   `(',object)))
+		    (type-info
+		     (cond (bit (car cdr-info-part))
+			   ;; An operation made on the spot, as LAMBDA
+			   ;; writes: the compiler makes a lambda of it
+			   ;; and the type never reaches an .oa, so the
+			   ;; type itself serves, safe from a local named
+			   ;; OBJECT.
+			   ((and (pair? op)
+				 (let ((m (car op)))
+				   (or (eq? m 'make)
+				       (and (pair? m) (eq? (car m) 'quote)
+					    (pair? (cdr m)) (eq? (cadr m) make)))))
+			    `(',object))
+			   ;; Any other is written as (OBJECT) would be:
+			   ;; the type itself inlined into a compiled
+			   ;; file cannot be read back from its .oa.
+			   (else '(object))))
 		    (args (if bit
 			      (cdr cdr-info-part)
 			      cdr-info-part))

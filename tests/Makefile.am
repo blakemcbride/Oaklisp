@@ -36,14 +36,14 @@ TESTS = smoke.test arith.test bignum.test data.test control.test objects.test \
   promises.test io.test locales.test unit.test examples.test compile.test		\
   world.test consistency.test threads.test native.test \
   native-parity.test standalone.test restargs.test threads-stress.test \
-  threads-api.test gc-stress.test
+  threads-api.test gc-stress.test modes.test
 
 
 OAKTESTS = arith.oak bignum.oak data.oak control.oak objects.oak io.oak locales.oak \
   promises.oak compile-me.oak native-me.oak native-check.oak eval-check.oak \
   benchmain.oak wp-a.oak wp-b.oak restargs.oak threads-check.oak \
   threads-stress.oak threads-api.oak parallel-tak.oak gc-stress.oak \
-  weak-young.oak
+  weak-young.oak manual.oak
 
 BENCHES = bench-tak.oak bench-fib.oak bench-bignum.oak bench-sort.oak	\
   bench-cons.oak bench-strings.oak bench-hash.oak bench-dispatch.oak	\
@@ -60,4 +60,5 @@ bench: all
 CLEANFILES = *.oa *.oa-tmp *.tmp *.bin *.cold *.sym header.txt
 clean-local:
 	rm -rf compile-me-check native-check native-parity standalone \
-	  stress-seq stress-par stress-*.out gc-stress api-native stress-native
+	  stress-seq stress-par stress-*.out gc-stress api-native stress-native \
+	  modes
