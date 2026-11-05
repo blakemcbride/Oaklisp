@@ -36,7 +36,7 @@ TESTS = smoke.test arith.test bignum.test data.test control.test objects.test \
   promises.test io.test locales.test unit.test examples.test compile.test		\
   world.test consistency.test threads.test native.test \
   native-parity.test standalone.test restargs.test threads-stress.test \
-  threads-api.test gc-stress.test modes.test props.test
+  threads-api.test gc-stress.test modes.test props.test fuzz.test
 
 
 OAKTESTS = arith.oak bignum.oak data.oak control.oak objects.oak io.oak locales.oak \
@@ -50,7 +50,7 @@ BENCHES = bench-tak.oak bench-fib.oak bench-bignum.oak bench-sort.oak	\
   bench-eval.oak bench-format.oak bench-compile.oak
 
 EXTRA_DIST = $(TESTS) $(OAKTESTS) $(BENCHES) testlib.sh bench.sh \
-  qemu-native.sh numeric-cases.scm
+  qemu-native.sh numeric-cases.scm progen.scm fuzz.sh fuzz-shrink.sh
 
 bench: all
 	$(AM_TESTS_ENVIRONMENT) $(SHELL) $(srcdir)/bench.sh $(BENCHFLAGS)
@@ -61,4 +61,4 @@ CLEANFILES = *.oa *.oa-tmp *.tmp *.bin *.cold *.sym header.txt
 clean-local:
 	rm -rf compile-me-check native-check native-parity standalone \
 	  stress-seq stress-par stress-*.out gc-stress api-native stress-native \
-	  modes props
+	  modes props fuzz

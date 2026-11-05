@@ -1,0 +1,8 @@
+#!/bin/sh
+# Random programs in every mode (fuzz.sh, progen.scm): a few fixed
+# seeds, so that a failure repeats.  Needs Guile, which writes the
+# programs.  OAK_FUZZ_COUNT and OAK_FUZZ_SEED run more, or others; a
+# campaign is fuzz.sh by hand (-n, -s, -j).
+. "$(dirname "$0")/testlib.sh"
+test "$GUILE" != no || skip "no Guile to write the programs"
+sh "$testdir/fuzz.sh" -n "${OAK_FUZZ_COUNT:-6}" -s "${OAK_FUZZ_SEED:-1}" -j 3 -d fuzz

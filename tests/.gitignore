@@ -17,3 +17,4 @@ api-native/
 stress-native/
 modes/
 props/
+fuzz/
