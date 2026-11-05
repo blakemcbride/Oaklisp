@@ -44,7 +44,7 @@ oak_mutex_t dump_lock = OAK_MUTEX_INITIALIZER;
    the mark-sweep collector take part in a handshake round
    (gc-ms.c).  Set and cleared by whoever runs the pause or the
    round, never both at once. */
-volatile bool gc_pending = false;
+bool gc_pending = false;
 bool gc_stw = false;
 int gc_ready[MAX_THREAD_COUNT];
 /* Slots of threads that have exited.  next_index never decreases, so
@@ -102,8 +102,8 @@ oak_thread_exit_unwind(void)
 #ifdef USE_MARK_SWEEP
   ms_thread_exiting(my_index);
 #endif
-  gc_thread_dead[my_index] = 1;
-  gc_ready[my_index] = 1;
+  GC_THREAD_DEAD_SET(my_index, 1);
+  GC_READY_SET(my_index);
 
   thread_exit_armed[my_index] = 0;
   longjmp(thread_exit_point[my_index], 1);
@@ -147,7 +147,7 @@ oak_thread0_init(void)
   oak_tls_set(index_key, (void*)my_index_p);
   my_index = *my_index_p;
   oak_thread_index_var = my_index;
-  gc_ready[my_index] = 0;
+  GC_READY_CLEAR(my_index);
   value_stack_array[my_index] = (oakstack*)malloc(sizeof (oakstack));
   cntxt_stack_array[my_index] = (oakstack*)malloc(sizeof (oakstack));
   register_array[my_index] = (register_set_t*)malloc(sizeof(register_set_t));
@@ -173,14 +173,14 @@ oak_thread0_init(void)
 void
 oak_thread_blocking_begin(void)
 {
-  gc_ready[oak_thread_index_var] = 1;
+  GC_READY_SET(oak_thread_index_var);
 }
 
 void
 oak_thread_blocking_end(void)
 {
   oak_mutex_lock(&gc_lock);
-  gc_ready[oak_thread_index_var] = 0;
+  GC_READY_CLEAR(oak_thread_index_var);
   oak_mutex_unlock(&gc_lock);
 }
 #endif
@@ -228,8 +228,8 @@ int create_thread(ref_t start_operation)
     free(info_p);
     return 0;
   }
-  gc_ready[index] = 0;
-  gc_thread_dead[index] = 0;
+  GC_READY_CLEAR(index);
+  GC_THREAD_DEAD_SET(index, 0);
   info_p->start_operation = start_operation;
   info_p->parent_index = *((int *)oak_tls_get(index_key));
   info_p->my_index = index;
@@ -355,7 +355,7 @@ static int park_permit[MAX_THREAD_COUNT];
 static void
 park_init(void)
 {
-  if (!park_inited) {
+  if (!OAK_LOAD_ACQUIRE(&park_inited)) {
     oak_mutex_lock(&park_init_lock);
     if (!park_inited) {
       int i;
@@ -364,7 +364,7 @@ park_init(void)
 	oak_cond_init(&park_cv[i]);
 	park_permit[i] = 0;
       }
-      park_inited = 1;
+      OAK_STORE_RELEASE(&park_inited, 1);
     }
     oak_mutex_unlock(&park_init_lock);
   }
@@ -381,7 +381,7 @@ oak_thread_park(long ms)
   int got;
 
   park_init();
-  gc_ready[idx] = 1;
+  GC_READY_SET(idx);
   oak_mutex_lock(&park_lock[idx]);
   if (ms < 0) {
     while (!park_permit[idx])
@@ -393,7 +393,7 @@ oak_thread_park(long ms)
   park_permit[idx] = 0;
   oak_mutex_unlock(&park_lock[idx]);
   oak_mutex_lock(&gc_lock);
-  gc_ready[idx] = 0;
+  GC_READY_CLEAR(idx);
   oak_mutex_unlock(&gc_lock);
   return got;
 #else
@@ -408,7 +408,7 @@ int
 oak_thread_unpark(int idx)
 {
 #ifdef THREADS
-  if (idx < 0 || idx >= next_index)
+  if (idx < 0 || idx >= OAK_LOAD_RELAXED(&next_index))
     return 0;
   park_init();
   oak_mutex_lock(&park_lock[idx]);
@@ -429,10 +429,10 @@ oak_thread_sleep_ms(long ms)
 #ifdef THREADS
   int idx = *(int *)oak_tls_get(index_key);
 
-  gc_ready[idx] = 1;
+  GC_READY_SET(idx);
   oak_sleep_ms(ms);
   oak_mutex_lock(&gc_lock);
-  gc_ready[idx] = 0;
+  GC_READY_CLEAR(idx);
   oak_mutex_unlock(&gc_lock);
 #else
   oak_sleep_ms(ms);
@@ -443,9 +443,9 @@ oak_thread_sleep_ms(long ms)
 int oak_live_thread_count(void)
 {
 #ifdef THREADS
-  int n = 0, i, count = next_index;
+  int n = 0, i, count = OAK_LOAD_RELAXED(&next_index);
   for (i = 0; i < count; i++)
-    if (!gc_thread_dead[i])
+    if (!GC_THREAD_DEAD(i))
       n++;
   return n;
 #else
@@ -458,12 +458,12 @@ void set_gc_flag (bool flag)
 #ifdef THREADS
   if (flag == true) {
     oak_mutex_lock(&gc_lock);
-    gc_stw = true;
-    gc_pending = true;
+    OAK_STORE_RELAXED(&gc_stw, true);
+    OAK_STORE_RELEASE(&gc_pending, true);	/* gc_stw before it */
   }
   else {
-    gc_stw = false;
-    gc_pending = false;
+    OAK_STORE_RELAXED(&gc_stw, false);
+    OAK_STORE_RELAXED(&gc_pending, false);
     oak_mutex_unlock(&gc_lock);
   }
 #endif
@@ -491,7 +491,7 @@ int get_next_index ()
     }
   if (ret == -1 && next_index < MAX_THREAD_COUNT) {
     ret = next_index;
-    next_index++;
+    OAK_STORE_RELAXED(&next_index, next_index + 1);	/* read without the lock */
   }
   oak_mutex_unlock(&index_lock);
 #endif
@@ -505,8 +505,8 @@ static void release_thread_slot (int i)
 {
   if (i <= 0 || i >= MAX_THREAD_COUNT)
     return;			/* slot 0 is the main thread */
-  gc_thread_dead[i] = 1;
-  gc_ready[i] = 1;
+  GC_THREAD_DEAD_SET(i, 1);
+  GC_READY_SET(i);
 #ifdef USE_MARK_SWEEP
   ms_thread_slot_reset(i);
 #endif
@@ -540,8 +540,8 @@ void free_registers (void *arg)
 #ifdef USE_MARK_SWEEP
   ms_thread_exiting(i);
 #endif
-  gc_thread_dead[i] = 1;
-  gc_ready[i] = 1;
+  GC_THREAD_DEAD_SET(i, 1);
+  GC_READY_SET(i);
 
   /* gc_lock is held for the duration of a collection, so taking it
      here guarantees nobody is scanning our stacks right now.  Anyone
@@ -601,11 +601,14 @@ void wait_for_gc()
   gc_timer_t stall;
   my_index_p = oak_tls_get(index_key);
   my_index = *(my_index_p);
-  if (gc_stw) {
+  /* The poll read gc_pending relaxed; what was set before it (gc_stw,
+     the round asked for) is seen from here. */
+  OAK_ATOMIC_FENCE_ACQUIRE();
+  if (OAK_LOAD_RELAXED(&gc_stw)) {
     gc_stats_begin(&stall, GC_EV_SAFEPOINT);
-    gc_ready[my_index] = 1;
+    GC_READY_SET(my_index);
     oak_mutex_lock(&gc_lock);
-    gc_ready[my_index] = 0;
+    GC_READY_CLEAR(my_index);
     oak_mutex_unlock(&gc_lock);
     gc_stats_end(&stall, GC_EV_SAFEPOINT, NULL);
   }

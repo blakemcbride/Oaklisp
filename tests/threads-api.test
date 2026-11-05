@@ -15,7 +15,7 @@ echo "thread API tests pass"
 rm -rf api-native && mkdir api-native && cp "$testdir/threads-api.oak" api-native/
 (cd api-native && oak -- --compile-native threads-api --exit >compile.log 2>&1)
 if test -f api-native/threads-api.so; then
-  out=$(cd api-native && timeout 300 "$OAKLISP" --batch --world "$OAKWORLD" -- \
+  out=$(cd api-native && limit 300 "$OAKLISP" --batch --world "$OAKWORLD" -- \
 	  --locale system-locale --eval "(define #*oaklisp-examples \"$ex\")" \
 	  --load threads-api --exit 2>&1)
   rc=$?

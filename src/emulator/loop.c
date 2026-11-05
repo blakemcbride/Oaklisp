@@ -253,7 +253,7 @@ loop(ref_t initial_tos)
 #endif
 
 #ifdef THREADS
-#define POLL_GC_SIGNALS()	if (gc_pending) {			     \
+#define POLL_GC_SIGNALS()	if (OAK_LOAD_RELAXED(&gc_pending)) {     \
 				    value_stack.sp = local_value_sp;	     \
 				    context_stack.sp = local_context_sp;     \
 				    e_pc = local_e_pc;			     \
@@ -669,8 +669,7 @@ loop(ref_t initial_tos)
 	    case 15:		/* SET-CONTENTS */
 	      POPVAL(x);
 	      CHECKTAG1(x, LOC_TAG, 2);
-	      SATB_BARRIER(LOC_TO_PTR(x), PEEKVAL());
-	      *LOC_TO_PTR(x) = PEEKVAL();
+	      SATB_STORE(LOC_TO_PTR(x), PEEKVAL());
 	      GOTO_TOP;
 
 	    case 16:		/* LOAD-TYPE */
@@ -791,8 +790,7 @@ loop(ref_t initial_tos)
 	    case 22:		/* STORE-BP-I */
 	      POPVAL(x);
 	      CHECKTAG1(x, INT_TAG, 2);
-	      SATB_BARRIER(e_bp + REF_TO_INT(x), PEEKVAL());
-	      *(e_bp + REF_TO_INT(x)) = PEEKVAL();
+	      SATB_STORE(e_bp + REF_TO_INT(x), PEEKVAL());
 	      GOTO_TOP;
 
 	    case 23:		/* LOAD-BP-I */
@@ -1009,15 +1007,13 @@ loop(ref_t initial_tos)
 	    case 42:		/* SET-CAR */
 	      CONSINSTR(2);
 	      POPVALS(1);
-	      SATB_BARRIER(pcar(x), PEEKVAL());
-	      *pcar(x) = PEEKVAL();
+	      SATB_STORE(pcar(x), PEEKVAL());
 	      GOTO_TOP;
 
 	    case 43:		/* SET-CDR */
 	      CONSINSTR(2);
 	      POPVALS(1);
-	      SATB_BARRIER(pcdr(x), PEEKVAL());
-	      *pcdr(x) = PEEKVAL();
+	      SATB_STORE(pcdr(x), PEEKVAL());
 	      GOTO_TOP;
 
 	    case 44:		/* LOCATE-CAR */
@@ -1157,18 +1153,14 @@ loop(ref_t initial_tos)
 #endif
 	      x = PEEKVAL();
 	      /* CHECKTAG0(x,PTR_TAG,1); */
-	      SATB_BARRIER(&REF_SLOT(x, CONTINUATION_VAL_SEGS),
-			   value_stack.segment);
-	      REF_SLOT(x, CONTINUATION_VAL_SEGS)
-		= value_stack.segment;
-	      REF_SLOT(x, CONTINUATION_VAL_OFF)
-		= INT_TO_REF(value_stack.pushed_count);
-	      SATB_BARRIER(&REF_SLOT(x, CONTINUATION_CXT_SEGS),
-			   context_stack.segment);
-	      REF_SLOT(x, CONTINUATION_CXT_SEGS)
-		= context_stack.segment;
-	      REF_SLOT(x, CONTINUATION_CXT_OFF)
-		= INT_TO_REF(context_stack.pushed_count);
+	      SATB_STORE(&REF_SLOT(x, CONTINUATION_VAL_SEGS),
+			 value_stack.segment);
+	      SATB_STORE(&REF_SLOT(x, CONTINUATION_VAL_OFF),
+			 INT_TO_REF(value_stack.pushed_count));
+	      SATB_STORE(&REF_SLOT(x, CONTINUATION_CXT_SEGS),
+			 context_stack.segment);
+	      SATB_STORE(&REF_SLOT(x, CONTINUATION_CXT_OFF),
+			 INT_TO_REF(context_stack.pushed_count));
 	      /* Maybe it's a good idea to reload the buffer, but I'm
 	         not bothering and things seem to work. */
 	      /* CHECKCXT_POP(0); */
@@ -1367,8 +1359,7 @@ loop(ref_t initial_tos)
 		PEEKVAL() = e_false;
 		GOTO_TOP;
 	      }
-	      SATB_BARRIER(LOC_TO_PTR(x), PEEKVAL());
-	      *LOC_TO_PTR(x) = PEEKVAL();
+	      SATB_STORE(LOC_TO_PTR(x), PEEKVAL());
 	      PEEKVAL() = e_t;
 	      GOTO_TOP;
 #endif
@@ -1609,8 +1600,7 @@ loop(ref_t initial_tos)
 	      GOTO_TOP;
 
 	    case 13:		/* STORE-BP n */
-	      SATB_BARRIER(e_bp + arg_field, PEEKVAL());
-	      *(e_bp + arg_field) = PEEKVAL();
+	      SATB_STORE(e_bp + arg_field, PEEKVAL());
 	      GOTO_TOP;
 
 	    case 14:		/* LOAD-ENV n */
@@ -1619,8 +1609,7 @@ loop(ref_t initial_tos)
 	      GOTO_TOP;
 
 	    case 15:		/* STORE-ENV n */
-	      SATB_BARRIER(e_env + arg_field, PEEKVAL());
-	      *(e_env + arg_field) = PEEKVAL();
+	      SATB_STORE(e_env + arg_field, PEEKVAL());
 	      GOTO_TOP;
 
 	    case 16:		/* LOAD-STK n */
@@ -2015,8 +2004,7 @@ loop(ref_t initial_tos)
 	    case 26:		/* STORE-SLOT n */
 	      POPVAL(x);
 	      CHECKTAG1(x, PTR_TAG, 2);
-	      SATB_BARRIER(&REF_SLOT(x, arg_field), PEEKVAL());
-	      REF_SLOT(x, arg_field) = PEEKVAL();
+	      SATB_STORE(&REF_SLOT(x, arg_field), PEEKVAL());
 	      GOTO_TOP;
 
 	    case 27:		/* LOAD-SLOT n */

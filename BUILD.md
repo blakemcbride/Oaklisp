@@ -349,6 +349,41 @@ tests/bench.sh for saving and comparing runs, and for "-p N", which
 runs N copies of tak on N OS threads (an emulator with threads)
 against the same on one, by the wall clock.
 
+Sanitizers
+==========
+
+The suite runs clean under AddressSanitizer with
+UndefinedBehaviorSanitizer, the generated C compiled at -O0 (GCC
+takes over an hour per generated file with the sanitizers on at
+-O1):
+
+	./configure --enable-threads \
+	  CFLAGS="-g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer" \
+	  LDFLAGS="-fsanitize=address,undefined"
+	make
+	OAKLISP_NATIVE_CFLAGS="-g -O0 -fsanitize=address,undefined -fPIC -fno-strict-aliasing" \
+	  make check
+
+and under ThreadSanitizer, which checks that the concurrent
+collector's protocol is expressed in atomics (GC.md, "Shared
+words"):
+
+	./configure --enable-threads \
+	  CFLAGS="-g -O1 -fsanitize=thread -fno-omit-frame-pointer" \
+	  LDFLAGS="-fsanitize=thread"
+	make
+	OAK_TIMEOUT_SCALE=4 TSAN_OPTIONS=halt_on_error=0:exitcode=0:report_signal_unsafe=0 make check
+
+Its reports go to stderr and the tests run on.  What it reports is
+the test programs' own shared variables (threads-stress shares data
+between its threads without a mutex on purpose); a report in a
+test's output fails native-parity.test, which compares outputs.
+OAK_TIMEOUT_SCALE multiplies the time limits the thread and
+collector tests run under, for the slowdown; even so
+threads-stress's last check, the concurrent definitions, does not
+finish under ThreadSanitizer in its time (the checks before it
+pass), so that test is expected to fail there.
+
 Thread Support
 ==============
 

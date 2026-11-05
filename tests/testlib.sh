@@ -47,4 +47,7 @@ run_oak_test() {
 }
 
 skip() { echo "SKIP: $*"; exit 77; }
+# A command under a time limit of SECONDS (the first argument), times
+# OAK_TIMEOUT_SCALE: a sanitizer build or a slow machine sets it.
+limit() { t=$1; shift; timeout $((t * ${OAK_TIMEOUT_SCALE:-1})) "$@"; }
 fail() { echo "FAIL: $*"; exit 1; }

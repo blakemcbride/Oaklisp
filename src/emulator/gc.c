@@ -46,7 +46,7 @@
 /* Iterate over the live threads only: an exited thread's slot still
    sits inside the scan range but its stacks have been released. */
 #define FORTHREADS THREADY( for (my_index=0; my_index<gc_thread_count; my_index++) \
-			      if (!gc_thread_dead[my_index]) )
+			      if (!GC_THREAD_DEAD(my_index)) )
 
 
 
@@ -494,21 +494,18 @@ gc(bool pre_dump, bool full_gc, char *reason, size_t amount)
 #endif
   my_index_p = oak_tls_get(index_key);
   my_index = *my_index_p;
-  gc_ready[my_index] = 1;
+  GC_READY_SET(my_index);
   set_gc_flag (true);
   gc_stats_begin(&pause, GC_EV_COPY);
   gc_stats_begin(&handshake, GC_EV_HANDSHAKE);
   /* Snapshot next_index so thread creation during GC cannot cause
      us to read uninitialized gc_ready[] slots. */
-  gc_thread_count = next_index;
+  gc_thread_count = OAK_LOAD_RELAXED(&next_index);
 
-  /* The flags are written by the other threads, so read them as
-     volatile: nothing in this loop would make the compiler reload
-     them. */
   while (ready == false) {
     ready = true;
     for (i = 0; i < gc_thread_count; i++) {
-      if (((volatile int *)gc_ready)[i] == 0 && !gc_thread_dead[i]) {
+      if (!GC_READY(i) && !GC_THREAD_DEAD(i)) {
 	  ready = false;
 	  oak_thread_yield();
 	  break;
@@ -923,7 +920,7 @@ gc_top:
 #ifdef THREADS
   my_index_p = oak_tls_get(index_key);
   my_index = *my_index_p;
-  gc_ready[my_index] = 0;
+  GC_READY_CLEAR(my_index);
   set_gc_flag (false);
 #ifdef USE_MARK_SWEEP
   ms_gc_release();

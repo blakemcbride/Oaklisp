@@ -26,13 +26,13 @@ report() {
     || { tail -5 "$2"; status=1; }
 }
 
-timeout 900 "$OAKLISP" --batch --size-heap $heap --gc-stats --world "$OAKWORLD" -- \
+limit 900 "$OAKLISP" --batch --size-heap $heap --gc-stats --world "$OAKWORLD" -- \
   --locale system-locale --load gc-stress --exit > bytecode.out 2>&1
 report bytecode bytecode.out $?
 
 oak -- --compile-native gc-stress --exit > compile.log 2>&1
 if test -f gc-stress.so; then
-  timeout 900 "$OAKLISP" --batch --size-heap $heap --gc-stats --world "$OAKWORLD" -- \
+  limit 900 "$OAKLISP" --batch --size-heap $heap --gc-stats --world "$OAKWORLD" -- \
     --locale system-locale --load gc-stress --exit > native.out 2>&1
   report "mixed native" native.out $?
 else
@@ -46,7 +46,7 @@ if test -x "$OAKC" && test -f "$top_builddir/src/world/native/liboaknat.a"; then
     exe=gc-stress$mode-x
     if "$OAKC" $flags gc-stress.oak -o "$exe" > "oakc$mode.log" 2>&1; then
       OAKLISP_OPTIONS="--size-heap $heap --gc-stats" OAKWORLD=/nonexistent \
-	timeout 900 "./$exe" > "$exe.out" 2>&1
+	limit 900 "./$exe" > "$exe.out" 2>&1
       report "oakc $mode" "$exe.out" $?
     else
       cat "oakc$mode.log"; echo "oakc $flags failed"; status=1
@@ -58,7 +58,7 @@ fi
 
 # Weak pointers to objects made during a mark, held only by an old
 # object (weak-young.oak).
-timeout 300 "$OAKLISP" --batch --size-heap 128 --world "$OAKWORLD" -- \
+limit 300 "$OAKLISP" --batch --size-heap 128 --world "$OAKWORLD" -- \
   --locale system-locale --load "$testdir/weak-young" --exit > weak-young.out 2>&1
 if grep -q '^PASS weak-young' weak-young.out; then
   echo "weak-young: pass"

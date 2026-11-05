@@ -9,7 +9,7 @@ enabled=$(oak -- --eval '(print (%threads-enabled?) standard-output)' --exit 2>&
 case $enabled in *T*) ;; *) skip "emulator built without threads";; esac
 status=0
 for run in 1 2 3; do
-  timeout 300 "$OAKLISP" --batch --world "$OAKWORLD" -- \
+  limit 300 "$OAKLISP" --batch --world "$OAKWORLD" -- \
     --locale system-locale --pthreads 3 --load "$testdir/threads-stress.oak" --exit \
     > stress-$run.out 2>&1
   rc=$?
@@ -24,7 +24,7 @@ done
 rm -rf stress-native && mkdir stress-native && cp "$testdir/threads-stress.oak" stress-native/
 (cd stress-native && oak -- --compile-native threads-stress --exit >compile.log 2>&1)
 if test -f stress-native/threads-stress.so; then
-  (cd stress-native && timeout 300 "$OAKLISP" --batch --world "$OAKWORLD" -- \
+  (cd stress-native && limit 300 "$OAKLISP" --batch --world "$OAKWORLD" -- \
      --locale system-locale --pthreads 3 --load threads-stress --exit) \
     > stress-native.out 2>&1
   rc=$?
@@ -43,7 +43,7 @@ for f in $files; do
     || { echo "single-threaded compile of $f failed"; status=1; }
 done
 list=; for f in $files; do list="$list \"$testdir/$f\""; done
-timeout 600 "$OAKLISP" --batch --world "$OAKWORLD" -- \
+limit 600 "$OAKLISP" --batch --world "$OAKWORLD" -- \
   --locale system-locale --pthreads 3 \
   --eval '(set! #*compiler-output-directory "stress-par")' \
   --eval "(print (map force (map (lambda (f) (future (block (compile-file system-locale f) #t))) (list$list))) standard-output)" \

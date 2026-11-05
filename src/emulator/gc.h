@@ -27,6 +27,7 @@
 
 #include "config.h"
 #include "data.h"
+#include "oak-atomic.h"
 
 extern bool full_gc;
 extern void printref(FILE * fd, ref_t refin);
@@ -47,13 +48,24 @@ extern void gc(bool pre_dump, bool full_gc, char *reason,
 		   } */
 
 #ifdef THREADS
+/* Each thread's parked flag and dead flag: written by the thread
+   (gc_ready, once its stacks are synchronized: a release) or its
+   slot's reaper, read by whoever runs a pause or a round (an
+   acquire, before it scans the thread's stacks). */
 extern int gc_ready[];
 extern int gc_thread_dead[];
+#define GC_READY(i)		OAK_LOAD_ACQUIRE(&gc_ready[i])
+#define GC_READY_SET(i)		OAK_STORE_RELEASE(&gc_ready[i], 1)
+#define GC_READY_CLEAR(i)	OAK_STORE_RELAXED(&gc_ready[i], 0)
+#define GC_THREAD_DEAD(i)	OAK_LOAD_RELAXED(&gc_thread_dead[i])
+#define GC_THREAD_DEAD_SET(i, x) OAK_STORE_RELAXED(&gc_thread_dead[i], (x))
 extern int oak_live_thread_count(void);
 extern int oak_thread_park(long ms);
 extern int oak_thread_unpark(int idx);
 extern void oak_thread_sleep_ms(long ms);
-extern volatile bool gc_pending;
+/* Set by whoever runs a pause or a round, polled by every thread at
+   its safepoints. */
+extern bool gc_pending;
 extern bool gc_stw;
 extern oak_mutex_t gc_lock;
 #endif

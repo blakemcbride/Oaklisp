@@ -857,11 +857,31 @@ verify mode's mark reads a fresh object's fields as they are.
 
 **Heap stores.**  Every store of a ref into an existing heap object
 -- a slot, a cons cell, a vector element, an environment, the cell a
-locative names, a cache -- is `SATB_BARRIER(addr, v); *addr = v;` in
-C and `ON_STORE(addr, v)` in generated C, the barrier before the
-store so that it reads the old value.  A store into a stack or a
-register is not barriered.  native-parity.test greps the generated C
-for raw stores; the interpreter's ten sites are listed above.
+locative names, a cache -- is `SATB_STORE(addr, v)` in C and
+`ON_STORE(addr, v)` in generated C: the barrier (`SATB_BARRIER`),
+before the store so that it reads the old value, then the store
+itself, a relaxed atomic one, since a marker may be reading the
+word.  A store into a stack or a register is not barriered.
+native-parity.test greps the generated C for raw stores; the
+interpreter's ten sites are listed above.
+
+**Shared words.**  Every word one thread writes and another may read
+at the same time with no lock between them -- the collector's flags
+and counters, the bitmaps, a region's top, the heap words the markers
+read -- is accessed through the atomic accessors of oak-atomic.h
+(`OAK_LOAD_RELAXED` and `OAK_STORE_RELAXED`; where the protocol
+needs an order, `OAK_LOAD_ACQUIRE`, `OAK_STORE_RELEASE` and the
+fences; `SHARED_GET`, `SHARED_SET` and `SHARED_ADD` in gc-ms.c,
+`GC_READY` and `GC_THREAD_DEAD` in gc.h), never with a plain or a
+`volatile` access: a plain access to such a word is a data race,
+undefined under the C memory model however benign on the machine,
+and ThreadSanitizer reports it.  The relaxed accessors are the plain
+load and store on every machine the emulator runs on, so they cost
+nothing.  A ThreadSanitizer build of the suite (BUILD.md,
+"Sanitizers") reports nothing in the collector; what it reports is
+the test programs' own shared variables, written from several
+threads without a mutex by design (threads-stress), which the
+machine's word-sized accesses serve.
 
 **Reads outside the roots.**  A value read through a weak pointer
 goes through `wp_to_ref`, which logs it during a mark and answers

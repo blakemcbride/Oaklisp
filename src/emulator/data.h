@@ -505,7 +505,7 @@ extern void ms_verify_log_alloc(ref_t *p, int path, size_t words);
 {							\
   THREADY(						\
       while (oak_mutex_trylock(&alloc_lock) != 0) {	\
-	      if (gc_pending) {				\
+	      if (OAK_LOAD_RELAXED(&gc_pending)) {		\
 		      before; wait_for_gc(); after;	\
 	      }						\
       }							\
@@ -531,6 +531,7 @@ extern void ms_verify_log_alloc(ref_t *p, int path, size_t words);
 #define SATB_BARRIER(addr, v) ((void)0)
 #define SATB_READ_WEAK(v) ((void)0)
 #define SATB_READ_RAW(v) ((void)0)
+#define SATB_STORE(addr, v) (*(addr) = (v))
 #endif
 
 /* A value read through a weak pointer (wp_to_ref): logged during a
@@ -544,7 +545,8 @@ satb_weak_read(ref_t v)
 {
   SATB_READ_WEAK(v);
 #ifdef USE_MARK_SWEEP
-  if (OAK_UNLIKELY(gc_weak_clearing) && (v & PTR_MASK) && !ms_weak_alive(v))
+  if (OAK_UNLIKELY(OAK_LOAD_RELAXED(&gc_weak_clearing)) && (v & PTR_MASK)
+      && !ms_weak_alive(v))
     return e_nil;
 #endif
   return v;

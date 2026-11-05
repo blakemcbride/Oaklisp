@@ -271,7 +271,9 @@ void ms_tlab_retire_all(void);
    found from the thread's TLAB base and bitmap pointer. */
 #define MS_TLAB_OBJSTART(idx, p)					\
   do { size_t _ms_o = (size_t)((p) - tlab_base_array[idx]);		\
-       tlab_bm_array[idx][_ms_o / 64] |= 1ULL << (_ms_o % 64); } while (0)
+       uint64_t *_ms_w = &tlab_bm_array[idx][_ms_o / 64];		\
+       OAK_STORE_RELAXED(_ms_w, OAK_LOAD_RELAXED(_ms_w)			\
+			 | (1ULL << (_ms_o % 64))); } while (0)
 
 
 /* ------------------------------------------------------------------ */
@@ -328,17 +330,28 @@ void satb_log_value(ref_t v);
    fallback defined in data.h. */
 #undef SATB_BARRIER
 #define SATB_BARRIER(addr, v) \
-    do { if (OAK_UNLIKELY(gc_satb_active)) \
+    do { if (OAK_UNLIKELY(OAK_LOAD_RELAXED(&gc_satb_active))) \
 	     satb_log_store((addr), (v)); } while (0)
 
 /* The read barrier on weak pointers (after wp_to_ref, on the value)
    and on the raw-ref caches (on the method a hit yields). */
 #undef SATB_READ_WEAK
 #define SATB_READ_WEAK(v) \
-    do { if (OAK_UNLIKELY(gc_satb_active)) \
+    do { if (OAK_UNLIKELY(OAK_LOAD_RELAXED(&gc_satb_active))) \
 	     satb_log_value(v); } while (0)
 #undef SATB_READ_RAW
 #define SATB_READ_RAW(v) SATB_READ_WEAK(v)
+
+/* A store of V into the heap word at ADDR: the barrier, then the
+   store as an atomic one (relaxed), since a concurrent mark may be
+   reading the word -- a plain store would be a data race, undefined
+   however benign on the machine.  Every store of a ref into an
+   existing heap object goes through this. */
+#undef SATB_STORE
+#define SATB_STORE(addr, v) \
+    do { ref_t *_satb_a = (addr); ref_t _satb_v = (v); \
+	 SATB_BARRIER(_satb_a, _satb_v); \
+	 OAK_STORE_RELAXED(_satb_a, _satb_v); } while (0)
 
 
 /* ------------------------------------------------------------------ */
@@ -357,13 +370,13 @@ enum gc_phase_t {
     GC_PHASE_REMARK,
     GC_PHASE_SWEEP
 };
-extern volatile int gc_phase;
+extern int gc_phase;
 
 #ifdef THREADS
 /* True while a concurrent mark-sweep cycle is in progress on the GC
    thread.  A thread that exhausts the heap waits for the cycle to
    end instead of starting one. */
-extern volatile int gc_concurrent_in_progress;
+extern int gc_concurrent_in_progress;
 
 /* Initialize concurrent GC synchronization (called once at startup,
    before ms_init). */
@@ -395,7 +408,7 @@ void ms_start_lazy_sweep(void);
    threads, after the remark pause, the sweep going on meanwhile): a
    read of a weak pointer tests its object itself, ms_weak_alive, by
    the marks, which stand until the next cycle clears them. */
-extern volatile int gc_weak_clearing;
+extern int gc_weak_clearing;
 bool ms_weak_alive(ref_t ref);
 
 /* Sweep one block (up to SWEEP_BLOCK_SIZE words) from the sweep cursor.

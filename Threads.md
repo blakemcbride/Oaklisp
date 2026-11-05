@@ -281,6 +281,11 @@ Thread Safety
 **C emulator:**
 
 - `signal_poll_flag` -- `volatile sig_atomic_t`, delivered by thread 0
+- The collector's flags, counters and bitmaps, each thread's parked
+  and dead flags, a region's top and the heap words the markers read
+  -- atomic accesses (oak-atomic.h; GC.md, "Shared words"), never
+  plain or `volatile`; a ThreadSanitizer build checks it (BUILD.md,
+  "Sanitizers")
 - `alloc_lock` -- the allocation slow path, the regions' tops, list
   and lookup table, mapping and unmapping; STORE-REG of `free-ptr`
   and `cons-limit` (the copying collector's bump pointer and limit,

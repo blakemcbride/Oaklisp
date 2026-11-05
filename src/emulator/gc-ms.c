@@ -80,8 +80,13 @@ static ms_region_t *alloc_region;
 /* GET-DATA's slots (gc-ms.h): a table of the regions by slot, each
    region holding as many consecutive slots as it has chunks.  Grown
    by replacing the table; a reader that still holds the old one
-   finds its regions there, so the old tables are kept. */
-typedef struct { size_t n; ms_region_t *r[]; } ms_slot_table_t;
+   finds its regions there, so the old tables are kept, chained from
+   the new one (bounded: each is half the size of the next). */
+typedef struct ms_slot_table {
+    struct ms_slot_table *older;
+    size_t n;
+    ms_region_t *r[];
+} ms_slot_table_t;
 static size_t ms_slots_ptr;		/* ms_slot_table_t *, published */
 
 /* The copying collector's destination span (ms_evacuate_begin). */
@@ -100,6 +105,14 @@ static void ms_request_cycle(const char *reason);
 static int gc_requested;
 #endif
 
+/* A counter or a flag one thread writes under a lock and another
+   reads without it (the pacing's counters, the work list's), so that
+   the compiler sees the sharing: a relaxed atomic access is the
+   plain one on every machine. */
+#define SHARED_GET(v)	OAK_LOAD_RELAXED(&(v))
+#define SHARED_SET(v, x)	OAK_STORE_RELAXED(&(v), (x))
+#define SHARED_ADD(v, d)	OAK_STORE_RELAXED(&(v), OAK_LOAD_RELAXED(&(v)) + (d))
+
 /* The lazy sweep's state (defined with it, below). */
 static ms_region_t *sweep_region;
 static bool lazy_sweep_active;
@@ -108,7 +121,10 @@ static bool lazy_sweep_active;
 #define BM_IDX(r, p)	((size_t)((p) - (r)->start))
 #define BM_SET(bm, i)	((bm)[(i)/64] |=  (1ULL << ((i) % 64)))
 #define BM_CLR(bm, i)	((bm)[(i)/64] &= ~(1ULL << ((i) % 64)))
-#define BM_TEST(bm, i)	((bm)[(i)/64] &   (1ULL << ((i) % 64)))
+/* A test is a relaxed atomic load: the marker reads bits the mutators
+   set (TLAB object starts, free entries) and the sweeper reads bits
+   the markers set. */
+#define BM_TEST(bm, i)	(OAK_LOAD_RELAXED(&(bm)[(i)/64]) & (1ULL << ((i) % 64)))
 
 /* Objstart bits are set by the locked slow paths and the collector in
    words they may share, so those updates are atomic with threads; the
@@ -252,6 +268,7 @@ ms_slot_alloc(ms_region_t *r)
 	    want = 64;
 	bigger = (ms_slot_table_t *)xmalloc(sizeof *bigger
 					    + want * sizeof(ms_region_t *));
+	bigger->older = t;
 	bigger->n = want;
 	memset(bigger->r, 0, want * sizeof(ms_region_t *));
 	if (t)
@@ -463,7 +480,8 @@ ms_may_map(void)
        whatever the headroom has learnt: the headroom sets when a
        cycle is asked for, this what the mutators may still map before
        the mark ends -- a wait costs them more than a region. */
-    if (gc_concurrent_in_progress && room < (size_t)e_next_newspace_size / 2)
+    if (SHARED_GET(gc_concurrent_in_progress)
+	&& room < (size_t)e_next_newspace_size / 2)
 	room = (size_t)e_next_newspace_size / 2;
 #endif
     limit = (size_t)e_next_newspace_size + room;
@@ -656,9 +674,11 @@ static bool tlab_free_none;
    mark bits: a new object's weak pointer would be cleared). */
 #ifdef THREADS
 #define MS_BORN_BLACK() \
-    OAK_UNLIKELY(gc_phase >= GC_PHASE_CONCURRENT_MARK || gc_weak_clearing)
+    OAK_UNLIKELY(OAK_LOAD_RELAXED(&gc_phase) >= GC_PHASE_CONCURRENT_MARK \
+		 || OAK_LOAD_RELAXED(&gc_weak_clearing))
 #else
-#define MS_BORN_BLACK() OAK_UNLIKELY(gc_phase >= GC_PHASE_CONCURRENT_MARK)
+#define MS_BORN_BLACK() \
+    OAK_UNLIKELY(OAK_LOAD_RELAXED(&gc_phase) >= GC_PHASE_CONCURRENT_MARK)
 #endif
 
 /* An entry's size field, checked: a zero would loop the allocator,
@@ -700,7 +720,7 @@ ms_free_list_alloc(size_t n_words)
 		ms_objstart_set(r, p);
 		ms_free_clear(r, p);
 		free_list_total_words -= actual_size;
-		ms_since_snapshot += actual_size;
+		SHARED_ADD(ms_since_snapshot, actual_size);
 
 		/* Born-black: during concurrent mark, objects allocated
 		   from the free list (below sweep_top) must have their
@@ -758,7 +778,7 @@ ms_free_list_alloc(size_t n_words)
 		ms_free_set(r, rest);
 		free_list_heads[rc] = rest;
 		free_list_total_words -= n_words;
-		ms_since_snapshot += n_words;
+		SHARED_ADD(ms_since_snapshot, n_words);
 		if (rest_size >= TLAB_MIN_FREE)
 		    tlab_free_none = false;
 
@@ -824,8 +844,8 @@ ms_virgin_take(ms_region_t *r, size_t words, bool aligned)
     if (r->top == r->start)
 	r->empty_cycles = 0;
     ms_filler(r, r->top, (size_t)(start - r->top));
-    ms_since_snapshot += (size_t)(start + words - r->top);
-    r->top = start + words;
+    SHARED_ADD(ms_since_snapshot, (size_t)(start + words - r->top));
+    SHARED_SET(r->top, start + words);	/* the markers read it */
     return start;
 }
 
@@ -954,8 +974,8 @@ static bool tlab_free_none = true;
 #ifdef THREADS
 static void ms_blacken(ms_region_t *r, ref_t *start, ref_t *end);
 static void ms_scan_self(int idx, bool self);
-static volatile size_t gc_mark_epoch;
-static volatile size_t gc_scan_epoch[MAX_THREAD_COUNT];
+static size_t gc_mark_epoch;
+static size_t gc_scan_epoch[MAX_THREAD_COUNT];
 #endif
 
 static ref_t *
@@ -1018,7 +1038,7 @@ ms_tlab_from_free(size_t min_words, ms_region_t **out_r, ref_t **out_end)
 		if (MS_BORN_BLACK())
 		    ms_blacken(r, start, end);
 #endif
-		ms_since_snapshot += (size_t)(end - start);
+		SHARED_ADD(ms_since_snapshot, (size_t)(end - start));
 		*out_r = r;
 		*out_end = end;
 		return start;
@@ -1082,15 +1102,16 @@ ms_alloc_slow_locked(size_t n_words, int idx)
        the thread's next safepoint; a thread created after the roots'
        round holds only references the marker reaches, and scans
        itself here all the same. */
-    if (gc_satb_active && gc_scan_epoch[idx] != gc_mark_epoch)
+    if (SHARED_GET(gc_satb_active)
+	&& SHARED_GET(gc_scan_epoch[idx]) != SHARED_GET(gc_mark_epoch))
 	ms_scan_self(idx, true);
 
     /* The trigger: a cycle is asked for when the heap's occupancy --
        what the last mark found live, and what has been handed out
        since its snapshot -- comes within the headroom of the budget,
        so that the cycle ends before the mutators run out of room. */
-    if (!gc_concurrent_in_progress && !gc_requested
-	&& marked_words + ms_since_snapshot + ms_headroom
+    if (!SHARED_GET(gc_concurrent_in_progress) && !SHARED_GET(gc_requested)
+	&& SHARED_GET(marked_words) + SHARED_GET(ms_since_snapshot) + ms_headroom
 	   >= (size_t)e_next_newspace_size)
 	ms_request_cycle("heap at its trigger");
 #endif
@@ -1205,7 +1226,7 @@ ms_allocate_slow(size_t words, char *reason)
 	int spins = 0;
 
 	while (oak_mutex_trylock(&alloc_lock) != 0) {
-	    if (gc_pending)
+	    if (OAK_LOAD_RELAXED(&gc_pending))
 		wait_for_gc();
 	    else if (++spins > 64)
 		oak_thread_yield();
@@ -1256,7 +1277,7 @@ ms_tlab_retire_all(void)
 {
 #ifdef THREADS
     extern int next_index;
-    int n = next_index;   /* snapshot under alloc_lock */
+    int n = OAK_LOAD_RELAXED(&next_index);   /* snapshot under alloc_lock */
 #else
     int n = 1;
 #endif
@@ -1342,8 +1363,8 @@ satb_room(ref_t **bufp, size_t count, size_t *sizep)
    ones it overwrites ("Handshakes", below).  The GC thread advances
    the epoch before it turns the barrier on (a release), and the
    barrier reads it after the flag (an acquire). */
-static volatile size_t gc_mark_epoch;
-static volatile size_t gc_scan_epoch[MAX_THREAD_COUNT];
+static size_t gc_mark_epoch;
+static size_t gc_scan_epoch[MAX_THREAD_COUNT];
 
 /* Buffers handed to the markers, full or at a handshake: packets of
    refs on their work list ("Parallel marking", below). */
@@ -1355,8 +1376,10 @@ static void ms_work_put(ref_t *buf, size_t count, size_t epoch, int kind);
 static inline void
 satb_fresh(int idx)
 {
-    if (satb_epoch_array[idx] != gc_mark_epoch) {
-	satb_epoch_array[idx] = gc_mark_epoch;
+    size_t epoch = SHARED_GET(gc_mark_epoch);
+
+    if (satb_epoch_array[idx] != epoch) {
+	satb_epoch_array[idx] = epoch;
 	satb_count_array[idx] = 0;
     }
 }
@@ -1392,11 +1415,12 @@ satb_log_store(ref_t *addr, ref_t v)
     ref_t old_val;
 
     OAK_ATOMIC_FENCE_ACQUIRE();	/* the epoch, after the flag */
-    old_val = *addr;
+    old_val = OAK_LOAD_RELAXED(addr);	/* another thread may be storing */
     /* Only pointer-tagged values (skip fixnums and immediates). */
     if (old_val & PTR_MASK)
 	satb_append(idx, old_val);
-    if ((v & PTR_MASK) && gc_scan_epoch[idx] != gc_mark_epoch)
+    if ((v & PTR_MASK)
+	&& SHARED_GET(gc_scan_epoch[idx]) != SHARED_GET(gc_mark_epoch))
 	satb_append(idx, v);
 }
 
@@ -1439,8 +1463,8 @@ satb_log_value(ref_t v)
 /*  Concurrent marking state                                           */
 /* ------------------------------------------------------------------ */
 
-volatile int gc_phase = GC_PHASE_IDLE;
-volatile int gc_weak_clearing = 0;
+int gc_phase = GC_PHASE_IDLE;
+int gc_weak_clearing = 0;
 
 #ifdef THREADS
 /*
@@ -1455,7 +1479,7 @@ volatile int gc_weak_clearing = 0;
  * MS_GC_THREAD_INDEX.  A dump or a world load, which move or unmap
  * the heap, hold it off (ms_gc_hold) until they are done.
  */
-volatile int gc_concurrent_in_progress = 0;
+int gc_concurrent_in_progress = 0;
 
 static oak_mutex_t gc_concurrent_lock = OAK_MUTEX_INITIALIZER;
 static oak_cond_t  gc_concurrent_done_cv = OAK_COND_INITIALIZER;
@@ -1472,7 +1496,7 @@ static void *ms_gc_thread_main(void *arg);
 static void ms_background_sweep(void);
 static bool ms_help_mark(int idx);
 static int ms_cpus;			/* the CPUs the process may run on */
-static volatile bool ms_run_open;
+static bool ms_run_open;
 static oak_mutex_t ms_work_lock = OAK_MUTEX_INITIALIZER;
 static oak_cond_t ms_work_cv = OAK_COND_INITIALIZER;
 static oak_cond_t ms_run_cv = OAK_COND_INITIALIZER;
@@ -1512,8 +1536,8 @@ static void
 ms_request_cycle(const char *reason)
 {
     oak_mutex_lock(&gc_concurrent_lock);
-    if (!gc_concurrent_in_progress && !gc_requested) {
-	gc_requested = 1;
+    if (!SHARED_GET(gc_concurrent_in_progress) && !SHARED_GET(gc_requested)) {
+	SHARED_SET(gc_requested, 1);
 	gc_request_reason = reason;
 	ms_gc_thread_start_locked();
 	oak_cond_broadcast(&gc_request_cv);
@@ -1536,20 +1560,20 @@ ms_wait_cycle(const char *reason, size_t amount)
 	fprintf(stderr, "; MS-GC: thread %d waits for a cycle (%s, %zu words):"
 		" %zu mapped, budget %zu, headroom %zu, %zu free, phase %d.\n",
 		idx, reason, amount, ms_mapped, (size_t)e_next_newspace_size,
-		ms_headroom, free_list_total_words, gc_phase);
+		ms_headroom, free_list_total_words, SHARED_GET(gc_phase));
     oak_mutex_unlock(&alloc_lock);
     /* Advertise that we are parked for the whole time we are out of
        action, including while re-acquiring the allocator lock: the
        stop-the-world handshake spins until every thread's gc_ready
        flag is set. */
-    gc_ready[idx] = 1;
+    GC_READY_SET(idx);
     oak_mutex_lock(&gc_concurrent_lock);
     target = gc_cycles_done + 1;
     ms_waited = true;
     if (amount > gc_request_amount)
 	gc_request_amount = amount;
-    if (!gc_concurrent_in_progress && !gc_requested) {
-	gc_requested = 1;
+    if (!SHARED_GET(gc_concurrent_in_progress) && !SHARED_GET(gc_requested)) {
+	SHARED_SET(gc_requested, 1);
 	gc_request_reason = reason;
 	ms_gc_thread_start_locked();
 	oak_cond_broadcast(&gc_request_cv);
@@ -1562,7 +1586,7 @@ ms_wait_cycle(const char *reason, size_t amount)
 	oak_mutex_unlock(&gc_concurrent_lock);
 	(void)ms_help_mark(idx);
 	oak_mutex_lock(&gc_concurrent_lock);
-	if (gc_cycles_done < target && !ms_run_open)
+	if (gc_cycles_done < target && !SHARED_GET(ms_run_open))
 	    oak_cond_wait(&gc_concurrent_done_cv, &gc_concurrent_lock);
     }
     oak_mutex_unlock(&gc_concurrent_lock);
@@ -1573,10 +1597,10 @@ ms_wait_cycle(const char *reason, size_t amount)
        counted it as parked, so what it allocated meanwhile was neither
        a root nor born black. */
     oak_mutex_lock(&gc_lock);
-    gc_ready[idx] = 0;
+    GC_READY_CLEAR(idx);
     oak_mutex_unlock(&gc_lock);
     while (oak_mutex_trylock(&alloc_lock) != 0) {
-	if (gc_pending)
+	if (OAK_LOAD_RELAXED(&gc_pending))
 	    wait_for_gc();
 	else
 	    oak_thread_yield();
@@ -1591,14 +1615,14 @@ ms_gc_hold(void)
 
     /* Parked while waiting: the cycle's pauses need us at a
        safepoint. */
-    gc_ready[idx] = 1;
+    GC_READY_SET(idx);
     oak_mutex_lock(&gc_concurrent_lock);
     gc_hold++;
-    while (gc_concurrent_in_progress || gc_sweeping)
+    while (SHARED_GET(gc_concurrent_in_progress) || SHARED_GET(gc_sweeping))
 	oak_cond_wait(&gc_concurrent_done_cv, &gc_concurrent_lock);
     oak_mutex_unlock(&gc_concurrent_lock);
     oak_mutex_lock(&gc_lock);
-    gc_ready[idx] = 0;
+    GC_READY_CLEAR(idx);
     oak_mutex_unlock(&gc_lock);
 }
 
@@ -1606,7 +1630,7 @@ void
 ms_gc_release(void)
 {
     oak_mutex_lock(&gc_concurrent_lock);
-    if (gc_hold > 0 && --gc_hold == 0 && gc_requested)
+    if (gc_hold > 0 && --gc_hold == 0 && SHARED_GET(gc_requested))
 	oak_cond_broadcast(&gc_request_cv);
     oak_mutex_unlock(&gc_concurrent_lock);
 }
@@ -1645,8 +1669,8 @@ ms_gc_release(void)
  * object the marker read before the overwrite -- or the object was
  * found from an entry drained in the round, which marked it.
  */
-static volatile size_t gc_hs_request;			/* the round asked for */
-static volatile size_t gc_hs_done[MAX_THREAD_COUNT];	/* the last done, per thread */
+static size_t gc_hs_request;			/* the round asked for */
+static size_t gc_hs_done[MAX_THREAD_COUNT];	/* the last done, per thread */
 /* The GC thread waits here between looks at the threads, and a thread
    that has done its part signals it (without the lock: a signal lost
    in the window costs the timed wait's millisecond, no more), so that
@@ -1684,7 +1708,7 @@ ms_scan_self(int idx, bool self)
     tlab_bm_array[idx] = NULL;
     satb_fresh(idx);
     ms_scan_thread_roots(idx, ms_satb_sink);
-    gc_scan_epoch[idx] = gc_mark_epoch;
+    SHARED_SET(gc_scan_epoch[idx], SHARED_GET(gc_mark_epoch));
     satb_handoff(idx);
     if (self)
 	gc_stats_end(&scan, GC_EV_SCAN, NULL);
@@ -1695,7 +1719,7 @@ ms_scan_self(int idx, bool self)
 static void
 ms_handshake(int idx, size_t round, bool self)
 {
-    if (gc_scan_epoch[idx] != gc_mark_epoch)
+    if (SHARED_GET(gc_scan_epoch[idx]) != SHARED_GET(gc_mark_epoch))
 	ms_scan_self(idx, self);
     satb_handoff(idx);
     /* A release: the GC thread that sees the round done sees the
@@ -1711,7 +1735,7 @@ ms_handshake_poll(int idx)
 {
     size_t round = OAK_ATOMIC_LOAD_REF(&gc_hs_request);
 
-    if (gc_hs_done[idx] != round)
+    if (SHARED_GET(gc_hs_done[idx]) != round)
 	ms_handshake(idx, round, true);
 }
 
@@ -1722,24 +1746,24 @@ ms_handshake_poll(int idx)
 static void
 ms_handshake_round(const char *what)
 {
-    size_t round = gc_hs_request + 1;
+    size_t round = SHARED_GET(gc_hs_request) + 1;
     gc_timer_t timer;
 
     gc_stats_begin(&timer, GC_EV_ROUND);
     OAK_ATOMIC_STORE_REF(&gc_hs_request, round);
-    gc_pending = true;
+    OAK_STORE_RELEASE(&gc_pending, true);
     for (;;) {
 	bool all = true;
-	int n = next_index;
+	int n = OAK_LOAD_RELAXED(&next_index);
 
 	for (int i = 0; i < n; i++) {
-	    if (gc_thread_dead[i]
+	    if (GC_THREAD_DEAD(i)
 		|| OAK_ATOMIC_LOAD_REF(&gc_hs_done[i]) == round)
 		continue;
-	    if (((volatile int *)gc_ready)[i]) {
+	    if (GC_READY(i)) {
 		oak_mutex_lock(&gc_lock);
-		if (gc_ready[i] && !gc_thread_dead[i]
-		    && gc_hs_done[i] != round)
+		if (GC_READY(i) && !GC_THREAD_DEAD(i)
+		    && SHARED_GET(gc_hs_done[i]) != round)
 		    ms_handshake(i, round, false);
 		oak_mutex_unlock(&gc_lock);
 		if (OAK_ATOMIC_LOAD_REF(&gc_hs_done[i]) == round)
@@ -1753,7 +1777,7 @@ ms_handshake_round(const char *what)
 	oak_cond_timedwait_ms(&gc_hs_cv, &gc_hs_lock, 1);
 	oak_mutex_unlock(&gc_hs_lock);
     }
-    gc_pending = false;
+    SHARED_SET(gc_pending, false);
     gc_stats_end(&timer, GC_EV_ROUND, what);
 }
 
@@ -1771,7 +1795,7 @@ ms_thread_exiting(int idx)
 void
 ms_thread_slot_reset(int idx)
 {
-    gc_scan_epoch[idx] = 0;
+    SHARED_SET(gc_scan_epoch[idx], 0);
     OAK_ATOMIC_STORE_REF(&gc_hs_done[idx], 0);
 }
 
@@ -1786,10 +1810,10 @@ stw_request_pause(int my_index_val)
     gc_timer_t handshake;
 
     if (my_index_val >= 0)
-	gc_ready[my_index_val] = 1;
+	GC_READY_SET(my_index_val);
     set_gc_flag(true);   /* locks gc_lock, sets gc_pending */
     gc_stats_begin(&handshake, GC_EV_HANDSHAKE);
-    gc_thread_count = next_index;
+    gc_thread_count = OAK_LOAD_RELAXED(&next_index);
 
     /* Busy-wait for all threads to reach a safepoint. */
     {
@@ -1797,7 +1821,7 @@ stw_request_pause(int my_index_val)
 	while (!ready) {
 	    ready = true;
 	    for (int i = 0; i < gc_thread_count; i++) {
-		if (gc_ready[i] == 0 && !gc_thread_dead[i]) {
+		if (!GC_READY(i) && !GC_THREAD_DEAD(i)) {
 		    ready = false;
 		    oak_thread_yield();
 		    break;
@@ -1815,7 +1839,7 @@ static void
 stw_release(int my_index_val)
 {
     if (my_index_val >= 0)
-	gc_ready[my_index_val] = 0;
+	GC_READY_CLEAR(my_index_val);
     set_gc_flag(false);   /* gc_pending=false, unlocks gc_lock */
 }
 #endif /* OAK_GC_VERIFY */
@@ -1907,8 +1931,12 @@ ms_record_transport(ref_t *new_place)
 static size_t
 ms_objstart_extent(ms_region_t *r, ref_t *obj)
 {
-    size_t limit = BM_IDX(r, r->top);
-    size_t idx = BM_IDX(r, obj), next;
+    size_t limit, idx, next;
+
+    if (r == NULL)		/* a corrupt mark stack */
+	ms_fatal("an object to mark lies in no region", 0);
+    limit = BM_IDX(r, SHARED_GET(r->top));
+    idx = BM_IDX(r, obj);
 
     if (idx + 1 >= limit)
 	return 1;
@@ -1931,13 +1959,13 @@ find_object_start(ms_region_t *r, ref_t *addr)
     int bit = (int)(idx % 64);
 
     /* Mask: keep bits 0..bit (at or below the target). */
-    uint64_t word = r->objstart[w] & ((2ULL << bit) - 1);
+    uint64_t word = OAK_LOAD_RELAXED(&r->objstart[w]) & ((2ULL << bit) - 1);
 
     /* Scan backward through bitmap words. */
     while (word == 0) {
 	if (w == 0) return NULL;
 	w--;
-	word = r->objstart[w];
+	word = OAK_LOAD_RELAXED(&r->objstart[w]);
     }
 
     int highest = 63 - CLZ64(word);
@@ -2135,7 +2163,7 @@ typedef struct OAK_CACHE_ALIGNED ms_worker {
 } ms_worker_t;
 
 static int ms_markers;			/* the GC thread and its markers */
-static volatile bool ms_spin_ok;	/* this run: a CPU to spin on for each marker */
+static bool ms_spin_ok;	/* this run: a CPU to spin on for each marker */
 static ms_worker_t ms_pool_workers[MAX_THREAD_COUNT];	/* 0 the GC thread's */
 static ms_worker_t ms_helper_workers[MAX_THREAD_COUNT];	/* a parked mutator's */
 
@@ -2145,12 +2173,12 @@ static ms_worker_t ms_helper_workers[MAX_THREAD_COUNT];	/* a parked mutator's */
    ms_run_cv for the GC thread waiting for the workers to leave).
    The two every push reads are on a line the rest never dirties. */
 static struct {
-    struct ms_work *volatile list;
-    volatile int idle;		/* workers spinning or asleep for want of work */
+    struct ms_work *list;
+    int idle;		/* workers spinning or asleep for want of work */
 } OAK_CACHE_ALIGNED ms_work;
 #define ms_work_list ms_work.list
 #define ms_work_idle ms_work.idle
-static OAK_CACHE_ALIGNED volatile int ms_work_active;	/* workers not asleep for want of work */
+static OAK_CACHE_ALIGNED int ms_work_active;	/* workers not asleep for want of work */
 static int ms_work_waiting;		/* of the idle, asleep */
 static bool ms_work_done;		/* the run is over */
 static size_t ms_run_number;		/* the marker threads wake for a new one */
@@ -2182,8 +2210,8 @@ ms_work_put(ref_t *buf, size_t count, size_t epoch, int kind)
     struct ms_work *w = ms_work_new(buf, count, epoch, kind);
 
     oak_mutex_lock(&ms_work_lock);
-    w->next = ms_work_list;
-    ms_work_list = w;
+    w->next = SHARED_GET(ms_work_list);
+    SHARED_SET(ms_work_list, w);
     if (ms_work_waiting > 0)
 	oak_cond_signal(&ms_work_cv);
     oak_mutex_unlock(&ms_work_lock);
@@ -2245,8 +2273,8 @@ ms_worker_export(ms_worker_t *w)
     ms_dbg_exports++;
     ms_dbg_packets += packets;
     ms_dbg_moved += w->top;
-    tail->next = ms_work_list;
-    ms_work_list = head;
+    tail->next = SHARED_GET(ms_work_list);
+    SHARED_SET(ms_work_list, head);
     if (ms_work_waiting > 0) {
 	if (packets > 1)
 	    oak_cond_broadcast(&ms_work_cv);
@@ -2297,7 +2325,7 @@ ms_mark_ref_concurrent(ms_worker_t *w, ref_t ref)
     w->pushes++;
     if (w->top >= MS_EXPORT_MIN
 	&& w->pushes - w->exported_at >= MS_EXPORT_INTERVAL
-	&& ms_work_idle > 0 && ms_work_list == NULL)
+	&& SHARED_GET(ms_work_idle) > 0 && SHARED_GET(ms_work_list) == NULL)
 	ms_worker_export(w);
 }
 
@@ -2308,7 +2336,7 @@ ms_worker_trace(ms_worker_t *w, ref_t *obj)
 
     w->words += len;
     for (size_t i = 0; i < len; i++) {
-	ref_t val = obj[i];
+	ref_t val = OAK_LOAD_RELAXED(&obj[i]);	/* the mutators write it */
 	if (val & PTR_MASK)
 	    ms_mark_ref_concurrent(w, val);
     }
@@ -2321,7 +2349,8 @@ ms_worker_spin(void)
 {
     gc_ns_t t0 = gc_now();
 
-    while (ms_work_list == NULL && !ms_work_done && ms_work_active > 1
+    while (SHARED_GET(ms_work_list) == NULL && !SHARED_GET(ms_work_done)
+	   && SHARED_GET(ms_work_active) > 1
 	   && gc_now() - t0 < MS_SPIN_NS)
 	OAK_CPU_RELAX();
 }
@@ -2335,7 +2364,7 @@ ms_worker_spin(void)
 static void
 ms_worker_run(ms_worker_t *w)
 {
-    bool spun = !ms_spin_ok;
+    bool spun = !SHARED_GET(ms_spin_ok);
 
     for (;;) {
 	struct ms_work *pk;
@@ -2344,46 +2373,47 @@ ms_worker_run(ms_worker_t *w)
 	    ms_worker_trace(w, w->stack[--w->top]);
 
 	oak_mutex_lock(&ms_work_lock);
-	while ((pk = ms_work_list) == NULL) {
-	    if (!spun && ms_work_active > 1) {
+	while ((pk = SHARED_GET(ms_work_list)) == NULL) {
+	    if (!spun && SHARED_GET(ms_work_active) > 1) {
 		ms_dbg_spins++;
-		ms_work_idle++;
+		SHARED_ADD(ms_work_idle, 1);
 		oak_mutex_unlock(&ms_work_lock);
 		ms_worker_spin();
 		oak_mutex_lock(&ms_work_lock);
-		ms_work_idle--;
+		SHARED_ADD(ms_work_idle, -1);
 		spun = true;
 		continue;
 	    }
-	    if (--ms_work_active == 0) {
+	    SHARED_ADD(ms_work_active, -1);
+	    if (SHARED_GET(ms_work_active) == 0) {
 		/* The last one in: nothing to take, nobody to make more. */
-		ms_work_done = true;
+		SHARED_SET(ms_work_done, true);
 		oak_cond_broadcast(&ms_work_cv);
 		oak_mutex_unlock(&ms_work_lock);
 		return;
 	    }
-	    ms_work_idle++;
+	    SHARED_ADD(ms_work_idle, 1);
 	    ms_work_waiting++;
 	    ms_dbg_sleeps++;
-	    while (ms_work_list == NULL && !ms_work_done)
+	    while (SHARED_GET(ms_work_list) == NULL && !SHARED_GET(ms_work_done))
 		oak_cond_wait(&ms_work_cv, &ms_work_lock);
 	    ms_work_waiting--;
-	    ms_work_idle--;
-	    if (ms_work_done) {
+	    SHARED_ADD(ms_work_idle, -1);
+	    if (SHARED_GET(ms_work_done)) {
 		oak_mutex_unlock(&ms_work_lock);
 		return;
 	    }
-	    ms_work_active++;
+	    SHARED_ADD(ms_work_active, 1);
 	}
-	ms_work_list = pk->next;
+	SHARED_SET(ms_work_list, pk->next);
 	ms_dbg_takes++;
 	oak_mutex_unlock(&ms_work_lock);
-	spun = !ms_spin_ok;
+	spun = !SHARED_GET(ms_spin_ok);
 	w->exported_at = w->pushes;
 
 	switch (pk->kind) {
 	case MS_WORK_REFS:
-	    if (pk->epoch == gc_mark_epoch)
+	    if (pk->epoch == SHARED_GET(gc_mark_epoch))
 		for (size_t j = 0; j < pk->count; j++)
 		    ms_mark_ref_concurrent(w, pk->buf[j]);
 	    free(pk->buf);
@@ -2401,7 +2431,7 @@ ms_worker_run(ms_worker_t *w)
 	       mark anyway, while what was overwritten is in a barrier
 	       buffer. */
 	    for (size_t j = 0; j < pk->count; j++) {
-		ref_t v = pk->buf[j];
+		ref_t v = OAK_LOAD_RELAXED(&pk->buf[j]);
 		if ((v & PTR_MASK) && !SPATIC_PTR(ANY_TO_PTR(v)))
 		    ms_mark_ref_concurrent(w, v);
 	    }
@@ -2512,16 +2542,16 @@ ms_trace_parallel(void)
 {
     gc_ns_t t0 = gc_now();
 
-    ms_spin_ok = ms_markers + oak_live_thread_count() <= ms_cpus;
+    SHARED_SET(ms_spin_ok, ms_markers + oak_live_thread_count() <= ms_cpus);
     oak_mutex_lock(&ms_work_lock);
-    ms_work_done = false;
-    ms_work_active = ms_markers;
+    SHARED_SET(ms_work_done, false);
+    SHARED_SET(ms_work_active, ms_markers);
     ms_run_members = ms_markers;
     ms_run_left = 0;
     ms_run_pushes = 0;
     ms_run_words = 0;
     ms_run_number++;
-    ms_run_open = true;
+    SHARED_SET(ms_run_open, true);
     oak_cond_broadcast(&ms_work_cv);
     oak_mutex_unlock(&ms_work_lock);
     /* The mutators parked for want of memory: they help. */
@@ -2535,9 +2565,9 @@ ms_trace_parallel(void)
     oak_mutex_lock(&ms_work_lock);
     while (ms_run_left < ms_run_members)
 	oak_cond_wait(&ms_run_cv, &ms_work_lock);
-    ms_run_open = false;
+    SHARED_SET(ms_run_open, false);
     mark_stack_pushes += ms_run_pushes;
-    marked_words += ms_run_words;
+    SHARED_ADD(marked_words, ms_run_words);
     if (trace_gc > 2) {
 	fprintf(stderr, "\n; run %zu: %d members, %lu marked, %zu words,"
 		" %lu exports (%lu packets, %lu moved), %lu takes,"
@@ -2560,12 +2590,12 @@ ms_help_mark(int idx)
     int saved_crash_recovery;
 
     oak_mutex_lock(&ms_work_lock);
-    if (!ms_run_open || ms_work_done) {
+    if (!SHARED_GET(ms_run_open) || SHARED_GET(ms_work_done)) {
 	oak_mutex_unlock(&ms_work_lock);
 	return false;
     }
     ms_run_members++;
-    ms_work_active++;
+    SHARED_ADD(ms_work_active, 1);
     oak_mutex_unlock(&ms_work_lock);
     /* As on the GC thread: a bad pointer aborts rather than
        longjmping into the interpreter. */
@@ -2646,7 +2676,7 @@ ms_verify_log_alloc(ref_t *p, int path, size_t words)
     ms_vlog[i].p = p;
     ms_vlog[i].words = words;
     ms_vlog[i].thread = *(int *)oak_tls_get(index_key);
-    ms_vlog[i].phase = gc_phase;
+    ms_vlog[i].phase = SHARED_GET(gc_phase);
     ms_vlog[i].path = path;
     ms_vlog[i].cycle = ms_verify_cycles;
 }
@@ -2677,7 +2707,7 @@ ms_verify_stw_alloc(int idx, const char *how)
 {
     fprintf(stderr, "; GC VERIFY: thread %d allocating (%s) while thread %d"
 	    " has the world stopped (phase %d)\n",
-	    idx, how, ms_verify_stw_owner, gc_phase);
+	    idx, how, ms_verify_stw_owner, SHARED_GET(gc_phase));
 }
 static void ms_mark_roots(void);
 
@@ -2943,8 +2973,8 @@ ms_mark_roots(void)
 {
     ms_mark_global_roots(ms_mark_sink);
 #ifdef THREADS
-    for (int i = 0; i < next_index; i++)
-	if (!gc_thread_dead[i])
+    for (int i = 0; i < OAK_LOAD_RELAXED(&next_index); i++)
+	if (!GC_THREAD_DEAD(i))
 	    ms_scan_thread_roots(i, ms_mark_sink);
 #else
     ms_scan_thread_roots(0, ms_mark_sink);
@@ -3099,7 +3129,8 @@ ms_region_reset(ms_region_t *r)
     memset(r->objstart, 0, bytes);
     memset(r->mark, 0, bytes);
     memset(r->freebm, 0, bytes);
-    r->top = r->sweep_top = r->start;
+    r->sweep_top = r->start;
+    SHARED_SET(r->top, r->start);
     r->live_words = 0;
     r->empty_cycles++;
     ms_virgin_grew();
@@ -3168,7 +3199,7 @@ ms_lazy_sweep_one(void)
 	       moves sweep_top, which the readers' liveness test uses
 	       (ms_weak_alive); the region is swept block by block then,
 	       into one entry. */
-	    if (!gc_weak_clearing && ms_region_all_dead(r)) {
+	    if (!SHARED_GET(gc_weak_clearing) && ms_region_all_dead(r)) {
 		ms_region_reset(r);
 		sweep_region = r->next;
 		return true;
@@ -3372,7 +3403,7 @@ ms_run_cycle(const char *reason, size_t amount)
 #if !defined(THREADS) || defined(OAK_GC_VERIFY)
     mark_stack_init();
 #endif
-    marked_words = 0;
+    SHARED_SET(marked_words, 0);
 #if defined(THREADS) && defined(OAK_GC_VERIFY)
     ms_verify_cycle_begin();
 #endif
@@ -3391,8 +3422,8 @@ ms_run_cycle(const char *reason, size_t amount)
        black for what is allocated from free entries from now on, the
        regions' sweep_tops, then the barrier.  A TLAB carved after
        this is above its region's sweep_top or blackened. === */
-    gc_mark_epoch++;
-    gc_phase = GC_PHASE_CONCURRENT_MARK;
+    SHARED_ADD(gc_mark_epoch, 1);
+    SHARED_SET(gc_phase, GC_PHASE_CONCURRENT_MARK);
     ms_snapshot_tops();
 
     /* The allocation rate, for the pacing: what was handed out since
@@ -3409,12 +3440,12 @@ ms_run_cycle(const char *reason, size_t amount)
 	    fprintf(stderr, "\n; %zu words allocated in the %.1f ms since the"
 		    " last snapshot (%.0f/ms; smoothed %.0f/ms).",
 		    ms_since_snapshot, ms, rate, ms_alloc_rate);
-	ms_since_snapshot = 0;
+	SHARED_SET(ms_since_snapshot, 0);
 	ms_snapshot_ns = now;
 	t_mark = now;
     }
     OAK_ATOMIC_FENCE_RELEASE();	/* the epoch and the phase, then the flag */
-    gc_satb_active = 1;
+    SHARED_SET(gc_satb_active, 1);
     oak_mutex_unlock(&alloc_lock);
 
     /* The caches of raw refs, no roots: emptied now, and a hit during
@@ -3475,13 +3506,13 @@ ms_run_cycle(const char *reason, size_t amount)
     /* The barrier goes off.  Entries logged from here to the next
        cycle's first handshake are of this epoch and are dropped then
        (satb_fresh); they refer to marked objects anyway. */
-    gc_satb_active = 0;
+    SHARED_SET(gc_satb_active, 0);
 
     /* What the mutators allocated meanwhile, for the pacing: what
        the allocator handed out since the snapshot.  Smoothed: half
        this cycle's, half what it was. */
     {
-	size_t during = ms_since_snapshot;
+	size_t during = SHARED_GET(ms_since_snapshot);
 
 	ms_alloc_during_mark = ms_alloc_during_mark
 	    ? (ms_alloc_during_mark + during) / 2 : during;
@@ -3516,7 +3547,7 @@ ms_run_cycle(const char *reason, size_t amount)
 
     /* --- Sweep phase --- */
 #ifndef THREADS
-    gc_phase = GC_PHASE_SWEEP;
+    SHARED_SET(gc_phase, GC_PHASE_SWEEP);
 #endif
 
 #if !defined(THREADS) || defined(OAK_GC_VERIFY)
@@ -3556,9 +3587,9 @@ ms_run_cycle(const char *reason, size_t amount)
 	fprintf(stderr, "; Lazy sweep prepared (%zu regions).\n", ms_nregions);
 
 #ifdef THREADS
-    gc_weak_clearing = 1;
+    SHARED_SET(gc_weak_clearing, 1);
     ms_start_lazy_sweep();
-    gc_phase = GC_PHASE_IDLE;
+    SHARED_SET(gc_phase, GC_PHASE_IDLE);
     oak_mutex_unlock(&alloc_lock);
 
     /* --- Weak pointers, concurrently --- */
@@ -3570,9 +3601,9 @@ ms_run_cycle(const char *reason, size_t amount)
 	    fprintf(stderr, " %lu entr%s discarded.\n",
 		    wp_count, wp_count != 1 ? "ies" : "y");
     }
-    gc_weak_clearing = 0;
+    SHARED_SET(gc_weak_clearing, 0);
 #else
-    gc_phase = GC_PHASE_IDLE;
+    SHARED_SET(gc_phase, GC_PHASE_IDLE);
 #endif
 
     /* Sweep enough blocks now to satisfy the requested amount, so that
@@ -3639,27 +3670,27 @@ ms_gc_thread_main(void *arg)
     for (;;) {
 	const char *reason;
 
-	while (!gc_requested || gc_hold)
+	while (!SHARED_GET(gc_requested) || gc_hold)
 	    oak_cond_wait(&gc_request_cv, &gc_concurrent_lock);
-	gc_requested = 0;
+	SHARED_SET(gc_requested, 0);
 	reason = gc_request_reason;
-	gc_concurrent_in_progress = 1;
+	SHARED_SET(gc_concurrent_in_progress, 1);
 	oak_mutex_unlock(&gc_concurrent_lock);
 
 	ms_run_cycle(reason, 0);
 
 	oak_mutex_lock(&gc_concurrent_lock);
-	gc_concurrent_in_progress = 0;
+	SHARED_SET(gc_concurrent_in_progress, 0);
 	gc_cycles_done++;
 	oak_cond_broadcast(&gc_concurrent_done_cv);
 
 	/* The rest of the sweep, in the background (a dump or a world
 	   load waits for this to stop too). */
-	gc_sweeping = 1;
+	SHARED_SET(gc_sweeping, 1);
 	oak_mutex_unlock(&gc_concurrent_lock);
 	ms_background_sweep();
 	oak_mutex_lock(&gc_concurrent_lock);
-	gc_sweeping = 0;
+	SHARED_SET(gc_sweeping, 0);
 	oak_cond_broadcast(&gc_concurrent_done_cv);
     }
     return NULL;
@@ -3686,7 +3717,7 @@ ms_background_sweep(void)
 	bool stop, more;
 
 	oak_mutex_lock(&gc_concurrent_lock);
-	stop = gc_requested || gc_hold;
+	stop = SHARED_GET(gc_requested) || gc_hold;
 	oak_mutex_unlock(&gc_concurrent_lock);
 	if (stop)
 	    break;
@@ -3738,7 +3769,7 @@ ms_collect_explicit(const char *reason)
 {
 #ifdef THREADS
     while (oak_mutex_trylock(&alloc_lock) != 0) {
-	if (gc_pending)
+	if (OAK_LOAD_RELAXED(&gc_pending))
 	    wait_for_gc();
 	else
 	    oak_thread_yield();
@@ -3848,7 +3879,8 @@ ms_evacuate_end(void)
        it. */
     ms_unmap_all();
     r = ms_region_new(new_space.start, evac_chunks);
-    r->top = r->sweep_top = free_point;
+    r->sweep_top = free_point;
+    SHARED_SET(r->top, free_point);
     for (size_t i = 0; i < deferred_count; i++) {
 	ref_t *p = deferred_objstarts[i];
 	if (p >= r->start && p < r->top)

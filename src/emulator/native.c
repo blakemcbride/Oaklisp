@@ -275,7 +275,7 @@ oak_native_flush_sites(void)
   SITE_LOCK();
   for (i = 0; i < site_module_count; i++)
     for (j = 0; j < site_modules[i]->site_count; j++)
-      site_modules[i]->sites[j].epoch = INT_TO_REF(0);
+      OAK_STORE_RELAXED(&site_modules[i]->sites[j].epoch, INT_TO_REF(0));
   SITE_UNLOCK();
 }
 
@@ -339,12 +339,14 @@ site_fill_locked(oak_native_site * s, ref_t v, ref_t y_type)
   ref_t m, seg, offset;
   oak_native_fn fn;
 
-  s->epoch = oak_native_epoch;
-  s->op = v;
-  s->y_type = INT_TO_REF(0);
-  s->offset = INT_TO_REF(0);
-  s->method = s->code = s->env = e_nil;
-  s->fn = NULL;
+  OAK_STORE_RELAXED(&s->epoch, oak_native_epoch);
+  OAK_STORE_RELAXED(&s->op, v);
+  OAK_STORE_RELAXED(&s->y_type, INT_TO_REF(0));
+  OAK_STORE_RELAXED(&s->offset, INT_TO_REF(0));
+  OAK_STORE_RELAXED(&s->method, e_nil);
+  OAK_STORE_RELAXED(&s->code, e_nil);
+  OAK_STORE_RELAXED(&s->env, e_nil);
+  OAK_STORE_RELAXED(&s->fn, NULL);
   if (!TAG_IS(v, PTR_TAG))
     return;
   m = REF_SLOT(v, OPERATION_LAMBDA_OFF);
@@ -353,35 +355,37 @@ site_fill_locked(oak_native_site * s, ref_t v, ref_t y_type)
       /* Generic. */
       if (y_type == INT_TO_REF(0))
 	{
-	  s->epoch = INT_TO_REF(0);	/* could not see the argument */
+	  OAK_STORE_RELAXED(&s->epoch, INT_TO_REF(0));	/* could not see the argument */
 	  return;
 	}
-      s->y_type = y_type;
+      OAK_STORE_RELAXED(&s->y_type, y_type);
       if (!oak_mcache_read(v, y_type, &m, &offset))
 	return;
       if (!TAG_IS(m, PTR_TAG) || REF_SLOT(m, 0) != e_method_type)
 	return;
-      s->method = m;
-      s->offset = offset;
+      OAK_STORE_RELAXED(&s->method, m);
+      OAK_STORE_RELAXED(&s->offset, offset);
     }
   else
     {
       if (!TAG_IS(m, PTR_TAG) || REF_SLOT(m, 0) != e_method_type)
 	return;
-      s->method = m;
+      OAK_STORE_RELAXED(&s->method, m);
     }
   seg = REF_SLOT(m, METHOD_CODE_OFF);
   if ((fn = oak_native_known(seg)) == NULL)
     return;
-  s->code = seg;
-  s->env = REF_SLOT(m, METHOD_ENV_OFF);
-  s->fn = fn;
+  OAK_STORE_RELAXED(&s->code, seg);
+  OAK_STORE_RELAXED(&s->env, REF_SLOT(m, METHOD_ENV_OFF));
+  OAK_STORE_RELAXED(&s->fn, fn);
 }
 
 /* With THREADS a fill takes the site's sequence count from even to
    odd and back (ON_SITE_CALL trusts what it read only if the count
    is the same even number before and after), under site_lock so two
-   fills cannot interleave. */
+   fills cannot interleave.  The fields are written, and read by the
+   callers, with relaxed atomic accesses: a reader may be reading
+   them as they are written (the sequence count tells it so). */
 void
 oak_native_site_fill(oak_native_site * s, ref_t v, ref_t y_type)
 {
@@ -428,7 +432,7 @@ oak_native_resolve(ref_t seg)
   free(cname);
   /* The index first, the epoch last: a reader that sees the epoch
      (oak_native_known, an acquiring load) sees the index. */
-  cv[n - 3] = INT_TO_REF(native_hash[slot] - 1);
+  OAK_STORE_RELAXED(&cv[n - 3], INT_TO_REF(native_hash[slot] - 1));
 #ifdef THREADS
   OAK_ATOMIC_STORE_REF(&cv[n - 1], oak_native_epoch);
 #else

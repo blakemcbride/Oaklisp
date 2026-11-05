@@ -108,7 +108,9 @@ typedef struct {
    asking" -- until the global holds something else, or the witnessed
    method changes.  With THREADS a fill is guarded by the site's
    sequence count (seq), odd while it writes, so a reader in another
-   thread never acts on half a fill. */
+   thread never acts on half a fill; the fields are written and read
+   with relaxed atomic accesses, a reader being free to read them as
+   they are written. */
 typedef struct {
   ref_t epoch;			/* oak_native_epoch when filled, or 0 */
   size_t seq;			/* THREADS: odd while a fill is writing */
@@ -180,7 +182,7 @@ extern volatile sig_atomic_t signal_poll_flag;
    the code returns to its dispatcher, which delivers. */
 #ifdef THREADS
 #define ON_PENDING()							\
-  ((signal_poll_flag && my_index == 0) || gc_pending			\
+  ((signal_poll_flag && my_index == 0) || OAK_LOAD_RELAXED(&gc_pending)	\
    || (oak_timer_increment						\
        && (oak_timer_counter += oak_timer_increment) > OAK_TIMER_LIMIT))
 #else
@@ -203,9 +205,7 @@ extern oak_native_fn *oak_native_fn_chunks[OAK_NATIVE_FN_CHUNKS];
    barrier of the concurrent collector (gc-ms.h) sits; a store into a
    stack or a register does not.  native-parity.test greps the
    generated C for raw stores. */
-#define ON_STORE(p, v)							\
-  do { ref_t *_on_p = (p); ref_t _on_v = (v);				\
-       SATB_BARRIER(_on_p, _on_v); *_on_p = _on_v; } while (0)
+#define ON_STORE(p, v)	SATB_STORE((p), (v))
 
 /* The thread registers (LOAD-REG 23 to 25). */
 #ifdef THREADS
@@ -537,8 +537,11 @@ oak_native_direct_return(unsigned *k)
 #endif
 #ifdef ON_MUSTTAIL
 #define ON_SITE_JUMP(s, seq1, bp)					\
-  do { ref_t _on_m = (s)->method, _on_c = (s)->code, _on_e = (s)->env;	\
-       ref_t _on_o = (s)->offset; oak_native_fn _on_fn = (s)->fn;	\
+  do { ref_t _on_m = OAK_LOAD_RELAXED(&(s)->method);			\
+       ref_t _on_c = OAK_LOAD_RELAXED(&(s)->code);			\
+       ref_t _on_e = OAK_LOAD_RELAXED(&(s)->env);			\
+       ref_t _on_o = OAK_LOAD_RELAXED(&(s)->offset);			\
+       oak_native_fn _on_fn = OAK_LOAD_RELAXED(&(s)->fn);		\
        if (ON_SITE_CHECK(s, seq1))					\
 	 { SATB_READ_RAW(_on_m);					\
 	   if (bp) e_bp = REF_TO_PTR(sp[-1]) + REF_TO_INT(_on_o);	\
@@ -550,8 +553,10 @@ oak_native_direct_return(unsigned *k)
 	   ON_MUSTTAIL return _on_fn(0); } } while (0)
 #else
 #define ON_SITE_JUMP(s, seq1, bp)					\
-  do { ref_t _on_m = (s)->method, _on_c = (s)->code, _on_e = (s)->env;	\
-       ref_t _on_o = (s)->offset;					\
+  do { ref_t _on_m = OAK_LOAD_RELAXED(&(s)->method);			\
+       ref_t _on_c = OAK_LOAD_RELAXED(&(s)->code);			\
+       ref_t _on_e = OAK_LOAD_RELAXED(&(s)->env);			\
+       ref_t _on_o = OAK_LOAD_RELAXED(&(s)->offset);			\
        if (ON_SITE_CHECK(s, seq1))					\
 	 { SATB_READ_RAW(_on_m);					\
 	   if (bp) e_bp = REF_TO_PTR(sp[-1]) + REF_TO_INT(_on_o);	\
@@ -589,15 +594,17 @@ oak_native_direct_return(unsigned *k)
 	   : oak_native_type(sp[-1]);					\
        if (_on_s1 & 1)							\
 	 ;	/* another thread is filling it: the long way */	\
-       else if ((s)->epoch != oak_native_epoch || (s)->op != _on_v)	\
+       else if (OAK_LOAD_RELAXED(&(s)->epoch) != oak_native_epoch	\
+		|| OAK_LOAD_RELAXED(&(s)->op) != _on_v)			\
 	 oak_native_site_fill((s), _on_v, _on_t);			\
-       else if ((s)->y_type == INT_TO_REF(0))				\
-	 { if ((s)->fn != NULL && !ON_PENDING())			\
+       else if (OAK_LOAD_RELAXED(&(s)->y_type) == INT_TO_REF(0))	\
+	 { if (OAK_LOAD_RELAXED(&(s)->fn) != NULL && !ON_PENDING())	\
 	     ON_SITE_JUMP(s, _on_s1, 0); }				\
        else if (oak_mcache_read(_on_v, _on_t, &_on_cm, &_on_co))	\
-	 { if (_on_t != (s)->y_type || _on_cm != (s)->method)		\
+	 { if (_on_t != OAK_LOAD_RELAXED(&(s)->y_type)			\
+	       || _on_cm != OAK_LOAD_RELAXED(&(s)->method))		\
 	     oak_native_site_fill((s), _on_v, _on_t);			\
-	   else if ((s)->fn != NULL && !ON_PENDING())			\
+	   else if (OAK_LOAD_RELAXED(&(s)->fn) != NULL && !ON_PENDING())	\
 	     ON_SITE_JUMP(s, _on_s1, 1); }				\
      } while (0)
 

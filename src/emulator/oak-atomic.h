@@ -106,6 +106,17 @@ static inline int CTZ64(uint64_t x) {
  *                                         acquire on success; on failure
  *                                         *expp gets the value seen
  *   OAK_ATOMIC_FENCE_ACQUIRE(), OAK_ATOMIC_FENCE_RELEASE()
+ *
+ * And for a word of any type that another thread may read or write at
+ * the same time (the collector's flags, the words of the heap and its
+ * bitmaps a concurrent mark reads while the mutators write them):
+ *   OAK_LOAD_RELAXED(ptr), OAK_STORE_RELAXED(ptr, val)
+ *   OAK_LOAD_ACQUIRE(ptr), OAK_STORE_RELEASE(ptr, val)
+ *   OAK_ADD_RELAXED(ptr, val)          - fetch-and-add
+ * A plain access to such a word is a data race, undefined under the C
+ * memory model however benign on the machine; these compile to the
+ * plain load or store on every machine the emulator runs on, so they
+ * cost nothing and make the protocol the one the compiler sees.
  */
 
 #if (defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L \
@@ -138,6 +149,36 @@ static inline int CTZ64(uint64_t x) {
 #define OAK_ATOMIC_FENCE_ACQUIRE() atomic_thread_fence(memory_order_acquire)
 #define OAK_ATOMIC_FENCE_RELEASE() atomic_thread_fence(memory_order_release)
 
+/* Accesses to a word another thread may be accessing at the same
+   time (below): in the object's own type.  GCC and Clang have the
+   builtins, which take the object as it is (their <stdatomic.h>
+   generics go through a temporary, which GCC's overflow checker
+   misreads in inlined code); any other C11 compiler gets the
+   generics, with __typeof__, the extension every one of them has. */
+#if defined(__GNUC__) || defined(__clang__)
+#define OAK_LOAD_RELAXED(ptr)		__atomic_load_n((ptr), __ATOMIC_RELAXED)
+#define OAK_STORE_RELAXED(ptr, val)	__atomic_store_n((ptr), (val), __ATOMIC_RELAXED)
+#define OAK_LOAD_ACQUIRE(ptr)		__atomic_load_n((ptr), __ATOMIC_ACQUIRE)
+#define OAK_STORE_RELEASE(ptr, val)	__atomic_store_n((ptr), (val), __ATOMIC_RELEASE)
+#define OAK_ADD_RELAXED(ptr, val)	__atomic_fetch_add((ptr), (val), __ATOMIC_RELAXED)
+#else
+#define OAK_LOAD_RELAXED(ptr) \
+    atomic_load_explicit((_Atomic __typeof__(*(ptr)) *)(ptr), \
+			 memory_order_relaxed)
+#define OAK_STORE_RELAXED(ptr, val) \
+    atomic_store_explicit((_Atomic __typeof__(*(ptr)) *)(ptr), (val), \
+			  memory_order_relaxed)
+#define OAK_LOAD_ACQUIRE(ptr) \
+    atomic_load_explicit((_Atomic __typeof__(*(ptr)) *)(ptr), \
+			 memory_order_acquire)
+#define OAK_STORE_RELEASE(ptr, val) \
+    atomic_store_explicit((_Atomic __typeof__(*(ptr)) *)(ptr), (val), \
+			  memory_order_release)
+#define OAK_ADD_RELAXED(ptr, val) \
+    atomic_fetch_add_explicit((_Atomic __typeof__(*(ptr)) *)(ptr), (val), \
+			      memory_order_relaxed)
+#endif
+
 #elif defined(__GNUC__) || defined(__clang__)
 
 #define OAK_ATOMIC_FETCH_OR_U64(ptr, val) \
@@ -158,6 +199,12 @@ static inline int CTZ64(uint64_t x) {
 
 #define OAK_ATOMIC_FENCE_ACQUIRE() __atomic_thread_fence(__ATOMIC_ACQUIRE)
 #define OAK_ATOMIC_FENCE_RELEASE() __atomic_thread_fence(__ATOMIC_RELEASE)
+
+#define OAK_LOAD_RELAXED(ptr)		__atomic_load_n((ptr), __ATOMIC_RELAXED)
+#define OAK_STORE_RELAXED(ptr, val)	__atomic_store_n((ptr), (val), __ATOMIC_RELAXED)
+#define OAK_LOAD_ACQUIRE(ptr)		__atomic_load_n((ptr), __ATOMIC_ACQUIRE)
+#define OAK_STORE_RELEASE(ptr, val)	__atomic_store_n((ptr), (val), __ATOMIC_RELEASE)
+#define OAK_ADD_RELAXED(ptr, val)	__atomic_fetch_add((ptr), (val), __ATOMIC_RELAXED)
 
 #elif defined(_MSC_VER)
 
@@ -199,6 +246,14 @@ static inline int oak_atomic_cas_size_(volatile size_t *p, size_t *e, size_t v) 
    from reordering suffices. */
 #define OAK_ATOMIC_FENCE_ACQUIRE() _ReadWriteBarrier()
 #define OAK_ATOMIC_FENCE_RELEASE() _ReadWriteBarrier()
+
+/* On x86 and x64 an aligned word's load and store are atomic and
+   ordered as these need; volatile keeps the compiler to one access. */
+#define OAK_LOAD_RELAXED(ptr)		(*(volatile __typeof__(*(ptr)) *)(ptr))
+#define OAK_STORE_RELAXED(ptr, val)	(*(volatile __typeof__(*(ptr)) *)(ptr) = (val))
+#define OAK_LOAD_ACQUIRE(ptr)		(*(volatile __typeof__(*(ptr)) *)(ptr))
+#define OAK_STORE_RELEASE(ptr, val)	(_WriteBarrier(), *(volatile __typeof__(*(ptr)) *)(ptr) = (val))
+#define OAK_ADD_RELAXED(ptr, val)	(*(volatile __typeof__(*(ptr)) *)(ptr) += (val))
 
 #else
 #error "No atomic operations available.  Need C11, GCC, Clang, or MSVC."

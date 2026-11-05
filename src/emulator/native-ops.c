@@ -894,8 +894,7 @@ oak_rt_test_and_set(ref_t * p, ref_t old, ref_t new)
 #else
   if (*p != old)
     return e_false;
-  SATB_BARRIER(p, new);
-  *p = new;
+  SATB_STORE(p, new);
   return e_t;
 #endif
 }
@@ -979,7 +978,7 @@ static int
 run_pending(void)
 {
 #ifdef THREADS
-  if (gc_pending)
+  if (OAK_LOAD_RELAXED(&gc_pending))
     wait_for_gc();
 #endif
   return (signal_poll_flag THREADY(&& my_index == 0))

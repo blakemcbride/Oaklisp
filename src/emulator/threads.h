@@ -22,7 +22,7 @@
 #include "oak-thread.h"
 
 #ifdef THREADS
-extern int next_index;
+extern int next_index;		/* slots handed out; read without index_lock, so atomically */
 extern int oak_live_thread_count(void);
 extern oak_tls_key_t index_key;
 extern oak_mutex_t index_lock;

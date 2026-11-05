@@ -214,11 +214,9 @@ oak_mcache_fill(ref_t op, ref_t y_type, ref_t method, ref_t offset)
       OAK_ATOMIC_STORE_REF(seqp, seq + 2);
     }
 #else
-  SATB_BARRIER(&REF_SLOT(op, OPERATION_CACHE_TYPE_OFF), y_type);
-  REF_SLOT(op, OPERATION_CACHE_TYPE_OFF) = y_type;
-  SATB_BARRIER(&REF_SLOT(op, OPERATION_CACHE_METH_OFF), method);
-  REF_SLOT(op, OPERATION_CACHE_METH_OFF) = method;
-  REF_SLOT(op, OPERATION_CACHE_TYPE_OFF_OFF) = offset;
+  SATB_STORE(&REF_SLOT(op, OPERATION_CACHE_TYPE_OFF), y_type);
+  SATB_STORE(&REF_SLOT(op, OPERATION_CACHE_METH_OFF), method);
+  SATB_STORE(&REF_SLOT(op, OPERATION_CACHE_TYPE_OFF_OFF), offset);
 #endif
 #else
   (void)op; (void)y_type; (void)method; (void)offset;
@@ -363,7 +361,8 @@ void
 oak_find_super_method(ref_t op, ref_t type, ref_t *method_ptr,
 		      ref_t *type_ptr)
 {
-  bool parked = REF_SLOT(op, OPERATION_CACHE_TYPE_OFF) == INT_TO_REF(0);
+  bool parked = OAK_LOAD_RELAXED(&REF_SLOT(op, OPERATION_CACHE_TYPE_OFF))
+    == INT_TO_REF(0);
 
   oak_find_method(op, type, method_ptr, type_ptr);
   if (parked && *method_ptr != e_nil)
