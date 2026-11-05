@@ -1,0 +1,92 @@
+;;; Oaklisp's numbers against Guile's: numeric.test has Guile write
+;;; random cases with their answers (numeric-cases.scm), as lines
+;;; (OP (ARG ...) ANSWER), and NUMERIC-CASES-FILE names the file.  Each
+;;; operation is called on its arguments at run time and must give the
+;;; answer exactly: the same value, an integer where the answer is one,
+;;; a fraction in lowest terms with a positive denominator, and a
+;;; fixnum exactly when the answer fits in one, as the reader makes it.
+
+(set! #*print-length #f)
+(set! #*print-level #f)
+
+(define (truth x) (if x #t #f))
+
+(define numeric-ops
+  (list (cons '+ +) (cons '- -) (cons '* *) (cons '/ /)
+	(cons 'negate (lambda (x) (- x)))
+	(cons '+int +) (cons '-int -) (cons '*int *) (cons '/int /)
+	(cons 'quotient quotient) (cons 'remainder remainder)
+	(cons 'modulo modulo) (cons 'gcd gcd) (cons 'lcm lcm)
+	(cons 'abs abs) (cons 'max max) (cons 'min min)
+	(cons 'numerator numerator) (cons 'denominator denominator)
+	(cons 'floor floor) (cons 'ceiling ceiling)
+	(cons 'truncate truncate) (cons 'round round)
+	(cons 'expt expt) (cons 'sqrt sqrt) (cons 'integer-sqrt integer-sqrt)
+	(cons '= (lambda (a b) (truth (= a b))))
+	(cons '< (lambda (a b) (truth (< a b))))
+	(cons '> (lambda (a b) (truth (> a b))))
+	(cons '<= (lambda (a b) (truth (<= a b))))
+	(cons '>= (lambda (a b) (truth (>= a b))))
+	(cons 'zero? (lambda (a) (truth (zero? a))))
+	(cons 'positive? (lambda (a) (truth (positive? a))))
+	(cons 'negative? (lambda (a) (truth (negative? a))))
+	(cons 'even? (lambda (a) (truth (even? a))))
+	(cons 'odd? (lambda (a) (truth (odd? a))))
+	(cons 'bit-not bit-not) (cons 'bit-and bit-and) (cons 'bit-or bit-or)
+	(cons 'bit-xor bit-xor) (cons 'bit-nand bit-nand)
+	(cons 'bit-nor bit-nor) (cons 'bit-equiv bit-equiv)
+	(cons 'bit-andca bit-andca)
+	(cons 'ash-left ash-left) (cons 'ash-right ash-right)
+	(cons 'print-radix
+	      (lambda (x r) (bind ((#*print-radix r)) (format #f "~A" x))))
+	(cons 'read-radix (lambda (s r) (string->number s r)))
+	(cons 'read-prefixed (lambda (s) (string->number s)))
+	(cons 'parse-junk (lambda (s r) (string->number s r)))
+	(cons 'read-datum (lambda (s) (read (make string-input-stream s))))))
+
+;;; The same answer, in the same form.
+(define (same? got want)
+  (cond ((number? want)
+	 (and (number? got)
+	      (= got want)
+	      (eq? (truth (integer? got)) (truth (integer? want)))
+	      (eq? (truth (fixnum? got)) (truth (fixnum? want)))
+	      (= (numerator got) (numerator want))
+	      (= (denominator got) (denominator want))))
+	((string? want) (equal? got want))
+	(else (eq? (truth got) (truth want)))))
+
+;;; Per operation: (NAME CASES FAILURES).
+(define numeric-tally '())
+
+(define (tally! name ok? report)
+  (let ((entry (or (assq name numeric-tally)
+		   (let ((e (list name 0 0)))
+		     (set! numeric-tally (append numeric-tally (list e)))
+		     e))))
+    (set! (nth entry 1) (+ (nth entry 1) 1))
+    (unless ok?
+      (set! (nth entry 2) (+ (nth entry 2) 1))
+      (when (<= (nth entry 2) 3) (report)))))
+
+(define (run-case c)
+  (destructure (name args want) c
+    (let* ((op (cdr (assq name numeric-ops)))
+	   (got (catch-errors (general-error (lambda (e) 'an-error))
+		  (apply op args))))
+      (tally! name (and (not (eq? got 'an-error)) (same? got want))
+	      (lambda ()
+		(format #t "FAIL ~A ~S: got ~S, Guile ~S~%" name args got want))))))
+
+(with-open-file (s numeric-cases-file in)
+  (iterate next ()
+    (let ((c (read s)))
+      (unless (eq? c the-eof-token)
+	(run-case c)
+	(next)))))
+
+(dolist (e numeric-tally)
+  (destructure (name n bad) e
+    (if (zero? bad)
+	(format #t "PASS ~A (~D cases)~%" name n)
+	(format #t "FAIL ~A: ~D of ~D cases~%" name bad n))))

@@ -196,6 +196,7 @@ fi
 program io system-locale "$testdir/io"
 program locales user-locale --interpreter "$testdir/locales"
 program restargs system-locale "$testdir/restargs"
+program props system-locale "$testdir/props"
 driver compile-me-run <<'EOF'
 (show (list (count-to 10) (bigger) (rest-test 1 2 3)))
 EOF

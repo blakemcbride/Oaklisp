@@ -1,0 +1,297 @@
+;;; Property tests of the numeric tower and the reader: algebraic
+;;; identities and round trips over pseudo-random operands, which need
+;;; no table of answers.  Integers come from every class where bugs
+;;; live -- zero and one, the edges of the fixnum range on either word
+;;; size, powers of two and of the bignum digit bases (10^4, 10^9),
+;;; bignums of hundreds of bits -- and rationals from their quotients.
+;;; Fixnum arithmetic is checked against the same sums done by the
+;;; bignum code, scaled up out of fixnum range.  The generator is a
+;;; fixed-seed Park-Miller, so every run and every mode sees the same
+;;; operands.  numeric-check.oak compares against Guile.
+
+(define (check name got expected)
+  (if (equal? got expected)
+      (format #t "PASS ~A~%" name)
+      (format #t "FAIL ~A: got ~S expected ~S~%" name got expected))
+  (flush standard-output))
+
+;;; LOAD binds these to abbreviate its progress reports; not wanted here.
+(set! #*print-length #f)
+(set! #*print-level #f)
+
+(define prop-seed 20261105)
+(define (rand-raw)
+  (set! prop-seed (modulo (* 16807 prop-seed) 2147483647))
+  prop-seed)
+(define (rand n)			; 0 <= result < n, any n
+  (if (<= n 1073741824)
+      (modulo (rand-raw) n)
+      (modulo (+ (* (rand-raw) 2147483647) (rand-raw)) n)))
+(define (pick l) (nth l (rand (length l))))
+(define (signed x) (if (zero? (rand 2)) x (- x)))
+
+(define (rand-bits bits)		; 0 <= result < 2^bits
+  (iterate aux ((k bits) (acc 0))
+    (if (<= k 0)
+	(modulo acc (expt 2 bits))
+	(aux (- k 30) (+ (* acc 1073741824) (rand 1073741824))))))
+
+(define (rand-int)
+  (let ((class (rand 9)))
+    (cond ((= class 0) (pick '(0 1 -1 2 -2)))
+	  ((= class 1) (signed (rand 1000)))
+	  ((= class 2) (signed (rand-bits 30)))
+	  ((= class 3) (signed (rand-bits 62)))
+	  ((= class 4) (+ (pick (list (expt 2 29) (- (expt 2 29))
+				      (expt 2 61) (- (expt 2 61))))
+			  (- (rand 5) 2)))
+	  ((= class 5) (signed (+ (expt (pick '(2 10)) (rand 130)) (- (rand 3) 1))))
+	  ((= class 6) (signed (+ (expt (pick '(10000 1000000000)) (+ 1 (rand 6)))
+				  (- (rand 3) 1))))
+	  ((= class 7) (signed (rand-bits (+ 62 (rand 340)))))
+	  (else (signed (- (expt 2 (+ 30 (rand 200))) (expt 2 (rand 30))))))))
+
+(define (nonzero-int) (let ((x (rand-int))) (if (zero? x) 7 x)))
+(define (rand-rat)
+  (if (zero? (rand 3)) (rand-int) (/ (rand-int) (nonzero-int))))
+(define (nonzero-rat) (let ((x (rand-rat))) (if (zero? x) 1/3 x)))
+
+;;; (PROPERTY NAME N GENERATE TEST): TEST on the arguments GENERATE
+;;; makes, N times; the first counterexample is reported.
+(define (property name n generate test)
+  (iterate aux ((i 0))
+    (if (= i n)
+	(format #t "PASS ~A (~D cases)~%" name n)
+	(let ((args (generate)))
+	  (if (catch-errors (general-error (lambda (e) #f))
+		(apply test args))
+	      (aux (+ i 1))
+	      (format #t "FAIL ~A: ~S~%" name args)))))
+  (flush standard-output))
+
+(define cases 200)
+(define (two-rats) (list (rand-rat) (rand-rat)))
+(define (three-rats) (list (rand-rat) (rand-rat) (rand-rat)))
+(define (two-ints) (list (rand-int) (rand-int)))
+(define (int-and-divisor) (list (rand-int) (nonzero-int)))
+
+;;; An integer in fixnum range is a fixnum, and a ratio is in lowest
+;;; terms with a positive denominator: the canonical forms the rest of
+;;; the system (EQ?, the reader, the printer) relies on.
+(define (canonical? x)
+  (cond ((integer? x)
+	 (eq? (fixnum? x)
+	      (and (<= most-negative-fixnum x) (<= x most-positive-fixnum))))
+	(else (and (positive? (denominator x))
+		   (> (denominator x) 1)
+		   (= 1 (gcd (numerator x) (denominator x)))))))
+
+;;;; The ring.
+
+(property "+ commutes" cases two-rats (lambda (a b) (= (+ a b) (+ b a))))
+(property "+ associates" cases three-rats
+	  (lambda (a b c) (= (+ (+ a b) c) (+ a (+ b c)))))
+(property "* commutes" cases two-rats (lambda (a b) (= (* a b) (* b a))))
+(property "* associates" cases three-rats
+	  (lambda (a b c) (= (* (* a b) c) (* a (* b c)))))
+(property "* distributes over +" cases three-rats
+	  (lambda (a b c) (= (* a (+ b c)) (+ (* a b) (* a c)))))
+(property "- undoes +" cases two-rats (lambda (a b) (= (- (+ a b) b) a)))
+(property "negation" cases two-rats
+	  (lambda (a b) (and (= (- (- a)) a) (= (- a b) (+ a (- b))) (zero? (+ a (- a))))))
+(property "/ undoes *" cases (lambda () (list (rand-rat) (nonzero-rat)))
+	  (lambda (a b) (and (= (* (/ a b) b) a) (= (/ (* a b) b) a))))
+(property "results canonical" cases two-rats
+	  (lambda (a b)
+	    (every? canonical?
+		    (list (+ a b) (- a b) (* a b) (- (+ a b) b) (- a)
+			  (if (zero? b) 0 (/ a b))))))
+
+;;;; Integer division.
+
+(property "quotient and remainder" cases int-and-divisor
+	  (lambda (a b)
+	    (let ((q (quotient a b)) (r (remainder a b)))
+	      (and (= a (+ (* q b) r))
+		   (< (abs r) (abs b))
+		   (or (zero? r) (eq? (negative? r) (negative? a)))
+		   (canonical? q) (canonical? r)))))
+(property "modulo" cases int-and-divisor
+	  (lambda (a b)
+	    (let ((m (modulo a b)))
+	      (and (< (abs m) (abs b))
+		   (or (zero? m) (eq? (negative? m) (negative? b)))
+		   (zero? (remainder (- a m) b))
+		   (= m (- a (* b (floor (/ a b)))))
+		   (canonical? m)))))
+(property "quotient of an exact multiple" cases int-and-divisor
+	  (lambda (a b) (and (= (quotient (* a b) b) a) (zero? (remainder (* a b) b)))))
+(property "gcd and lcm" cases two-ints
+	  (lambda (a b)
+	    (let ((g (gcd a b)) (l (lcm a b)))
+	      (and (not (negative? g))
+		   (if (and (zero? a) (zero? b))
+		       (zero? g)
+		       (and (zero? (remainder a g)) (zero? (remainder b g))
+			    (= 1 (gcd (quotient a g) (quotient b g)))))
+		   (= (* g l) (abs (* a b)))))))
+
+;;;; Rationals.
+
+(property "lowest terms" cases two-rats
+	  (lambda (a b)
+	    (let ((q (if (zero? b) a (/ a b))))
+	      (and (canonical? q)
+		   (= q (/ (numerator q) (denominator q)))))))
+(property "floor ceiling truncate round" cases (lambda () (list (rand-rat)))
+	  (lambda (q)
+	    (let ((f (floor q)) (c (ceiling q)) (tr (truncate q)) (r (round q)))
+	      (and (every? integer? (list f c tr r))
+		   (<= f q) (< q (+ f 1))
+		   (= c (- (floor (- q))))
+		   (= tr (if (negative? q) c f))
+		   (<= (abs (- r q)) 1/2)
+		   (or (< (abs (- r q)) 1/2) (even? r))))))
+(property "expt adds exponents" cases
+	  (lambda () (list (let ((x (rand-rat))) (if (zero? x) 2 x))
+			   (rand 12) (rand 12)))
+	  (lambda (a m n)
+	    (and (= (expt a (+ m n)) (* (expt a m) (expt a n)))
+		 (= (expt a (- m)) (/ 1 (expt a m))))))
+(property "integer-sqrt" cases (lambda () (list (abs (rand-int))))
+	  (lambda (n)
+	    (let ((s (integer-sqrt n)))
+	      (and (<= (* s s) n) (< n (* (+ s 1) (+ s 1)))))))
+
+;;;; Order.
+
+(property "trichotomy" cases two-rats
+	  (lambda (a b)
+	    (and (= 1 (length (remove (list (< a b) (= a b) (> a b)) #f)))
+		 (eq? (< a b) (negative? (- a b)))
+		 (eq? (<= a b) (not (> a b)))
+		 (eq? (>= a b) (not (< a b))))))
+(property "n-ary comparisons" cases three-rats
+	  (lambda (a b c)
+	    (and (eq? (< a b c) (and (< a b) (< b c)))
+		 (eq? (>= a b c) (and (>= a b) (>= b c))))))
+(property "max and min" cases two-rats
+	  (lambda (a b)
+	    (and (= (max a b) (if (< a b) b a)) (= (min a b) (if (< a b) a b))
+		 (= (+ (max a b) (min a b)) (+ a b)))))
+
+;;;; Bits.
+
+(property "bit-and bit-or bit-xor" cases two-ints
+	  (lambda (a b)
+	    (and (= (+ (bit-and a b) (bit-or a b)) (+ a b))
+		 (= (bit-xor a b) (- (bit-or a b) (bit-and a b)))
+		 (= (bit-xor (bit-xor a b) b) a))))
+(property "bit-not and De Morgan" cases two-ints
+	  (lambda (a b)
+	    (and (= (bit-not a) (- -1 a))
+		 (= (bit-not (bit-and a b)) (bit-or (bit-not a) (bit-not b)))
+		 (= (bit-nand a b) (bit-not (bit-and a b)))
+		 (= (bit-nor a b) (bit-not (bit-or a b)))
+		 (= (bit-equiv a b) (bit-not (bit-xor a b)))
+		 (= (bit-andca a b) (bit-and a (bit-not b))))))
+(property "shifts" cases (lambda () (list (rand-int) (rand 200)))
+	  (lambda (a n)
+	    (and (= (ash-left a n) (* a (expt 2 n)))
+		 (= (ash-right a n) (floor (/ a (expt 2 n))))
+		 (= (ash-left a (- n)) (ash-right a n)))))
+
+;;;; Fixnum arithmetic against the bignum code: the same sums with
+;;;; every operand scaled out of fixnum range.
+
+(define big-k (expt 10 30))
+(define (two-small) (list (signed (rand 33554432)) (signed (+ 1 (rand 33554432)))))
+(property "fixnum * against bignums" cases two-small
+	  (lambda (a b)
+	    (= (* a b)
+	       (- (* (+ a big-k) (+ b big-k)) (* big-k (+ a b)) (* big-k big-k)))))
+(property "fixnum + - against bignums" cases two-small
+	  (lambda (a b)
+	    (and (= (+ a b) (- (+ (+ a big-k) b) big-k))
+		 (= (- a b) (- (+ a big-k) (+ b big-k))))))
+(property "fixnum division against bignums" cases two-small
+	  (lambda (a b)
+	    (and (= (quotient a b) (quotient (* a big-k) (* b big-k)))
+		 (= (* big-k (remainder a b)) (remainder (* a big-k) (* b big-k)))
+		 (= (* big-k (modulo a b)) (modulo (* a big-k) (* b big-k)))
+		 (= (* big-k (gcd a b)) (gcd (* a big-k) (* b big-k))))))
+(property "fixnum order against bignums" cases two-small
+	  (lambda (a b)
+	    (and (eq? (< a b) (< (* a big-k) (* b big-k)))
+		 (eq? (= a b) (= (* a big-k) (* b big-k))))))
+
+;;;; Printing and reading numbers.
+
+(define (read-string s) (read (make string-input-stream s)))
+(property "print, string->number" cases (lambda () (list (rand-rat)))
+	  (lambda (q)
+	    (let ((back (string->number (format #f "~A" q))))
+	      (and (= back q) (canonical? back)))))
+(property "print, read" cases (lambda () (list (rand-rat)))
+	  (lambda (q)
+	    (let ((back (read-string (format #f "~S" q))))
+	      (and (= back q) (canonical? back)))))
+(property "print and read in every radix" cases
+	  (lambda () (list (rand-rat) (+ 2 (rand 35))))
+	  (lambda (q r)
+	    (let ((s (bind ((#*print-radix r)) (format #f "~A" q))))
+	      (and (= q (string->number s r))
+		   (= q (bind ((#*input-base r)) (read-string s)))))))
+(property "radix prefixes" cases
+	  (lambda () (list (rand-rat) (pick '(("#b" . 2) ("#o" . 8) ("#d" . 10) ("#x" . 16)))))
+	  (lambda (q p)
+	    (let ((s (append (car p)
+			     (bind ((#*print-radix (cdr p))) (format #f "~A" q)))))
+	      (and (= q (string->number s)) (= q (read-string s))))))
+
+;;;; Printing and reading data.
+
+(define (rand-char) (%fixnum->character (rand 256)))
+(define symbol-chars
+  (#^list-type "abcXYZ019+-*/.<=>!?$%&^_~|\\#:;'`,\"() 	"))
+(define (rand-symbol)
+  (intern (#^string (iterate aux ((n (rand 6)) (acc '()))
+		      (if (zero? n) acc
+			  (aux (- n 1) (cons (pick symbol-chars) acc)))))))
+(define (rand-string)
+  (#^string (iterate aux ((n (rand 12)) (acc '()))
+	      (if (zero? n) acc (aux (- n 1) (cons (rand-char) acc))))))
+(define (rand-datum depth)
+  (let ((k (rand (if (zero? depth) 5 8))))
+    (cond ((= k 0) (rand-rat))
+	  ((= k 1) (rand-symbol))
+	  ((= k 2) (rand-string))
+	  ((= k 3) (rand-char))
+	  ((= k 4) (pick '(#t () 0)))
+	  ((= k 5) (iterate aux ((n (rand 4)) (acc '()))
+		     (if (zero? n) acc (aux (- n 1) (cons (rand-datum (- depth 1)) acc)))))
+	  ((= k 6) (cons (rand-datum (- depth 1)) (rand-datum (- depth 1))))
+	  (else (#^simple-vector
+		 (iterate aux ((n (rand 4)) (acc '()))
+		   (if (zero? n) acc (aux (- n 1) (cons (rand-datum (- depth 1)) acc)))))))))
+
+(define (same-datum? a b)
+  (cond ((and (number? a) (number? b)) (= a b))
+	((and (pair? a) (pair? b))
+	 (and (same-datum? (car a) (car b)) (same-datum? (cdr a) (cdr b))))
+	((and (is-a? a simple-vector) (is-a? b simple-vector))
+	 (same-datum? (#^list-type a) (#^list-type b)))
+	(else (equal? a b))))
+
+(property "every character prints and reads" 1 (lambda () '())
+	  (lambda ()
+	    (every? (lambda (i)
+		      (let ((c (%fixnum->character i)))
+			(eq? c (read-string (format #f "~S" c)))))
+		    (cons 0 (iota 255)))))
+(property "symbols print and read" (* 2 cases) (lambda () (list (rand-symbol)))
+	  (lambda (s) (eq? s (read-string (format #f "~S" s)))))
+(property "strings print and read" cases (lambda () (list (rand-string)))
+	  (lambda (s) (equal? s (read-string (format #f "~S" s)))))
+(property "data print and read" cases (lambda () (list (rand-datum 3)))
+	  (lambda (d) (same-datum? d (read-string (format #f "~S" d)))))

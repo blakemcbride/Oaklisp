@@ -192,10 +192,11 @@
 	  ((eq? (get-type y) fixnum)
 	   (remainder x y))
 	  ((eq? (get-type y) bignum)
-	   ;; A bignum divisor always exceeds a fixnum dividend in
-	   ;; magnitude, so the truncated quotient is zero and the
-	   ;; remainder is the dividend itself.
-	   x)
+	   ;; A bignum divisor exceeds a fixnum dividend in magnitude,
+	   ;; so the truncated quotient is zero and the remainder is the
+	   ;; dividend itself -- save the most negative fixnum over its
+	   ;; own negation, the one bignum no larger, which divides it.
+	   (if (zero? (+ x y)) 0 x))
 	  (else
 	   ;;(error "Illegal second arg: (REMAINDER ~D ~D).~%" x y)
 	   (^super integer remainder x y)
@@ -212,7 +213,8 @@
 	   (modulo x y))
 	  ((eq? (get-type y) bignum)
 	   ;; Likewise the floored remainder, which differs from the
-	   ;; truncated one only when the signs disagree.
+	   ;; truncated one only when the signs disagree.  The most
+	   ;; negative fixnum over its negation comes out 0 below too.
 	   (cond ((zero? x) 0)
 		 ((negative? x) (if (negative? y) x (+ x y)))
 		 (else (if (negative? y) (+ x y) x))))
@@ -233,7 +235,9 @@
     (cond ((zero? y)
 	   (error "Illegal second arg: (QUOTIENT ~D ~D).~%" x y))
 	  ((eq? (get-type y) bignum)
-	   0)
+	   ;; Zero, as the bignum is the larger in magnitude, save the
+	   ;; most negative fixnum over its own negation.
+	   (if (zero? (+ x y)) -1 0))
 	  ((eq? (get-type y) fixnum)
 	   ;; The DIV instruction traps on exactly one pair of fixnums:
 	   ;; the most negative fixnum divided by -1, whose quotient is
@@ -261,9 +265,11 @@
 	       (- x)
 	       (quotientm x y)))
 	  ((eq? (get-type y) bignum)
-	   ;; A bignum divisor always exceeds a fixnum dividend in
-	   ;; magnitude, so the truncated quotient is zero; flooring it
-	   ;; gives -1 exactly when the signs differ and X isn't zero.
+	   ;; A bignum divisor exceeds a fixnum dividend in magnitude,
+	   ;; so the truncated quotient is zero; flooring it gives -1
+	   ;; exactly when the signs differ and X isn't zero.  The one
+	   ;; exception, the most negative fixnum over its negation, is
+	   ;; -1 too.
 	   (cond ((zero? x) 0)
 		 ((negative? x) (if (negative? y) 0 -1))
 		 (else (if (negative? y) -1 0))))

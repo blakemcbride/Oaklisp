@@ -1,0 +1,32 @@
+#!/bin/sh
+# Property tests of the numeric tower and the reader (props.oak), then,
+# with Guile, Oaklisp's numbers against Guile's: numeric-cases.scm
+# writes random cases with Guile's answers, numeric-check.oak checks
+# them, in the emulator and, given the native runtime, as a
+# stand-alone executable, where the numeric code is the native world's.
+# OAK_NUMERIC_SEED picks other cases (the default is fixed, so that a
+# failure repeats); OAK_NUMERIC_CASES sets how many per operation.
+. "$(dirname "$0")/testlib.sh"
+rm -rf props && mkdir props && cd props || exit 99
+
+run_oak_test props.oak || fail "property tests"
+
+test "$GUILE" != no || { echo "no Guile: not compared with Guile's numbers"; exit 0; }
+seed=${OAK_NUMERIC_SEED:-1}
+n=${OAK_NUMERIC_CASES:-300}
+echo "Guile's cases: seed $seed, $n per operation"
+"$GUILE" --no-auto-compile "$testdir/numeric-cases.scm" "$seed" "$n" cases.oak \
+  || fail "numeric-cases.scm failed"
+run_oak_test numeric-check.oak --eval "(define numeric-cases-file \"$(pwd)/cases.oak\")" \
+  || fail "Oaklisp's numbers differ from Guile's"
+
+OAKC=$top_builddir/oakc
+test -f "$top_builddir/src/world/native/liboaknat.a" || exit 0
+echo "(define numeric-cases-file \"$(pwd)/cases.oak\")" > cases-file.oak
+cp "$testdir/numeric-check.oak" .
+"$OAKC" cases-file.oak numeric-check.oak -o numeric-x > oakc.log 2>&1 \
+  || { cat oakc.log; fail "oakc failed for numeric-x"; }
+out=$(OAKWORLD=/nonexistent ./numeric-x 2>&1) || { echo "$out"; fail "numeric-x exited nonzero"; }
+echo "$out" | grep -a -e '^FAIL' -e 'error' && fail "the native numeric code differs from Guile's"
+echo "$out" | grep -q '^PASS' || fail "numeric-x printed no PASS"
+echo "ok numeric-x ($(echo "$out" | grep -c '^PASS') operations, native)"
