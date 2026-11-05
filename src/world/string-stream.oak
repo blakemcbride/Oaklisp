@@ -40,7 +40,20 @@
   char)
 
 (add-method (#^string (string-output-stream accumulated) self)
-  (#^string (reverse accumulated)))
+  ;; ACCUMULATED holds the characters last first.  It is a list this
+  ;; stream built itself, never circular, so it is walked here
+  ;; without the budget LENGTH and REVERSE keep against circular lists
+  ;; (*CIRCULAR-LIST-LIMIT*, conses.oak), which would otherwise refuse
+  ;; to give back more than a million characters -- (FORMAT #F ...)
+  ;; of something big, or any long accumulation.
+  (let* ((n (iterate count ((l accumulated) (n 0))
+	      (if (null? l) n (count (cdr l) (+ n 1)))))
+	 (s (make-string n)))
+    (iterate fill ((l accumulated) (i (- n 1)))
+      (if (null? l)
+	  s
+	  (block (set! (nth s i) (car l))
+		 (fill (cdr l) (- i 1)))))))
 
 ;;; Calling this a STRING-INPUT-STREAM is a misnomer; actually, it can get
 ;;; its input from any sequence.

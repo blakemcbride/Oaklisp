@@ -18,6 +18,13 @@
 (check "format ~& fresh" (format #f "a~&b") (append "a" nl "b"))
 (check "format ~~" (format #f "~~") "~")
 (check "string output stream" (let ((s (make string-output-stream))) (write-string "abc" s) (write-char s #\d) (#^string s)) "abcd")
+;; More characters than the list walkers' circular-list budget (a million).
+(check "string output stream, long"
+       (let ((s (make string-output-stream)))
+	 (dotimes (i 1100000) (write-char s (if (= i 1099999) #\z #\a)))
+	 (let ((str (#^string s)))
+	   (list (length str) (nth str 0) (nth str 1099998) (nth str 1099999))))
+       '(1100000 #\a #\a #\z))
 (check "string input stream read" (read (make string-input-stream "(a (b) \"c\" 4 #\\d)")) '(a (b) "c" 4 #\d))
 (check "read-char peek-char" (let ((s (make string-input-stream "xy"))) (list (peek-char s) (read-char s) (read-char s) (eq? (read-char s) the-eof-token))) '(#\x #\x #\y #t))
 (check "unread-char" (let ((s (make string-input-stream "xy"))) (let ((c (read-char s))) (unread-char s c) (read-char s))) #\x)
