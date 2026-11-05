@@ -1972,6 +1972,22 @@ find_object_start(ms_region_t *r, ref_t *addr)
     return r->start + w * 64 + highest;
 }
 
+#if defined(THREADS) && defined(OAK_GC_VERIFY)
+/* Verify mode's own mark (ms_verify_marks) takes a locative that
+   points exactly at an object's first word for no reference at all.
+   That is what a method's bp is, and every context frame's saved bp,
+   when the method's type has no instance variables of its own: such a
+   type's place in the instance is at its end (kernel1-maketype.oak),
+   so bp is one past the receiver, at the next object in memory.  The
+   mutator makes it from the receiver, after its own scan as often as
+   not, so the concurrent mark has no reason to keep that next object,
+   and counting the locative would report a dead object as missed.  A
+   locative made on purpose at an object's first word (%CRUNCH of a
+   pointer) is the price: verify mode does not check what only such a
+   locative holds. */
+static bool ms_verify_marking;
+#endif
+
 /* The region and the object a reference lands in, or NULL: spatic
    (one block, rejected first: nearly every pointer in a world image
    is one), the stacks, C data and garbage give NULL.  A locative, or
@@ -1990,6 +2006,11 @@ ms_mark_target(ref_t ref, ref_t **objp)
     r = ms_region_of(p);
     if (r == NULL)
 	return NULL;
+#if defined(THREADS) && defined(OAK_GC_VERIFY)
+    if (ms_verify_marking && TAG_IS(ref, LOC_TAG)
+	&& BM_TEST(r->objstart, BM_IDX(r, p)))
+	return NULL;
+#endif
     if (TAG_IS(ref, LOC_TAG) || !BM_TEST(r->objstart, BM_IDX(r, p))) {
 	p = find_object_start(r, p);
 	if (p == NULL)
@@ -2793,6 +2814,7 @@ ms_verify_marks(void)
     /* What must be marked: everything reachable from the roots now,
        the objects allocated during the mark included (which the
        concurrent mark never traced: the barriers stand in). */
+    ms_verify_marking = true;
     ms_mark_roots();
 
     while (mark_stack_top > 0) {
@@ -2826,6 +2848,8 @@ ms_verify_marks(void)
 	    ms_mark_ref(val);
 	}
     }
+
+    ms_verify_marking = false;
 
     /* Report the rest only if none was reached through a field: those
        were reached straight from the roots. */

@@ -68,7 +68,15 @@ allocated, from a ring of the last four million allocations
 (`OAK_GC_VERIFY_LOG=0` in the environment turns the ring off: its
 atomic add on every allocation shifts the timing).  It also reports
 any allocation made while the GC thread has the world stopped.  A
-missed object is kept, so the run goes on.
+missed object is kept, so the run goes on.  The check's own mark
+ignores a locative that points exactly at an object's first word:
+that is a method's bp (and a context frame's saved bp) when the
+method's type has no instance variables of its own, one past the
+receiver, at whatever object follows it in memory, made after the
+thread's scan as often as not, so the concurrent mark rightly leaves
+that object unmarked (Interior pointers, below).  Counted, it was
+reported as a missed object about once in thirty runs of
+gc-stress.oak.
 
 Interior pointers and splitting
 -------------------------------
@@ -77,7 +85,13 @@ MAKE-LAMBDA allocates an operation and its method as one object, and
 the method is referred to on its own (`e_current_method`, context
 frames), often after the operation is garbage; the mark therefore
 maps any pointer that does not land on an object start to the object
-containing it.  When the free list for a request's size class is
+containing it.  A bp is the receiver's address plus its type's place
+in the instance (kernel1-maketype.oak), and a type with no instance
+variables of its own is placed at the end, so a method on one has bp
+one past its receiver, on the next object; the mark takes that for a
+locative to the next object and keeps it, which costs at most a dead
+object kept for a cycle, since the method reaches nothing through
+bp.  When the free list for a request's size class is
 empty, `ms_free_list_alloc` splits an entry of a larger class (whose
 end lies behind the lazy sweep's cursor) rather than collecting.
 
