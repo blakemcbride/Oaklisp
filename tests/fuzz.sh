@@ -13,7 +13,9 @@
 #
 # COUNT programs (default 10) from seed FIRST-SEED (default 1), JOBS at
 # a time (default 1), in DIR (default ./fuzz); -k keeps every program's
-# directory, not just a failing one's.  OAKLISP, OAKWORLD,
+# directory, not just a failing one's.  FUZZOPTS adds emulator options
+# to every run, e.g. FUZZOPTS="--size-seg-max 1" for tiny stack
+# segments.  OAKLISP, OAKWORLD,
 # GUILE and the rest come from testlib.sh, as for the tests.  Exits 1
 # if any program failed.  "fuzz.sh --one SEED" runs one program.
 
@@ -34,7 +36,7 @@ run_one() {
     || { echo "FAIL $seed: progen.scm failed"; return 1; }
   for m in src bc nat exe; do cp "$d/p.oak" "$d/$m/"; done
 
-  (cd "$d/src" && limit 300 "$OAKLISP" --batch --size-heap 128 --world "$OAKWORLD" -- \
+  (cd "$d/src" && limit 300 "$OAKLISP" --batch --size-heap 128 $FUZZOPTS --world "$OAKWORLD" -- \
      --locale system-locale --load p --exit > ../src.out 2>&1)
   results "$d/src.out" > "$d/src.res"
   test -s "$d/src.res" || { echo "FAIL $seed: no results from source"; return 1; }
@@ -44,12 +46,12 @@ run_one() {
     case $m in bc) how=compile-file;; nat) how=native-compile-file;; esac
     # A program's generated C can run to a megabyte, which the C
     # compiler takes minutes over on a loaded machine.
-    (cd "$d/$m" && limit 1200 "$OAKLISP" --batch --size-heap 128 --world "$OAKWORLD" -- --locale system-locale \
+    (cd "$d/$m" && limit 1200 "$OAKLISP" --batch --size-heap 128 $FUZZOPTS --world "$OAKWORLD" -- --locale system-locale \
        --eval "(bind ((#*compiler-noisiness 0)) ($how system-locale \"p\"))" --exit \
        > compile.log 2>&1)
     if test ! -f "$d/$m/p.oa"; then fail="$fail $m(compile)"; continue; fi
     if test $m = nat && test ! -f "$d/$m/p.so"; then continue; fi
-    (cd "$d/$m" && limit 300 "$OAKLISP" --batch --size-heap 128 --world "$OAKWORLD" -- \
+    (cd "$d/$m" && limit 300 "$OAKLISP" --batch --size-heap 128 $FUZZOPTS --world "$OAKWORLD" -- \
        --locale system-locale --load p --exit > ../$m.out 2>&1)
     results "$d/$m.out" > "$d/$m.res"
     cmp -s "$d/src.res" "$d/$m.res" || fail="$fail $m"
@@ -59,7 +61,7 @@ run_one() {
     for m in exe exe-w exe-ir; do
       case $m in exe) flags=;; exe-w) flags=-w;; exe-ir) flags=--ir;; esac
       if (cd "$d/exe" && limit 1200 "$OAKC" $flags p.oak -o $m > $m.oakc.log 2>&1); then
-	(cd "$d/exe" && OAKLISP_OPTIONS="--size-heap 128" OAKWORLD=/nonexistent limit 300 ./$m > ../$m.out 2>&1)
+	(cd "$d/exe" && OAKLISP_OPTIONS="--size-heap 128 $FUZZOPTS" OAKWORLD=/nonexistent limit 300 ./$m > ../$m.out 2>&1)
 	results "$d/$m.out" > "$d/$m.res"
 	cmp -s "$d/src.res" "$d/$m.res" || fail="$fail $m"
       else
@@ -101,7 +103,7 @@ while test $# -gt 0; do
 done
 mkdir -p "$dir" || exit 1
 FUZZDIR=$(cd "$dir" && pwd)
-export FUZZDIR FUZZKEEP GUILE OAKLISP OAKWORLD top_srcdir top_builddir
+export FUZZDIR FUZZKEEP FUZZOPTS GUILE OAKLISP OAKWORLD top_srcdir top_builddir
 seq "$first" $((first + count - 1)) | xargs -P "$jobs" -n 1 sh "$self" --one > "$FUZZDIR/summary" 2>&1
 cat "$FUZZDIR/summary"
 bad=$(grep -c '^FAIL' "$FUZZDIR/summary")

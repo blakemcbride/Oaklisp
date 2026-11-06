@@ -1,0 +1,70 @@
+#!/bin/sh
+# What only an interactive run does: every other test passes --batch,
+# which leaves SIGINT alone and turns crash recovery off.  Without it a
+# SIGINT lands in the debugger with "User interrupt", from bytecode and
+# from natively compiled code, and resuming from there finishes the
+# computation; and a fault inside the VM (here a car of a pointer to
+# nowhere) lands in the debugger too rather than dumping core.
+. "$(dirname "$0")/testlib.sh"
+rm -rf interrupt && mkdir interrupt && cd interrupt || exit 99
+status=0
+
+cat > spin.oak <<'EOF'
+(define (count-to n)
+  (let loop ((i 0) (acc 0)) (if (= i n) acc (loop (+ i 1) (+ acc 1)))))
+EOF
+mkdir src nat && cp spin.oak src/ && cp spin.oak nat/
+(cd nat && oak -- --eval '(bind ((#*compiler-noisiness 0)) (native-compile-file system-locale "spin"))' \
+   --exit > compile.log 2>&1)
+# The debugger reads what to do from standard input: resume.
+echo '(ret 0)' > resume.in
+
+# interrupt DIR COUNT: run COUNT-TO from DIR without --batch, SIGINT it
+# once it has started, resume.
+interrupt() {
+  dir=$1; n=$2
+  (cd $dir && exec "$OAKLISP" --world "$OAKWORLD" -- --locale system-locale --load spin \
+     --eval '(format #t "started~%")' --eval '(flush standard-output)' \
+     --eval "(format #t \"result ~A~%\" (count-to $n))" --exit < ../resume.in > out 2>&1) &
+  pid=$!
+  i=0
+  while ! grep -q '^started' $dir/out 2>/dev/null; do
+    i=$((i + 1)); test $i -lt 600 || break
+    sleep 0.1
+  done
+  sleep 0.2
+  kill -INT $pid
+  i=0
+  while kill -0 $pid 2>/dev/null; do
+    i=$((i + 1)); test $i -lt $((1200 * ${OAK_TIMEOUT_SCALE:-1})) || { kill -9 $pid; break; }
+    sleep 0.1
+  done
+  wait $pid
+  echo "== $dir: exit status $?"
+  cat $dir/out
+  if grep -q 'User interrupt' $dir/out && grep -q "^result $n\$" $dir/out; then
+    echo "ok: $dir interrupted and resumed"
+  else
+    echo "FAIL: $dir was not interrupted and resumed"; status=1
+  fi
+}
+
+interrupt src 200000000
+if test -f nat/spin.so; then
+  interrupt nat 2000000000
+else
+  echo "no native module built: the native run skipped"
+fi
+
+# A fault in the VM: recovered into the debugger, which finds standard
+# input at its end and exits with status 1; with --batch, as before, a
+# plain crash.
+oak_nobatch() { "$OAKLISP" --world "$OAKWORLD" -- --locale system-locale "$@"; }
+out=$(oak_nobatch --eval '(print (car (%crunch 16 3)) standard-output)' --exit < /dev/null 2>&1); st=$?
+echo "$out"
+if test $st = 1 && printf '%s' "$out" | grep -q 'VM crash recovery'; then
+  echo "ok: a VM fault was recovered"
+else
+  echo "FAIL: a VM fault was not recovered (exit status $st)"; status=1
+fi
+exit $status

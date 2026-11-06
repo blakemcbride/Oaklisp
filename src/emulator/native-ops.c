@@ -748,17 +748,17 @@ oak_rt_dump_world(ref_t ** spp)
   return true;
 }
 
-bool
-oak_rt_load_world(ref_t ** spp)
+/* Replace the running world by the one in file S, as LOAD-WORLD does
+   in the interpreter and in natively compiled code: the old heap goes,
+   the stacks are emptied, and the registers are set to the new world's
+   boot code with the two values the boot code expects pushed, the way
+   oak_main starts a world.  Everything the old world left in the
+   registers goes too: e_process in particular has to be the fixnum 0
+   again, which is how the new world's warm boot knows that no process
+   object exists yet; left alone it points into the freed heap. */
+void
+oak_reload_world(char *s)
 {
-  ref_t *sp = *spp;
-  ref_t x = sp[0];
-  char *s;
-
-  if (!TAG_IS(x, LOC_TAG))
-    return false;
-  s = oak_c_string((ref_t *) LOC_TO_PTR(x), REF_TO_INT(sp[-1]));
-
   THREADY(oak_mutex_lock(&dump_lock));
   free_space(&spatic);
 #ifdef USE_MARK_SWEEP
@@ -767,7 +767,6 @@ oak_rt_load_world(ref_t ** spp)
   free_space(&new_space);
 #endif
   read_world(s);
-  free(s);
 
 #ifdef USE_MARK_SWEEP
   ms_init();
@@ -776,6 +775,9 @@ oak_rt_load_world(ref_t ** spp)
   alloc_space(&new_space, new_space.size);
   free_point = new_space.start;
 #endif
+  /* The switches on the command line were meant for the world just
+     discarded; leaving them in place makes "--eval (load-world ...)"
+     reboot forever. */
   clear_program_args();
 
   value_stack.sp = value_stack.bp;
@@ -787,6 +789,9 @@ oak_rt_load_world(ref_t ** spp)
   context_stack.segment = 0;
   context_stack.pushed_count = 0;
 
+  e_process = INT_TO_REF(0);
+  oak_timer_counter = 0;
+  oak_timer_increment = 0;
   e_current_method = e_boot_code;
   e_env = REF_TO_PTR(REF_SLOT(e_current_method, METHOD_ENV_OFF));
   e_code_segment = REF_SLOT(e_current_method, METHOD_CODE_OFF);
@@ -796,8 +801,23 @@ oak_rt_load_world(ref_t ** spp)
 
   *++value_stack.sp = INT_TO_REF(4321);
   *++value_stack.sp = INT_TO_REF(54321);
-  *spp = value_stack.sp;
   THREADY(oak_mutex_unlock(&dump_lock));
+}
+
+bool
+oak_rt_load_world(ref_t ** spp)
+{
+  ref_t *sp = *spp;
+  ref_t x = sp[0];
+  char *s;
+
+  if (!TAG_IS(x, LOC_TAG))
+    return false;
+  s = oak_c_string((ref_t *) LOC_TO_PTR(x), REF_TO_INT(sp[-1]));
+  value_stack.sp = sp;
+  oak_reload_world(s);
+  free(s);
+  *spp = value_stack.sp;
   return true;
 }
 
@@ -810,6 +830,13 @@ oak_rt_super_call(oak_rt_fn * fn)
   ref_t the_type, x, y, y_type, meth_type, offset, seg;
   oak_native_fn f;
 
+  /* The operation under the type has to be in the buffer, as the
+     emulator's ^SUPER-TAIL makes sure (POPVAL, CHECKVAL_POP). */
+  if (1 > (long)(sp - value_stack.bp))
+    {
+      stack_unflush(&value_stack, 1);
+      sp = value_stack.sp;
+    }
   the_type = sp[0];
   if (!TAG_IS(the_type, PTR_TAG))
     return 0;
@@ -985,6 +1012,22 @@ run_pending(void)
     || (oak_timer_increment && oak_timer_counter > OAK_TIMER_LIMIT);
 }
 
+/* Call the operation on top of the stack.  oak_native_call_1 declines
+   (0) when the buffer holds the operation alone, the first argument
+   still in a flushed segment; the emulator's FUNCALL pulls a segment
+   in for that (CHECKVAL_POP), and so does this before calling it.
+   Taking the refusal for an operation that cannot be called sent such
+   calls to the FUNCALL trap, which reported no method for them: with
+   one-ref segments (--size-seg-max 1) an unflush leaves just what was
+   asked for, and the call after it often found nothing else there. */
+static int
+run_call(oak_native_fn * fn)
+{
+  if (1 > (long)(value_stack.sp - value_stack.bp))
+    stack_unflush(&value_stack, 1);
+  return oak_native_call_1(fn, 1);
+}
+
 static void run_loop(oak_native_fn fn, unsigned k);
 
 void
@@ -1038,7 +1081,7 @@ run_loop(oak_native_fn fn, unsigned k)
 	{
 	  /* The ordinary call path refused: a pending signal, or
 	     something that needs the trap operation. */
-	  switch (oak_native_call_1(&fn, 1))
+	  switch (run_call(&fn))
 	    {
 	    case 2:
 	      break;
@@ -1047,7 +1090,7 @@ run_loop(oak_native_fn fn, unsigned k)
 	    default:
 	      /* Hand everything to the FUNCALL trap operation. */
 	      run_funcall_trap();
-	      switch (oak_native_call_1(&fn, 1))
+	      switch (run_call(&fn))
 		{
 		case 2:
 		  break;
@@ -1067,7 +1110,7 @@ run_loop(oak_native_fn fn, unsigned k)
 		 handler. */
 	      e_pc = CODE_SEG_FIRST_INSTR(e_code_segment);
 	      run_signal_trap();
-	      switch (oak_native_call_1(&fn, 1))
+	      switch (run_call(&fn))
 		{
 		case 2:
 		  k = 0;
@@ -1087,7 +1130,7 @@ run_loop(oak_native_fn fn, unsigned k)
 	  /* e_pc is at the instruction to resume (ON_POLL); deliver
 	     the signal first, as the emulator's intr_trap does. */
 	  run_signal_trap();
-	  switch (oak_native_call_1(&fn, 1))
+	  switch (run_call(&fn))
 	    {
 	    case 2:
 	      k = 0;

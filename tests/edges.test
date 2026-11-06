@@ -1,0 +1,16 @@
+#!/bin/sh
+# Edges the rest of the suite never reached (edges.oak); modes.test runs
+# it in every mode.
+. "$(dirname "$0")/testlib.sh"
+run_oak_test edges.oak || exit 1
+# The collectors' trace, which nothing else turns on: a full collection,
+# cycles under a small heap, and a dump's compaction, all reported.
+rm -f edges-trace.bin
+out=$(oak --trace-gc 3 --size-heap 128 -- --eval '(%full-gc)' \
+  --eval "(let loop ((i 0) (l '())) (if (< i 300000) (loop (+ i 1) (cons (list i) (if (= 0 (modulo i 1000)) '() l))) (length l)))" \
+  --eval '(dump-world "edges-trace.bin")' --exit 2>&1); status=$?
+rm -f edges-trace.bin
+printf '%s\n' "$out" | tail -5
+test $status = 0 || fail "a run with --trace-gc 3 failed (exit status $status)"
+test "$(printf '%s\n' "$out" | grep -c 'GC')" -gt 5 || fail "--trace-gc 3 traced no collections"
+echo "trace run passed"

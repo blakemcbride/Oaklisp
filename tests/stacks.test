@@ -1,0 +1,59 @@
+#!/bin/sh
+# Tiny stack buffers: test programs run with the smallest value and
+# context buffers and one-ref flushed segments, so that nearly every
+# push flushes and nearly every pop unflushes, in bytecode, mixed
+# native mode and an oakc executable.  Nothing else in the suite
+# shrinks the stacks: the default buffers hold whatever the programs
+# push between calls, and the flush and unflush paths of the native
+# helpers and of the executables' call driver went unrun.  An
+# executable once took a call whose first argument was still in a
+# flushed segment for a call of an operation without a method.
+. "$(dirname "$0")/testlib.sh"
+OAKC=$top_builddir/oakc
+rm -rf stacks && mkdir stacks && cd stacks || exit 99
+
+progs="control objects restargs edges promises"
+sizes1="--size-val-stk 256 --size-cxt-stk 4 --size-seg-max 1"
+sizes2="--size-val-stk 300 --size-cxt-stk 20 --size-seg-max 16"
+exe=yes
+test -x "$OAKC" && test -f "$top_builddir/src/world/native/liboaknat.a" || exe=no
+status=0
+
+# check NAME OUTFILE: the PASS lines and nothing that failed.
+check() {
+  if grep -a -q -e '^FAIL' -e 'An error occurred' -e '^Error:' -e '^\*\*\* ' -e 'atal error' "$2" \
+     || ! grep -a -q '^PASS' "$2"; then
+    echo "FAIL $1"
+    grep -a -e '^FAIL' -e 'rror' "$2" | head -5
+    status=1
+  else
+    echo "ok $1 ($(grep -a -c '^PASS' "$2") passed)"
+  fi
+}
+
+for p in $progs; do
+  mkdir $p && cp "$testdir/$p.oak" $p/
+  (cd $p && oak -- --eval "(bind ((#*compiler-noisiness 0)) (native-compile-file system-locale \"$p\"))" \
+     --exit > native.log 2>&1)
+  test $exe = no || (cd $p && limit 1200 "$OAKC" --locale system-locale $p.oak -o x > oakc.log 2>&1) || {
+    echo "FAIL $p: oakc failed"; tail -5 $p/oakc.log; status=1; }
+done
+
+for sizes in "$sizes1" "$sizes2"; do
+  echo "== $sizes"
+  for p in $progs; do
+    limit 600 "$OAKLISP" --batch --world "$OAKWORLD" $sizes -- --locale system-locale \
+      --load "$testdir/$p" --exit > $p/src.out 2>&1
+    check "$p source" $p/src.out
+    if test -f $p/$p.so; then
+      (cd $p && limit 600 "$OAKLISP" --batch --world "$OAKWORLD" $sizes -- --locale system-locale \
+	 --load $p --exit > nat.out 2>&1)
+      check "$p native" $p/nat.out
+    fi
+    if test -x $p/x; then
+      (cd $p && OAKLISP_OPTIONS="$sizes" OAKWORLD=/nonexistent limit 600 ./x > exe.out 2>&1)
+      check "$p executable" $p/exe.out
+    fi
+  done
+done
+exit $status

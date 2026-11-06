@@ -18,3 +18,5 @@ stress-native/
 modes/
 props/
 fuzz/
+stacks/
+interrupt/

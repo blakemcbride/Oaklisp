@@ -24,5 +24,35 @@ oak --dump dumped.hex --dump-base 16 -- --exit >/dev/null 2>&1
 head -n 1 dumped.hex | grep -q 'format=hex' || fail "hex dump lacks header"
 out=$("$OAKLISP" --batch --world dumped.hex -- --eval '(print (* 6 7) standard-output)' --exit 2>&1)
 printf '%s' "$out" | grep -q '42$' || fail "hex world did not reload"
+# DUMP-WORLD from a running program, and LOAD-WORLD of the result from
+# another: the state survives (a long list, a hash table, a weak
+# pointer).  LOAD-WORLD once left the old world's process object in
+# the registers and crashed in the new world's warm boot.
+cat > dw-prog.oak <<'EOF'
+(define *counter* 41)
+(define (bump) (set! *counter* (+ *counter* 1)) *counter*)
+(define big (let loop ((i 0) (acc '())) (if (= i 20000) acc (loop (+ i 1) (cons (* i i) acc)))))
+(define tbl (make-equal-hash-table))
+(set! (table-entry tbl "key") 'value)
+(define held (list 'weakly 'held))
+(define held-hash (object-hash held))
+(define (state) (list (bump) (length big) (car big) (table-entry tbl "key") (eq? (object-unhash held-hash) held)))
+(format #t "dumped ~A~%" (dump-world "dw-prog.bin"))
+(set! #*print-length #f)
+(format #t "after dump ~S~%" (state))
+EOF
+rm -f dw-prog.bin
+oak -- --load dw-prog --exit > dw-prog.out 2>&1
+cat dw-prog.out
+grep -q '^after dump (42 20000 399960001 VALUE #T)$' dw-prog.out || fail "DUMP-WORLD did not return to the program"
+test -s dw-prog.bin || fail "DUMP-WORLD wrote no world"
+out=$("$OAKLISP" --batch --world dw-prog.bin -- --locale system-locale --eval '(print (state) standard-output)' --exit 2>&1)
+echo "$out"
+printf '%s' "$out" | grep -q '(42 20000 399960001 VALUE #T)$' || fail "the world DUMP-WORLD wrote lost its state"
+out=$(echo '(print (state) standard-output)' | oak -- --eval '(define x 1)' --eval '(load-world "dw-prog.bin")' 2>&1); status=$?
+echo "$out"
+test "$status" = 0 || fail "LOAD-WORLD from a program failed (exit status $status)"
+printf '%s' "$out" | grep -q '(42 20000 399960001 VALUE #T)' || fail "the world LOAD-WORLD loaded lost its state"
+rm -f dw-prog.oak dw-prog.out dw-prog.bin
 rm -f dumped.bin bogus.bin dumped.hex header.txt
 echo "world test passed"

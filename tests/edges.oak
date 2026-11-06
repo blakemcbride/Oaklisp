@@ -1,0 +1,114 @@
+;;; Edges the rest of the suite never reached, found by measuring its
+;;; coverage of the emulator: the fixnum division traps, rotations by
+;;; negative counts, too few arguments for a rest list, ^SUPER with no
+;;; method to find, method lookup through a type hierarchy deeper than
+;;; the search's first table, the weak pointer table growing at run
+;;; time, a full collection, changing directory.  modes.test runs this
+;;; in every mode.
+
+(define (check name got expected)
+  (if (equal? got expected)
+      (format #t "PASS ~A~%" name)
+      (format #t "FAIL ~A: got ~S expected ~S~%" name got expected))
+  (flush standard-output))
+
+;;; LOAD binds these to abbreviate its progress reports; not wanted here.
+(set! #*print-length #f)
+(set! #*print-level #f)
+
+(define (err thunk)
+  (catch-errors (general-error (lambda (e) 'error))
+    (thunk)))
+
+;;; Operands the compiler cannot see, so nothing is folded.
+(define (id x) x)
+(define zero 0)
+(define minus-one -1)
+(define mnf most-negative-fixnum)
+
+;;; The division instructions trap on a zero divisor, and on the most
+;;; negative fixnum over -1, whose quotient is no fixnum.
+(check "modulo by zero" (err (lambda () (modulo (id 7) (id zero)))) 'error)
+(check "remainder by zero" (err (lambda () (remainder (id 7) (id zero)))) 'error)
+(check "quotient by zero" (err (lambda () (quotient (id 7) (id zero)))) 'error)
+(check "quotientm by zero" (err (lambda () (quotientm (id 7) (id zero)))) 'error)
+(check "quotient mnf -1" (quotient (id mnf) (id minus-one)) (- mnf))
+(check "quotientm mnf -1" (quotientm (id mnf) (id minus-one)) (- mnf))
+(check "remainder mnf -1" (remainder (id mnf) (id minus-one)) 0)
+(check "modulo mnf -1" (modulo (id mnf) (id minus-one)) 0)
+(check "quotientm signs" (list (quotientm (id -7) (id 2)) (quotientm (id 7) (id -2))) '(-4 -4))
+
+;;; A negative count rotates the other way.
+(check "rot-left by -1" (rot-left (id 1) (id minus-one)) mnf)
+(check "rot-right by -3" (rot-right (id 1) (id -3)) 8)
+(check "rot-left back" (rot-left (rot-left (id 12345) (id -7)) (id 7)) 12345)
+
+;;; Arity errors.
+(define (two-or-more a b . r) (list a b r))
+(check "rest lambda, enough" ((id two-or-more) 1 2) '(1 2 ()))
+(check "rest lambda, too few" (err (lambda () ((id two-or-more) 1))) 'error)
+(check "fixed lambda, too many" (err (lambda () ((id (lambda (a) a)) 1 2))) 'error)
+
+;;; ^SUPER starting at a type that, with its supertypes, has no method
+;;; for the operation.
+(define-instance e-base type '() (list object))
+(define-instance e-mid type '() (list e-base))
+(define-instance e-op operation)
+(add-method (e-op (e-base) self) 1)
+(add-method (e-op (e-mid) self) (+ 10 (^super e-base e-op self)))
+(define-instance e-op2 operation)
+(add-method (e-op2 (e-mid) self) (^super e-base e-op2 self))
+(check "^super found" (e-op (make e-mid)) 11)
+(check "^super with no method" (err (lambda () (e-op2 (make e-mid)))) 'error)
+
+;;; Method lookup walks the supertypes depth first, keeping a list of
+;;; the ones still to search per level; 200 levels outgrow its first
+;;; table (64) twice.
+(define deep-root (make type '() (list object)))
+(define deep-op (make operation))
+(define deep-other (make operation))
+(add-method (deep-op (deep-root) self) 'root)
+(define (deep-chain n)
+  (iterate loop ((t deep-root) (i 0))
+    (if (= i n) t (loop (make type '() (list t)) (+ i 1)))))
+(define deep-leaf (deep-chain 200))
+(check "method 200 types up" (deep-op (make deep-leaf)) 'root)
+(check "no method 200 types up" (err (lambda () (deep-other (make deep-leaf)))) 'error)
+;; A mixin at every level: two lists per level to search.
+(define deep-mix
+  (iterate loop ((t deep-root) (i 0))
+    (if (= i 150) t
+	(loop (make type '() (list (make type '() (list object)) t)) (+ i 1)))))
+(check "method 150 mixed types up" (deep-op (make deep-mix)) 'root)
+
+;;; The weak pointer table grows at run time: OBJECT-HASH gives each
+;;; object a weak pointer, and more objects than the table first holds
+;;; get one.  A collection afterwards must keep every live one and drop
+;;; the dead.
+(define live-objects
+  (iterate loop ((i 0) (l '()))
+    (if (= i 12000) l (loop (+ i 1) (cons (list i) l)))))
+(define live-hashes (map object-hash live-objects))
+(define (hash-garbage n)
+  (iterate loop ((i 0) (l '()))
+    (if (= i n) l (loop (+ i 1) (cons (object-hash (list 'dead i)) l)))))
+(define dead-hashes (hash-garbage 12000))
+(%full-gc)
+(%gc)
+(check "weak pointers kept"
+       (iterate loop ((o live-objects) (h live-hashes))
+	 (cond ((null? o) #t)
+	       ((eq? (object-unhash (car h)) (car o)) (loop (cdr o) (cdr h)))
+	       (else (list 'lost (car h)))))
+       #t)
+(check "weak pointers dropped"
+       (> (iterate loop ((h dead-hashes) (n 0))
+	    (cond ((null? h) n)
+		  ((object-unhash (car h)) (loop (cdr h) n))
+		  (else (loop (cdr h) (+ n 1)))))
+	  11000)
+       #t)
+
+;;; Changing directory: to where we are, and somewhere that isn't.
+(check "cwd ." (block (set! (cwd) ".") (cwd)) ".")
+(check "cwd nonexistent" (err (lambda () (set! (cwd) "/nonexistent/directory/here"))) 'error)

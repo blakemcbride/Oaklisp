@@ -384,6 +384,30 @@ threads-stress's last check, the concurrent definitions, does not
 finish under ThreadSanitizer in its time (the checks before it
 pass), so that test is expected to fail there.
 
+Coverage
+========
+
+Which lines of the emulator and the native runtime the suite runs,
+with gcov.  The coverage flags go in AM_CFLAGS, which compiles the
+emulator's own sources only, not the C the native compiler and oakc
+generate (those take CFLAGS); -lgcov in LIBS lets oakc link the
+instrumented runtime into executables, which then add to the same
+counts:
+
+	./configure --enable-threads CFLAGS="-g -O0" LIBS=-lgcov
+	make AM_CFLAGS=--coverage
+	make -C src/world native-world AM_CFLAGS=--coverage
+	make check AM_CFLAGS=--coverage
+	cd src/emulator && gcov liboakrt_a-*.gcda
+
+Each `FILE.c.gcov` marks the lines never run with `#####`.  Build in a
+copy of the tree (the `.gcda` files collect counts from every run of
+it) and do it for both the default and the threads build, whose
+collectors differ.  2026-11-05: 75% of the lines in the default
+build, 79% in the threads build; edges.test, stacks.test,
+interrupt.test and the dump and load of world.test came of what the
+rest left unrun.
+
 Thread Support
 ==============
 

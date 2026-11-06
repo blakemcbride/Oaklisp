@@ -33,6 +33,9 @@
 (define-instance load-world operation)
 
 (add-method (load-world (string) self)
+  ;; The other threads would go on running in the discarded heap.
+  (when (> (%thread-count) 1)
+    (error "LOAD-WORLD with ~D OS threads live.~%" (%thread-count)))
   (%load-world (make-locative (%vref self 0)) (length self)))
 
 ;;; eof

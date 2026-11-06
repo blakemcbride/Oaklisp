@@ -1401,67 +1401,15 @@ loop(ref_t initial_tos)
 	      POPVAL(x);	/* locative to string data */
 	      CHECKTAG1(x, LOC_TAG, 2);
 	      y = PEEKVAL();	/* string length */
-	      THREADY(oak_mutex_lock(&dump_lock));
 	      {
 		char *s = oak_c_string((ref_t *) LOC_TO_PTR(x),
 				       REF_TO_INT(y));
 
-		/* Free old heap spaces */
-		free_space(&spatic);
-#ifdef USE_MARK_SWEEP
-		ms_destroy();
-#else
-		free_space(&new_space);
-#endif
-
-		/* Load the new world (allocates new spatic) */
-		read_world(s);
+		UNLOCALIZE_ALL();
+		oak_reload_world(s);	/* native-ops.c */
 		free(s);
-
-		/* Allocate new working space */
-#ifdef USE_MARK_SWEEP
-		ms_init();
-#else
-		new_space.size = e_next_newspace_size
-		  = original_newspace_size;
-		alloc_space(&new_space, new_space.size);
-		free_point = new_space.start;
-#endif
-
-		/* The switches on the command line were meant for the
-		   world we just discarded; leaving them in place makes
-		   "--eval (load-world ...)" reboot forever. */
-		clear_program_args();
-
-		/* Reset stacks (discard all flushed segments) */
-		value_stack.sp = value_stack.bp;
-		*value_stack.bp = INT_TO_REF(1234);
-		value_stack.segment = 0;
-		value_stack.pushed_count = 0;
-
-		context_stack.sp = context_stack.bp;
-		*context_stack.bp = INT_TO_REF(1234);
-		context_stack.segment = 0;
-		context_stack.pushed_count = 0;
-
-		/* Set boot registers from new world */
-		e_current_method = e_boot_code;
-		e_env = REF_TO_PTR(REF_SLOT(e_current_method,
-					     METHOD_ENV_OFF));
-		e_code_segment = REF_SLOT(e_current_method,
-					  METHOD_CODE_OFF);
-		e_pc = CODE_SEG_FIRST_INSTR(e_code_segment);
-		e_bp = e_env;
-		e_nargs = 0;
-
-		/* Reinitialize local register copies */
 		LOCALIZE_ALL();
-
-		/* Push initial values as in loop() entry */
-		PUSHVAL_IMM(INT_TO_REF(4321));
-		PUSHVAL_IMM(INT_TO_REF(54321));
 	      }
-	      THREADY(oak_mutex_unlock(&dump_lock));
 	      GOTO_TOP;
 
 	      /* An unassigned opcode means a corrupt world or a

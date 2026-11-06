@@ -9,7 +9,8 @@
 #
 #   sh tests/fuzz-shrink.sh FILE MODE
 #
-# MODE is bc, nat, exe, exe-w or exe-ir.  The result is FILE.min, with
+# MODE is bc, nat, exe, exe-w or exe-ir.  FUZZOPTS adds emulator
+# options to every run, as for fuzz.sh.  The result is FILE.min, with
 # both runs' results beside it (FILE.min.src, FILE.min.MODE).
 
 . "$(dirname "$0")/testlib.sh"
@@ -26,22 +27,22 @@ run() {
   m=$1 d=$2
   case $m in
     src)
-      (cd "$d" && limit 300 "$OAKLISP" --batch --size-heap 128 --world "$OAKWORLD" -- \
+      (cd "$d" && limit 300 "$OAKLISP" --batch --size-heap 128 $FUZZOPTS --world "$OAKWORLD" -- \
 	 --locale system-locale --load p --exit > src.out 2>&1);;
     bc|nat)
       case $m in bc) how=compile-file;; nat) how=native-compile-file;; esac
       rm -rf "$d/$m" && mkdir "$d/$m" && cp "$d/p.oak" "$d/$m/"
-      (cd "$d/$m" && limit 1200 "$OAKLISP" --batch --size-heap 128 --world "$OAKWORLD" -- \
+      (cd "$d/$m" && limit 1200 "$OAKLISP" --batch --size-heap 128 $FUZZOPTS --world "$OAKWORLD" -- \
 	 --locale system-locale \
 	 --eval "(bind ((#*compiler-noisiness 0)) ($how system-locale \"p\"))" \
 	 --exit > compile.log 2>&1 \
-       && limit 300 "$OAKLISP" --batch --size-heap 128 --world "$OAKWORLD" -- \
+       && limit 300 "$OAKLISP" --batch --size-heap 128 $FUZZOPTS --world "$OAKWORLD" -- \
 	 --locale system-locale --load p --exit > ../$m.out 2>&1);;
     exe|exe-w|exe-ir)
       case $m in exe) flags=;; exe-w) flags=-w;; exe-ir) flags=--ir;; esac
       rm -f "$d/x" "$d/$m.out"
       (cd "$d" && limit 1200 "$OAKC" $flags p.oak -o x > oakc.log 2>&1 \
-       && OAKLISP_OPTIONS="--size-heap 128" OAKWORLD=/nonexistent limit 300 ./x > $m.out 2>&1);;
+       && OAKLISP_OPTIONS="--size-heap 128 $FUZZOPTS" OAKWORLD=/nonexistent limit 300 ./x > $m.out 2>&1);;
   esac
   touch "$d/$m.out"
   results "$d/$m.out" > "$d/$m.res"

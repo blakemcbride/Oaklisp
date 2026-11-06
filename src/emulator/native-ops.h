@@ -88,6 +88,7 @@ extern void oak_rt_gc(int full);	/* synchronized; pushes #f */
 extern void oak_rt_halt(int code);
 extern bool oak_rt_dump_world(ref_t ** spp);	/* 2 */
 extern bool oak_rt_load_world(ref_t ** spp);	/* 2; sets registers */
+extern void oak_reload_world(char *file);
 
 /* ^SUPER-TAIL's dispatch, mirroring oak_native_call's contract: 2 =
    native method, *FN set, registers set, e_pc past its NATIVE 0; 1 =

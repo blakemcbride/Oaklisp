@@ -85,11 +85,13 @@ report success.)}
 \op{dump-world}{file-name}
 \doc{Saves the running world to \emph{file-name}, a binary world
 image, and keeps running.  The image can be booted with
-\dfsw{{-}{-}world}.}
+\dfsw{{-}{-}world}.  It is an error while other OS threads are
+running, since only the calling thread's state would be saved.}
 
 \op{load-world}{file-name}
 \doc{Replaces the running world with the image in \emph{file-name}.
-It never returns.}
+It never returns.  It is an error while other OS threads are running,
+since they would go on in the world being discarded.}
 
 \gv{system-version}
 \doc{A string naming the version of Oaklisp, e.g.\ \df{"Oaklisp
