@@ -137,6 +137,54 @@
 	   (map thread-join ts)))
        '(1 2 3))
 
+;;; A thread's process stays on its OS thread: waiting for a mutex, a
+;;; future or a semaphore never puts it on the scheduler's queue, where
+;;; another OS thread could resume it.  Before that held, the first case
+;;; ran the thread's end on the main thread (a fatal stack underflow).
+;;; Main holds M with a slow process queued while the thread waits for
+;;; M; then main pauses, which runs the next queued process.
+(check "mutex wait with processes queued"
+       (let ((m (make mutex)))
+	 (acquire-mutex m)
+	 (process-run-fn (lambda () (thread-sleep 200)) '())
+	 (let ((t (make-thread (lambda () (with-mutex m 'ok)))))
+	   (thread-sleep 50)
+	   (release-mutex m)
+	   (pause)
+	   (thread-join t)))
+       'ok)
+(check "mutex contention with processes queued"
+       (let ((m (make mutex)) (n (list 0)))
+	 (dotimes (r 20)
+	   (acquire-mutex m)
+	   (process-run-fn (lambda () (thread-sleep 2)) '())
+	   (let ((ts (map (lambda (k)
+			    (make-thread
+			     (lambda ()
+			       (with-mutex m (set! (car n) (+ (car n) 1))))))
+			  '(1 2 3 4))))
+	     (thread-sleep 5)
+	     (release-mutex m)
+	     (pause)
+	     (map thread-join ts)))
+	 (car n))
+       80)
+(check "force on a thread"
+       (thread-join (make-thread (lambda () (force (future (* 6 7))))))
+       42)
+(check "a future of main's forced on a thread and on main"
+       (let* ((f (future (block (thread-sleep 50) 'computed)))
+	      (t (make-thread (lambda () (force f)))))
+	 (list (force f) (thread-join t)))
+       '(computed computed))
+(check "semaphore wait on a thread"
+       (let* ((s (make semaphore))
+	      (t (make-thread (lambda () (wait s) 'woken))))
+	 (thread-sleep 50)
+	 (signal s)
+	 (thread-join t))
+       'woken)
+
 ;;; The manual's examples.
 (load (append (file-base (#^string (fluid oaklisp-examples))) "parallel-map"))
 (load (append (file-base (#^string (fluid oaklisp-examples))) "producer-consumer"))

@@ -103,6 +103,16 @@
   (set! windings (cdr windings))
   (set! wind-count (- wind-count 1)))
 
+;;; The process of a thread made by MAKE-THREAD (below) is pinned to
+;;; its OS thread: the bottom of its stack is that thread's exit, so it
+;;; must never be resumed on another.  It never goes on the scheduler's
+;;; queue: PAUSE only yields the OS thread, and waiting for a mutex, a
+;;; future or a semaphore parks it.
+(define-instance pinned-process type '() (list process))
+(define-instance %process-pinned? operation)
+(add-method (%process-pinned? (object) self) #f)
+(add-method (%process-pinned? (pinned-process) self) #t)
+
 (define trace-processes #f)
 
 (add-method (initialize (process pid process-fluid-binding-list
@@ -477,8 +487,8 @@
     (%enable-alarms)
     (when wake (%thread-unpark wake))))
 
-;;; The OS threads parked in BUSY-WORK for want of a process to run,
-;;; by index; under the scheduler mutex.
+;;; The OS threads parked in BUSY-WORK or START for want of a process
+;;; to run, by index; under the scheduler mutex.
 (define *idle-schedulers* '())
 
 (define (lwp thunk)
@@ -486,16 +496,38 @@
   (enqueue (cons (%load-process) thunk)
 	   *scheduleQ*)
   (release-scheduler))
+
+;;; Run the next queued process.  Its callers -- a process made by
+;;; PROCESS-RUN-FN at its end, FORCE and a semaphore's WAIT suspending
+;;; theirs -- have nothing to return to: the caller's own continuation
+;;; is in a queue (a future's waiters, a semaphore's) or done.  So with
+;;; nothing queued and another OS thread that may queue something (the
+;;; one computing the future, say), wait for it as an idle scheduler,
+;;; parked; returning would run on in a dead extent, and the queued
+;;; continuation run a second time later.  Alone, there is nothing to
+;;; wait for.
 (define (start)
-  (let ((next nil))
+  (iterate retry ()
     (acquire-scheduler)
-    (if (qempty? *scheduleQ*)
-	'()
-	(set! next (dequeue *scheduleQ*)))
-    (when next (%store-process (car next))) ;; fix process register and proceed
-    (%reset-alarm-counter)
-    (release-scheduler)
-    (when next ((cdr next)))))
+    (cond ((not (qempty? *scheduleQ*))
+	   (let ((next (dequeue *scheduleQ*)))
+	     (%store-process (car next)) ;; fix process register and proceed
+	     (%reset-alarm-counter)
+	     (release-scheduler)
+	     ((cdr next))))
+	  ((> (%thread-count) 1)
+	   (let ((me (%thread-index)))
+	     (set! *idle-schedulers* (cons me *idle-schedulers*))
+	     (release-scheduler)
+	     (%thread-park %mutex-park-ms)
+	     (acquire-scheduler)
+	     (set! *idle-schedulers* (delq me *idle-schedulers*))
+	     (release-scheduler)
+	     (retry)))
+	  (else
+	   (%reset-alarm-counter)
+	   (release-scheduler)
+	   '()))))
 
 
 ;;; pause causes a context switch. here is an easier-to-read version,
@@ -511,6 +543,14 @@
 |#
 
 (define (pause)
+  (if (%process-pinned? (%load-process))
+      ;; A thread of the program's own: other processes are not for it
+      ;; to run, nor its process for any other thread to resume.
+      (block (%reset-alarm-counter)
+	     (%thread-yield))
+      (%pause-process)))
+
+(define (%pause-process)
   (let ((next nil)
 	(pid (process-id (current-process))))
     (acquire-scheduler)
@@ -586,7 +626,8 @@
 ;;; off, so for it, and inside the scheduler's section (SIGNAL takes
 ;;; a semaphore's mutex there), the step is a yield.  Otherwise, with
 ;;; processes queued, run them (PAUSE): the holder may be among them,
-;;; and it is what the alarm would do.  With nothing queued and
+;;; and it is what the alarm would do -- but not on a thread of the
+;;; program's own, whose process is pinned to it.  With nothing queued and
 ;;; another OS thread to release the mutex, park, registered in the
 ;;; mutex's waiter list, for at most %MUTEX-PARK-MS: RELEASE-MUTEX
 ;;; unparks the list.  The timeout covers a wakeup lost in the
@@ -636,7 +677,8 @@
   (cond ((%in-scheduler?)
 	 (%thread-yield)
 	 0)
-	((not (qempty? *scheduleQ*))
+	((and (not (qempty? *scheduleQ*))
+	      (not (%process-pinned? (%load-process))))
 	 (pause)
 	 0)
 	((> (%thread-count) 1)
@@ -690,17 +732,33 @@
 (add-method (wait (semaphore s-value s-Q) self)
   (acquire-mutex self)
   (set! s-value (- s-value 1))
-  (if (< s-value 0)
-      ;; add to s-Q and block until woken
-      (call/cc (lambda (c)
-		 ;; since context switching preserves current-process,
-		 ;; we should be able to just grab and go
-		 (enqueue (cons (current-process)
-				(lambda () (c nil)))
-			  s-Q)
-		 (release-mutex self)
-		 (start)))
-      (release-mutex self))
+  (cond ((not (< s-value 0))
+	 (release-mutex self))
+	((%process-pinned? (%load-process))
+	 ;; A thread of the program's own parks; SIGNAL calls the thunk
+	 ;; it queues instead of handing it to the scheduler.
+	 (let ((woken (list #f))
+	       (me (%thread-index)))
+	   (enqueue (cons (current-process)
+			  (lambda ()
+			    (set! (car woken) #t)
+			    (%thread-unpark me)))
+		    s-Q)
+	   (release-mutex self)
+	   (iterate park ()
+	     (unless (car woken)
+	       (%thread-park %mutex-park-ms)
+	       (park)))))
+	(else
+	 ;; add to s-Q and block until woken
+	 (call/cc (lambda (c)
+		    ;; since context switching preserves current-process,
+		    ;; we should be able to just grab and go
+		    (enqueue (cons (current-process)
+				   (lambda () (c nil)))
+			     s-Q)
+		    (release-mutex self)
+		    (start)))))
   nil)
 
 ;;; WARNING: make sure that no other virtual process acquires a
@@ -715,7 +773,10 @@
 
   (set! s-value (+ s-value 1))
   (when (<= s-value 0) ;; wake up the next blocked process
-	(enqueue (dequeue s-Q) *scheduleQ*))
+    (let ((w (dequeue s-Q)))
+      (if (%process-pinned? (car w))
+	  ((cdr w))
+	  (enqueue w *scheduleQ*))))
 
   (release-mutex self)
   (release-scheduler)
@@ -742,7 +803,42 @@
   (^super mutex initialize self)
   self)
 
-(add-method (force (future-obj flag val scheduled? dependantsQ sched-policy err-policy) self)
+;;; The computation, by whoever claimed it (SCHEDULED?): the value
+;;; stored, and the processes waiting for it handed to the scheduler.
+(define-instance %future-compute operation)
+(add-method (%future-compute (future-obj flag val dependantsQ) self)
+  (let ((newval (val)))
+    (acquire-mutex self)
+    (set! flag #t)
+    (set! val newval)
+    (release-mutex self)
+    ;; at this point no more people will
+    ;; be trying to add themselves...
+    (acquire-scheduler)
+    (qappend *scheduleQ* dependantsQ)
+    (release-scheduler)))
+
+(define-instance %force-process operation)
+
+(add-method (force (future-obj flag val scheduled?) self)
+  (if (%process-pinned? (%load-process))
+      ;; A thread of the program's own computes the value itself when no
+      ;; one has begun to, else waits for it parked: it may not suspend
+      ;; its process into the queues below, from which another OS thread
+      ;; would resume it.
+      (block
+	(when (test-and-set scheduled? null? #t)
+	  (%future-compute self))
+	(iterate wait ()
+	  (acquire-mutex self)
+	  (let ((done flag))
+	    (release-mutex self)
+	    (cond (done val)
+		  (else (%thread-park 1)
+			(wait))))))
+      (%force-process self)))
+
+(add-method (%force-process (future-obj flag val scheduled? dependantsQ) self)
   ;; Run whatever the scheduler still holds before suspending.  A
   ;; waiter left in the queue and resumed later runs the next fresh
   ;; thunk on its own dead stack extent, where this caller's catch
@@ -769,19 +865,8 @@
 		 ;; someone claim responsibility for and initiate future computation
 		 (let ((schedule? (test-and-set scheduled? null? #t)))
 		   (when schedule?
-			 (process-run-fn
-			  (lambda ()
-			    (let ((newval (val)))
-			      (acquire-mutex self)
-			      (set! flag #t)
-			      (set! val newval)
-			      (release-mutex self)
-			      ;; at this point no more people will
-			      ;; be trying to add themselves...
-			      (acquire-scheduler)
-			      (qappend *scheduleQ* dependantsQ)
-			      (release-scheduler)))
-			  nil)))
+			 (process-run-fn (lambda () (%future-compute self))
+					 nil)))
 		 (start)))))
 
 (define-syntax delay
@@ -866,7 +951,7 @@
 ;;; What the new OS thread runs.
 (add-method (%thread-run (thread name state value index lock waiters)
 		    self thunk)
-  (%store-process (make process))
+  (%store-process (make pinned-process))
   (%thread-register self)
   (let ((outcome (catch-errors (general-error (lambda (e) (cons 'failed e)))
 		   (cons 'done (thunk)))))

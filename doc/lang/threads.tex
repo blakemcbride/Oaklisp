@@ -12,7 +12,9 @@ with thread support (\texttt{configure --enable-threads}) Oaklisp
 code runs on several of them at once, and a program may make one of
 its own with \df{make-thread}.
 
-Each thread runs one process from a thunk to its end.  That process
+Each thread runs one process from a thunk to its end, and that
+process runs on no other thread: waiting for a mutex, a future or a
+semaphore parks the thread, and \df{pause} only yields it.  That process
 starts with a copy of its creator's fluid bindings and its creator's
 winding stack, so \df{bind} and \df{wind-protect} nest as they would
 in a call; global variables and all other objects are shared.  The
@@ -70,7 +72,8 @@ anonymous one.}
 
 \op{acquire-mutex}{mutex}
 \doc{Waits until \emph{mutex} is free and takes it.  While it waits
-the thread runs other processes or sleeps; it does not spin.  A wait
+the thread runs other processes or sleeps (a thread made by
+\df{make-thread} sleeps); it does not spin.  A wait
 that goes on for seconds is reported on standard error, naming the
 mutex and its holder.}
 

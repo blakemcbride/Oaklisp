@@ -48,11 +48,16 @@ oak_main_native(int argc, char **argv, const oak_embedding *emb,
 		const char *const *oak_args, int n_oak_args)
 {
   /* argv[0], the built-in switches, then "--" and the user's own
-     arguments; see oak_main_embedded. */
-  char **nargv = xmalloc(((size_t)argc + n_oak_args + 2) * sizeof(char *));
+     arguments; see oak_main_embedded.  Kept in a static: it lives as
+     long as the program, and with OAKLISP_OPTIONS set parse_cmd_line
+     keeps pointers into a copy of it instead, which would leave this
+     one unreferenced -- a leak to a leak checker.  Volatile, or the
+     compiler drops a static that is only ever written. */
+  static char **volatile nargv;
   int i, j = 0;
   unsigned m;
 
+  nargv = xmalloc(((size_t)argc + n_oak_args + 2) * sizeof(char *));
   nargv[j++] = argv[0];
   for (i = 0; i < n_oak_args; i++)
     nargv[j++] = (char *)oak_args[i];

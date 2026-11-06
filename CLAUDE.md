@@ -443,7 +443,13 @@ instructions to the emulator - a bisection aid for mixed mode only.
 suspending: a waiter left in the queue and resumed later would run the
 next fresh thunk on its own dead stack extent, so a throw out of a
 forced promise body would unwind into garbage.  Bytecode rarely meets
-this because alarm preemption tends to drain the queue first.
+this because alarm preemption tends to drain the queue first.  `start`
+never returns on an empty queue while another OS thread may queue
+something (it parks as an idle scheduler), for the same reason.  A
+`make-thread` thread's process is a `pinned-process`: its stack ends in
+its OS thread's exit, so it never enters a scheduler queue (`pause`
+only yields, mutex and semaphore waits park, `force` computes or waits
+parked); resumed on thread 0 it once returned past thread 0's bottom.
 
 ## Key Technical Constraints
 

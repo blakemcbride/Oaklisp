@@ -176,6 +176,51 @@ AS_IF([test x$enable_threads = xyes],
  [AC_SEARCH_LIBS([pthread_create],[pthread],[],
    [AC_MSG_WARN([pthread_create not found; threads may use Windows native API])])])
 
+# The collector's bitmaps are 64-bit words reached through atomic
+# operations (oak-atomic.h).  A 32-bit machine without 64-bit atomic
+# instructions (MIPS32, 32-bit PowerPC) has GCC call libatomic for
+# them, which has to be linked explicitly.
+AC_MSG_CHECKING([whether 64-bit atomic operations need -latomic])
+m4_define([OAK_ATOMIC64_PROGRAM],
+  [AC_LANG_PROGRAM([[#include <stdint.h>
+uint64_t oak_word;]],
+    [[return (int)__atomic_load_n(&oak_word, __ATOMIC_RELAXED)
+	 + (int)__atomic_fetch_or(&oak_word, 1, __ATOMIC_RELAXED);]])])
+AC_LINK_IFELSE([OAK_ATOMIC64_PROGRAM], [AC_MSG_RESULT([no])],
+ [oak_save_LIBS=$LIBS
+  LIBS="$LIBS -latomic"
+  AC_LINK_IFELSE([OAK_ATOMIC64_PROGRAM], [AC_MSG_RESULT([yes])],
+   [LIBS=$oak_save_LIBS
+    AC_MSG_RESULT([no; they do not link either way])])])
+
+# Natively compiled code jumps from function to function with tail
+# calls the musttail attribute guarantees (oak-native.h), compiled
+# with -fPIC.  A compiler may have the attribute and still be unable
+# to honor it for an indirect call (Clang on PowerPC and MIPS); then
+# the generated code returns to a trampoline instead.
+AC_MSG_CHECKING([whether indirect musttail calls compile])
+oak_save_CFLAGS=$CFLAGS
+CFLAGS="$CFLAGS -fPIC"
+AC_COMPILE_IFELSE([AC_LANG_SOURCE([[
+#if defined(__has_attribute)
+#if __has_attribute(musttail)
+typedef int (*oak_fn)(unsigned);
+extern oak_fn oak_table[4];
+int oak_call(unsigned k)
+{
+  oak_fn f = oak_table[k & 3];
+  __attribute__((musttail)) return f(k + 1);
+}
+#endif
+#endif
+int oak_unused;
+]])],
+ [AC_MSG_RESULT([yes])],
+ [AC_MSG_RESULT([no; natively compiled code will use a trampoline])
+  AC_DEFINE([OAK_NATIVE_NO_MUSTTAIL], [1],
+    [Define when the C compiler cannot honor musttail on an indirect call.])])
+CFLAGS=$oak_save_CFLAGS
+
 AC_MSG_CHECKING([with_readline])
 AC_ARG_WITH([readline],
        [AS_HELP_STRING([--with-readline],

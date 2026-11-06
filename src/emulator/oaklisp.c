@@ -124,10 +124,13 @@ oak_main_embedded(int argc, char **argv, const oak_embedding *emb,
   /* argv[0], the built-in Oaklisp switches, then "--" and the user's
      own arguments, kept out of switch processing (it stops at the
      --exit the built-in switches end with) but visible to the program
-     through the argument-line operations. */
-  char **nargv = xmalloc(((size_t)argc + n_oak_args + 2) * sizeof(char *));
+     through the argument-line operations.  Static, as in
+     oak_main_native: with OAKLISP_OPTIONS set parse_cmd_line keeps
+     pointers into a copy of it, not into it. */
+  static char **volatile nargv;
   int i, j = 0;
 
+  nargv = xmalloc(((size_t)argc + n_oak_args + 2) * sizeof(char *));
   nargv[j++] = argv[0];
   for (i = 0; i < n_oak_args; i++)
     nargv[j++] = (char *)oak_args[i];

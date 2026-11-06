@@ -115,8 +115,12 @@ static inline int CTZ64(uint64_t x) {
  *   OAK_ADD_RELAXED(ptr, val)          - fetch-and-add
  * A plain access to such a word is a data race, undefined under the C
  * memory model however benign on the machine; these compile to the
- * plain load or store on every machine the emulator runs on, so they
- * cost nothing and make the protocol the one the compiler sees.
+ * plain load or store of a word the machine's size or smaller, so they
+ * cost nothing and make the protocol the one the compiler sees.  The
+ * collector's bitmaps are 64-bit words, though, and a 32-bit machine
+ * without 64-bit atomic instructions (MIPS32, 32-bit PowerPC; not x86
+ * or ARMv7) makes a library call of each access to one (libatomic,
+ * which configure links when it has to).
  */
 
 #if (defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L \

@@ -383,10 +383,14 @@ oak_native_type(ref_t x)
    which deals with it.  Defining OAK_NATIVE_TRAMPOLINE forces the
    trampoline. */
 
-/* 32-bit PowerPC cannot tail-call indirectly, so the attribute's
-   presence is not enough there; the trampoline serves instead. */
-#if !defined(OAK_NATIVE_TRAMPOLINE) && defined(__has_attribute) \
-  && !(defined(__powerpc__) && !defined(__powerpc64__))
+/* The attribute's presence is not enough: Clang has it everywhere but
+   cannot honor it for an indirect call on PowerPC (32- and 64-bit) or
+   MIPS ("failed to perform tail call elimination on a call site marked
+   musttail"), so the trampoline serves there.  Configure tries one
+   with the C compiler and defines OAK_NATIVE_NO_MUSTTAIL when it
+   fails, for machines not named here. */
+#if !defined(OAK_NATIVE_TRAMPOLINE) && !defined(OAK_NATIVE_NO_MUSTTAIL) \
+  && defined(__has_attribute) && !defined(__powerpc__) && !defined(__mips__)
 #if __has_attribute(musttail)
 #define ON_MUSTTAIL __attribute__((musttail))
 #endif

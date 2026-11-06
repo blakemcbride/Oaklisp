@@ -41,7 +41,8 @@ test -n "$target" || { echo "cannot read the target architecture"; exit 1; }
 echo "qemu-native: target architecture $target"
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/oak-qemu.XXXXXX")
-trap 'rm -rf "$work"' 0
+test -n "${OAK_QEMU_KEEP-}" && echo "qemu-native: work in $work"
+test -n "${OAK_QEMU_KEEP-}" || trap 'rm -rf "$work"' 0
 
 prefixes=
 objs=
@@ -85,7 +86,7 @@ hex() { od -An -v -tx1 "$1" | tr -s ' ' '\n' | sed '/^$/d; s/^/0x/; s/$/,/'; }
   done
   echo '  0};'
   echo 'static const char *const args[] = {'
-  echo '  "--batch", "--", "--load-embedded", "--exit"};'
+  echo '  "--batch", "--", "--locale", "system-locale", "--load-embedded", "--exit"};'
   echo 'int main(int argc, char **argv) {'
   echo '  static oak_embedding e;'
   echo '  e.world = the_world; e.world_size = sizeof the_world;'

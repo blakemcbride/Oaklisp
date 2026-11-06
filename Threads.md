@@ -179,7 +179,8 @@ Synchronization primitives (all in `multiproc.oak`):
 
 - **Mutex**: the held flag taken with `%test-and-set-locative`;
   a waiter does not spin: it runs the processes the scheduler has
-  queued (`pause`, as the alarm would), or with none queued parks its
+  queued (`pause`, as the alarm would; not in a `make-thread` thread,
+  whose process is pinned), or with none queued parks its
   OS thread on the mutex's waiter list (stream primitive 19, 10 ms at
   a time) until `release-mutex` unparks it; only the scheduler's own
   lock, and a mutex taken inside the scheduler's section, is waited
@@ -197,7 +198,16 @@ Synchronization primitives (all in `multiproc.oak`):
 - **Futures**: Lazy evaluation with dependent process queue;
   auto-scheduled computation.
 - **Scheduler**: Global `*scheduleQ*` protected by mutex + alarm
-  disable.  `pause()` does `call/cc` context switch.
+  disable.  `pause()` does `call/cc` context switch.  `start` (the
+  end of a `process-run-fn` process, `force` and a semaphore's `wait`
+  suspending theirs) with nothing queued waits as an idle scheduler
+  while another OS thread may queue something; returning would run
+  on in a dead extent.
+- **Pinned processes**: a `make-thread` thread's process is a
+  `pinned-process`, whose stack ends in that OS thread's exit, so it
+  never enters a scheduler queue: `pause` only yields the OS thread,
+  a mutex wait parks, `force` computes the value itself or waits
+  parked, a semaphore's `wait` parks and `signal` wakes it directly.
 - **Threads, condition variables, atomics**: The API, below.
 
 
