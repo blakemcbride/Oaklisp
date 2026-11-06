@@ -11,7 +11,11 @@
 ;;; recursions run a bounded number of times.  So the program runs to
 ;;; the end, and what it prints -- one "=> TAG VALUE" line per result --
 ;;; depends on nothing but the language: no hash numbers, no addresses,
-;;; no timing.  The errors it does provoke are caught by the program
+;;; no timing, and no order of evaluating arguments, which Oaklisp
+;;; leaves open (the evaluator and compiled code differ): every side
+;;; effect a result could show is on a variable or an object made fresh
+;;; for it, and the global variables, which escapes and argument order
+;;; may update in any order, are never shown.  The errors it does provoke are caught by the program
 ;;; itself (CATCH-ERRORS), so traps are exercised too.
 
 (define args (cdr (command-line)))
@@ -173,8 +177,9 @@
 	    `(let* ((,v ,(g 'int env depth)) (,f (lambda () ,v)))
 	       (set! ,v ,(g 'int env depth))
 	       (,f))))
-    ((30) (let ((gv (pick '(zg1 zg2))))
-	    `(block (set! ,gv (+ ,gv ,(g 'int env depth))) ,gv)))
+    ((30) (let ((gv (pick '(zg1 zg2))) (d (fresh "d")))
+	    ;; The increment, not the global: siblings may update it first.
+	    `(let ((,d ,(g 'int env depth))) (set! ,gv (+ ,gv ,d)) ,d)))
     ((31) `(bind (((fluid zfl) ,(g 'int env depth))) ,(g 'int env depth)))
     ((32) `(wind-protect (set! zg1 (+ zg1 1)) ,(g 'int env depth) (set! zg2 (+ zg2 1))))
     ((33) `(apply ,(pick '(+ max min)) ,(g 'int env depth) ,(g 'list env depth)))
@@ -231,14 +236,14 @@
     ((54) (let ((op (fresh "op")) (name (pick '(zsum zrest max +))))
 	    `(let ((,op ,name))
 	       (,op ,(g (if (eq? name 'zsum) 'obj 'int) env depth) ,(g 'int env depth)))))
-    ((53) (with-local 'obj env depth
-		      (lambda (v env2)
-			`(block (zset-a ,v ,(g 'int env2 depth)) (zsum ,v ,(g 'int env2 depth))))))
-    (else (with-local 'vec env depth
-		      (lambda (v env2)
-			`(block (set! (nth ,v (modulo ,(g 'int env2 depth) (length ,v)))
-				      ,(g 'int env2 depth))
-				(apply + ((coercer list-type) ,v))))))))
+    ((53) (let ((v (fresh "v")))
+	    `(let ((,v (make zt2 ,(g 'int env depth) ,(g 'int env depth) ,(g 'int env depth))))
+	       (zset-a ,v ,(g 'int env depth)) (zsum ,v ,(g 'int env depth)))))
+    (else (let ((v (fresh "v")))
+	    ;; A copy, so that no one else sees the change.
+	    `(let ((,v (zcopy ,(g 'vec env depth))))
+	       (set! (nth ,v (modulo ,(g 'int env depth) (length ,v))) ,(g 'int env depth))
+	       (apply + ((coercer list-type) ,v)))))))
 
 (define (gen-rat env depth)
   (case (rnd 6)
@@ -295,8 +300,8 @@
   (case (rnd 3)
     ((0) `(vector ,@(map (lambda (i) (g 'int env depth)) (iota (+ 1 (rnd 4))))))
     ((1) `((coercer simple-vector) (cons ,(g 'int env depth) ,(g 'list env depth))))
-    (else (with-local 'vec env depth
-		      (lambda (v env2) `(block (set! (nth ,v 0) ,(g 'int env2 depth)) ,v))))))
+    (else (let ((v (fresh "v")))
+	    `(let ((,v (zcopy ,(g 'vec env depth)))) (set! (nth ,v 0) ,(g 'int env depth)) ,v)))))
 
 (define (gen-str env depth)
   (case (rnd 4)
@@ -320,8 +325,9 @@
   (case (rnd 3)
     ((0) `(make zt ,(g 'int env depth) ,(g 'int env depth)))
     ((1) `(make zt2 ,(g 'int env depth) ,(g 'int env depth) ,(g 'int env depth)))
-    (else (with-local 'obj env depth
-		      (lambda (v env2) `(block (zset-a ,v ,(g 'int env2 depth)) ,v))))))
+    (else (let ((v (fresh "v")))
+	    `(let ((,v (make zt ,(g 'int env depth) ,(g 'int env depth))))
+	       (zset-a ,v ,(g 'int env depth)) ,v)))))
 
 ;;; A call of global G with arguments made for its parameter types.  A
 ;;; global with a counter (its first parameter "n") gets a small one.
@@ -378,6 +384,7 @@
     (define (show tag x) (format #t "~C> ~A ~S~%" #\= tag x))
     (define (znz x) (if (zero? x) 7 x))
     (define (zid x) x)
+    (define (zcopy v) ((coercer simple-vector) ((coercer list-type) v)))
     (define zg1 0)
     (define zg2 0)
     (set! (fluid zfl) 3)
@@ -425,8 +432,7 @@
 	 (top (map (lambda (i) (show)) (iota (+ 8 (rnd 16)))))
 	 (main (map (lambda (i) (show)) (iota (+ 3 (rnd 6))))))
     (append prelude gforms top
-	    `((define (zmain) ,@main) (zmain)
-	      (show "globals" (list zg1 zg2 (fluid zfl)))))))
+	    `((define (zmain) ,@main) (zmain) (show "fluid" (fluid zfl))))))
 
 ;;; OBJ-INT shows an object through what it holds.
 (define old-gen gen)

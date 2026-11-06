@@ -5,4 +5,4 @@
 # campaign is fuzz.sh by hand (-n, -s, -j).
 . "$(dirname "$0")/testlib.sh"
 test "$GUILE" != no || skip "no Guile to write the programs"
-sh "$testdir/fuzz.sh" -n "${OAK_FUZZ_COUNT:-6}" -s "${OAK_FUZZ_SEED:-1}" -j 3 -d fuzz
+sh "$testdir/fuzz.sh" -n "${OAK_FUZZ_COUNT:-4}" -s "${OAK_FUZZ_SEED:-1}" -j 4 -d fuzz

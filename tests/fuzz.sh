@@ -42,7 +42,9 @@ run_one() {
   fail=
   for m in bc nat; do
     case $m in bc) how=compile-file;; nat) how=native-compile-file;; esac
-    (cd "$d/$m" && limit 300 "$OAKLISP" --batch --size-heap 128 --world "$OAKWORLD" -- --locale system-locale \
+    # A program's generated C can run to a megabyte, which the C
+    # compiler takes minutes over on a loaded machine.
+    (cd "$d/$m" && limit 1200 "$OAKLISP" --batch --size-heap 128 --world "$OAKWORLD" -- --locale system-locale \
        --eval "(bind ((#*compiler-noisiness 0)) ($how system-locale \"p\"))" --exit \
        > compile.log 2>&1)
     if test ! -f "$d/$m/p.oa"; then fail="$fail $m(compile)"; continue; fi
@@ -56,7 +58,7 @@ run_one() {
   if test -x "$OAKC" && test -f "$top_builddir/src/world/native/liboaknat.a"; then
     for m in exe exe-w exe-ir; do
       case $m in exe) flags=;; exe-w) flags=-w;; exe-ir) flags=--ir;; esac
-      if (cd "$d/exe" && limit 600 "$OAKC" $flags p.oak -o $m > $m.oakc.log 2>&1); then
+      if (cd "$d/exe" && limit 1200 "$OAKC" $flags p.oak -o $m > $m.oakc.log 2>&1); then
 	(cd "$d/exe" && OAKLISP_OPTIONS="--size-heap 128" OAKWORLD=/nonexistent limit 300 ./$m > ../$m.out 2>&1)
 	results "$d/$m.out" > "$d/$m.res"
 	cmp -s "$d/src.res" "$d/$m.res" || fail="$fail $m"
