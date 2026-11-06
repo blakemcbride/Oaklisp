@@ -10,6 +10,21 @@ run_oak_test threads-api.oak --eval "(define #*oaklisp-examples \"$ex\")" || fai
 want=$(oak -- --eval "(define #*oaklisp-examples \"$ex\")" --load "$testdir/threads-api" --exit 2>&1 | grep -c '^PASS')
 echo "thread API tests pass"
 
+# Joins and condition waits by processes the scheduler moves between
+# OS threads: four runs at once with eight scheduler threads.
+for i in 1 2 3 4; do
+  ( limit 300 "$OAKLISP" --batch --world "$OAKWORLD" -- --locale system-locale \
+      --pthreads 8 --load "$testdir/thread-moves" --exit > moves.$i.out 2>&1
+    echo "exit $?" >> moves.$i.out ) &
+done
+wait
+for i in 1 2 3 4; do
+  got=$(grep -c '^PASS' moves.$i.out); bad=$(grep -c '^FAIL' moves.$i.out)
+  grep -q '^exit 0$' moves.$i.out && test "$bad" = 0 && test "$got" = 2 \
+    || { tail -8 moves.$i.out; fail "thread-moves run $i: $got passed, $bad failed"; }
+done
+echo "joins and condition waits by moving processes pass"
+
 # The same program compiled natively, when a module can be built: the
 # threads run native code.
 rm -rf api-native && mkdir api-native && cp "$testdir/threads-api.oak" api-native/

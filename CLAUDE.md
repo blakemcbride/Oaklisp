@@ -450,6 +450,11 @@ something (it parks as an idle scheduler), for the same reason.  A
 its OS thread's exit, so it never enters a scheduler queue (`pause`
 only yields, mutex and semaphore waits park, `force` computes or waits
 parked); resumed on thread 0 it once returned past thread 0's bottom.
+Any other process can be moved between OS threads wherever alarms are
+on (the alarm handler is `pause`), so code that puts `%thread-index`
+where a waker will find it keeps alarms off until it has parked
+(`busy-work`, `start`, `thread-join`, `condition-wait`;
+`tests/thread-moves.oak`).
 
 ## Key Technical Constraints
 

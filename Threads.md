@@ -208,6 +208,16 @@ Synchronization primitives (all in `multiproc.oak`):
   never enters a scheduler queue: `pause` only yields the OS thread,
   a mutex wait parks, `force` computes the value itself or waits
   parked, a semaphore's `wait` parks and `signal` wakes it directly.
+- **Parking under a name**: any other process may be moved to another
+  OS thread wherever alarms are on (the alarm handler is `pause`), so
+  one that names its OS thread for a waker (`%thread-index` in a
+  waiter or idle list) keeps alarms off until it is parked:
+  `busy-work`, `start`, `thread-join`, `condition-wait`.  Moved in
+  between, it parked a thread nothing would unpark
+  (`tests/thread-moves.oak` hung one run in three with
+  `--pthreads 8`).  A condition variable's waiters are tickets a notify
+  marks, so a stray unpark, which every park may get, never leaves an
+  entry for a notify to be spent on.
 - **Threads, condition variables, atomics**: The API, below.
 
 

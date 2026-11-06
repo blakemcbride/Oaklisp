@@ -506,6 +506,12 @@
 ;;; parked; returning would run on in a dead extent, and the queued
 ;;; continuation run a second time later.  Alone, there is nothing to
 ;;; wait for.
+;;;
+;;; A process that names its OS thread somewhere (by %THREAD-INDEX) for
+;;; a waker and then parks keeps alarms off from the one to the other:
+;;; the alarm handler is PAUSE, so preempted in between, the process
+;;; could go on on another OS thread and park that one, which nothing
+;;; would ever unpark.  Here, BUSY-WORK, THREAD-JOIN and CONDITION-WAIT.
 (define (start)
   (iterate retry ()
     (acquire-scheduler)
@@ -517,10 +523,11 @@
 	     ((cdr next))))
 	  ((> (%thread-count) 1)
 	   (let ((me (%thread-index)))
-	     (set! *idle-schedulers* (cons me *idle-schedulers*))
-	     (release-scheduler)
+	     (unless (memq me *idle-schedulers*)
+	       (set! *idle-schedulers* (cons me *idle-schedulers*)))
+	     (release-mutex *scheduleQ-mutex*) ; nothing queued: none to wake
 	     (%thread-park %mutex-park-ms)
-	     (acquire-scheduler)
+	     (acquire-mutex *scheduleQ-mutex*)
 	     (set! *idle-schedulers* (delq me *idle-schedulers*))
 	     (release-scheduler)
 	     (retry)))
@@ -594,12 +601,16 @@
 (define (busy-work)
   ;; A scheduler thread's life: run the queued processes, and park
   ;; while there are none (RELEASE-SCHEDULER wakes it when one comes).
+  ;; Alarms stay off until it is parked (see START).
   (iterate loop ()
     (acquire-scheduler)
     (cond ((qempty? *scheduleQ*)
-	   (set! *idle-schedulers* (cons (%thread-index) *idle-schedulers*))
-	   (release-scheduler)
-	   (%thread-park #f))
+	   (let ((me (%thread-index)))
+	     (unless (memq me *idle-schedulers*)
+	       (set! *idle-schedulers* (cons me *idle-schedulers*))))
+	   (release-mutex *scheduleQ-mutex*) ; nothing queued: none to wake
+	   (%thread-park #f)
+	   (%enable-alarms))
 	  (else
 	   (release-scheduler)
 	   (pause)))
@@ -633,8 +644,10 @@
 ;;; unparks the list.  The timeout covers a wakeup lost in the
 ;;; register/look/park window (the permit model makes an unpark that
 ;;; comes first count, so the window is only a reordered pair of
-;;; plain accesses), and lets a parked thread notice processes queued
-;;; meanwhile.  Alone on the only OS thread with nothing queued, the
+;;; plain accesses) and one lost to this process's being preempted and
+;;; resumed on another OS thread between registering and parking (the
+;;; list names the first), and lets a parked thread notice processes
+;;; queued meanwhile.  Alone on the only OS thread with nothing queued, the
 ;;; holder cannot run at all; the loop spins on to the report.
 ;;; --------------------------------------------------
 
@@ -981,19 +994,25 @@
 ;;; #f if it is still running when that runs out.  A thread that
 ;;; failed makes its error the joiner's.
 (add-method (thread-join (thread name state value lock waiters) self . timeout)
-  (let ((ms (if (null? timeout) #f (car timeout)))
-	(me (%thread-index)))
+  (let ((ms (if (null? timeout) #f (car timeout))))
     (iterate wait ()
-      (let ((finished
-	     (%guard lock
-		     (lambda ()
-		       (or (eq? state 'done) (eq? state 'failed)
-			   (block (set! waiters (cons me waiters)) #f))))))
-	(cond (finished
+      ;; #t once it has finished, else the OS thread this process
+      ;; parks, alarms off until it is parked (see START).
+      (let ((me (%guard lock
+			(lambda ()
+			  (or (eq? state 'done) (eq? state 'failed)
+			      (block (%disable-alarms)
+				     (let ((me (%thread-index)))
+				       (set! waiters (cons me waiters))
+				       me)))))))
+	(cond ((eq? me #t)
 	       (if (eq? state 'failed)
 		   (error "Thread ~A died: ~A~%" name (%condition-string value))
 		   value))
-	      ((%thread-park ms) (wait))
+	      ((let ((woken (%thread-park ms)))
+		 (%enable-alarms)
+		 woken)
+	       (wait))
 	      (else
 	       (%guard lock (lambda () (set! waiters (delq me waiters))))
 	       (if (or (eq? state 'done) (eq? state 'failed)) (wait) #f)))))))
@@ -1014,28 +1033,50 @@
   (set! lock (make-named-mutex 'condition-variable))
   self)
 
+;;; A waiter is a ticket, (OS thread index . notified?), which a notify
+;;; takes off the list and marks before it unparks the thread.  Woken
+;;; unmarked (by an unpark meant for an earlier park of the thread), a
+;;; waiter parks again, or with a timeout takes its ticket off itself
+;;; and returns #f: no notify is ever spent on a waiter that has gone.
+
 (add-method (condition-wait (condition-variable waiters lock) self m . timeout)
-  (let ((ms (if (null? timeout) #f (car timeout)))
-	(me (%thread-index)))
-    (%guard lock (lambda () (set! waiters (append! waiters (list me)))))
+  (let* ((ms (if (null? timeout) #f (car timeout)))
+	 (ticket (%guard lock
+			 (lambda ()
+			   (%disable-alarms)	; until parked (see START)
+			   (let ((tk (cons (%thread-index) #f)))
+			     (set! waiters (append! waiters (list tk)))
+			     tk)))))
     (release-mutex m)
-    (let ((woken (%thread-park ms)))
-      (unless woken
-	(%guard lock (lambda () (set! waiters (delq me waiters)))))
+    (iterate park ()
+      (when (and (%thread-park ms) (not ms) (not (cdr ticket)))
+	(park)))
+    (%enable-alarms)
+    (let ((notified (%guard lock
+			    (lambda ()
+			      (or (cdr ticket)
+				  (block (set! waiters (delq ticket waiters))
+					 #f))))))
       (acquire-mutex m)
-      woken)))
+      notified)))
 
 (add-method (condition-notify (condition-variable waiters lock) self)
   (let ((w (%guard lock
 		   (lambda ()
 		     (and (not (null? waiters))
-			  (let ((x (car waiters)))
+			  (let ((tk (car waiters)))
 			    (set! waiters (cdr waiters))
-			    x))))))
-    (when w (%thread-unpark w))
+			    (set! (cdr tk) #t)
+			    tk))))))
+    (when w (%thread-unpark (car w)))
     (not (not w))))
 
 (add-method (condition-notify-all (condition-variable waiters lock) self)
-  (let ((ws (%guard lock (lambda () (let ((w waiters)) (set! waiters '()) w)))))
-    (dolist (w ws) (%thread-unpark w))
+  (let ((ws (%guard lock
+		    (lambda ()
+		      (let ((w waiters))
+			(set! waiters '())
+			(dolist (tk w) (set! (cdr tk) #t))
+			w)))))
+    (dolist (tk ws) (%thread-unpark (car tk)))
     (length ws)))

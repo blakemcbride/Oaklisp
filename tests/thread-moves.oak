@@ -1,0 +1,57 @@
+;;; Joins and condition waits by processes the scheduler moves between
+;;; OS threads: run with --pthreads 8 (threads-api.test).  A process
+;;; preempted between naming its OS thread for the waker and parking
+;;; once parked a different one, which nothing then unparked; the
+;;; first round below hung about one run in three before the fix.
+
+(define (check name got expected)
+  (if (equal? got expected)
+      (format #t "PASS ~A~%" name)
+      (format #t "FAIL ~A: got ~S expected ~S~%" name got expected))
+  (flush standard-output))
+
+;;; Main's process, released into the scheduler queue by PAUSE and by
+;;; the alarm, joins threads with processes queued.
+(check "joins by a moving process"
+       (let ((m (make mutex)) (n (list 0)))
+	 (dotimes (r 2000)
+	   (acquire-mutex m)
+	   (process-run-fn (lambda () (thread-sleep 2)) '())
+	   (let ((ts (map (lambda (k)
+			    (make-thread
+			     (lambda ()
+			       (with-mutex m (set! (car n) (+ (car n) 1))))))
+			  '(1 2 3 4))))
+	     (thread-sleep 5)
+	     (release-mutex m)
+	     (pause)
+	     (map thread-join ts)))
+	 (car n))
+       8000)
+
+;;; Waits on a condition variable, notified one by one and all at
+;;; once by a moving process.  A notify reaching a thread not yet
+;;; waiting is lost by design; the threads test GO before waiting.
+(check "condition waits with a moving notifier"
+       (let ((m (make mutex)) (cv (make condition-variable)) (n (list 0)))
+	 (dotimes (r 200)
+	   (let* ((go (list #f))
+		  (ts (map (lambda (k)
+			     (make-thread
+			      (lambda ()
+				(with-mutex m
+				  (let wait ()
+				    (unless (car go) (condition-wait cv m) (wait)))
+				  (set! (car n) (+ (car n) 1))))))
+			   '(1 2 3 4))))
+	     (process-run-fn (lambda () (thread-sleep 1)) '())
+	     (thread-sleep 2)
+	     (pause)
+	     (with-mutex m
+	       (set! (car go) #t)
+	       (if (even? r)
+		   (condition-notify-all cv)
+		   (dotimes (i 4) (condition-notify cv))))
+	     (map thread-join ts)))
+	 (car n))
+       800)
