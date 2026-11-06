@@ -49,9 +49,11 @@ interrupt() {
   fi
 }
 
+# Counts within a 32-bit fixnum (below 2^29): a bignum count takes
+# minutes.
 interrupt src 200000000
 if test -f nat/spin.so; then
-  interrupt nat 2000000000
+  interrupt nat 500000000
 else
   echo "no native module built: the native run skipped"
 fi

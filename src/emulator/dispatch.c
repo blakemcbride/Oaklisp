@@ -27,6 +27,7 @@
 #include <string.h>
 #include "config.h"
 #include "data.h"
+#include "oak-atomic.h"
 #include "xmalloc.h"
 #include "dispatch.h"
 
@@ -100,6 +101,10 @@ find_method_type_pair(ref_t op,
   ref_t *later_lists = inline_lists;
   size_t later_size = N_LATERS;
   size_t llp = 0;		/* index of first empty slot in table */
+
+  /* Found nowhere, the method is nil: the callers test for that, and
+     each happened to have nil there already, which nothing promised. */
+  *method_ptr = e_nil;
 
   while (1)			/* forever */
     {

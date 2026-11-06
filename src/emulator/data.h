@@ -25,6 +25,7 @@
 #ifndef _DATA_H_INCLUDED
 #define _DATA_H_INCLUDED
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>

@@ -428,6 +428,23 @@ reoffset(ref_t baseAddr,
 
 static void read_world_stream(FILE * d, const char *str);
 
+/* How many bytes are left in D from here, or -1 if it cannot be told
+   (a pipe). */
+#define REFS_IN(left) \
+  (input_is_binary ? (size_t)(left) / sizeof(ref_t) : ((size_t)(left) + 1) / 2)
+static long
+bytes_left(FILE * d)
+{
+  long here = ftell(d), end;
+
+  if (here < 0 || fseek(d, 0L, SEEK_END) != 0)
+    return -1;
+  end = ftell(d);
+  if (fseek(d, here, SEEK_SET) != 0 || end < here)
+    return -1;
+  return end - here;
+}
+
 void
 maybe_dump_world(int dumpstackp)
 {
@@ -570,6 +587,24 @@ read_world_stream(FILE * d, const char *str)
 		(size_t)world_size);
 	exit(EXIT_FAILURE);
       }
+    /* The rest of the file bounds it too: a binary ref takes
+       sizeof(ref_t) bytes and a text one at least two characters (the
+       last, at the end of the file, may lack its separator), so
+       a damaged size is refused here rather than allocated (a few
+       damaged bytes could ask for gigabytes). */
+    {
+      long left = bytes_left(d);
+
+      if (left >= 0
+	  && (size_t)world_size > REFS_IN(left))
+	{
+	  fprintf(stderr,
+		  "Error (loading world): \"%s\" claims %zu words but holds"
+		  " at most %zu; truncated or damaged.\n", str,
+		  (size_t)world_size, REFS_IN(left));
+	  exit(EXIT_FAILURE);
+	}
+    }
     spatic.size = (size_t) world_size;
   }
   alloc_space(&spatic, spatic.size);
@@ -605,7 +640,10 @@ read_world_stream(FILE * d, const char *str)
     {
       ref_t wp_count = read_ref(d);
 
-      if ((ssize_t)wp_count < 0 || wp_count >= (ref_t)INT_MAX)
+      long left = bytes_left(d);
+
+      if ((ssize_t)wp_count < 0 || wp_count >= (ref_t)INT_MAX
+	  || (left >= 0 && (size_t)wp_count > REFS_IN(left)))
 	{
 	  fprintf(stderr,
 		  "Error (loading world): bogus weak pointer count %zu.\n",

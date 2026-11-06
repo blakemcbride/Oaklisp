@@ -247,6 +247,7 @@ typedef struct {
     FILE *fp;
     int ungot;
     int has_ungot;
+    int depth;                  /* parse_sexp's nesting */
 } parser_t;
 
 static void parser_init(parser_t *p, FILE *fp)
@@ -254,6 +255,7 @@ static void parser_init(parser_t *p, FILE *fp)
     p->fp = fp;
     p->ungot = 0;
     p->has_ungot = 0;
+    p->depth = 0;
 }
 
 static int pgetc(parser_t *p)
@@ -289,6 +291,18 @@ static void skip_whitespace(parser_t *p)
 
 static sexp_t *parse_sexp(parser_t *p);
 
+/* A datum that has to be there: inside a list, after a dot or a quote.
+   The end of the file there means the file was cut short. */
+static sexp_t *parse_sexp_required(parser_t *p)
+{
+    sexp_t *s = parse_sexp(p);
+    if (s == NULL) {
+        fprintf(stderr, "Unexpected end of file (truncated .oa file?)\n");
+        exit(1);
+    }
+    return s;
+}
+
 /* Upcase a string in-place */
 static void upcase_str(char *s)
 {
@@ -306,8 +320,11 @@ static void upcase_str(char *s)
    would intern under those literal two- and six-character names. */
 static sexp_t *parse_atom(parser_t *p, int first_char)
 {
-    char buf[4096];
-    char esc[4096];             /* was buf[i] written through an escape? */
+    /* Static, not on the stack: an atom holds no other datum, so only
+       one is ever being read, and parse_sexp, which recurses as deep as
+       the data nest, may have these inlined into its frame. */
+    static char buf[4096];
+    static char esc[4096];      /* was buf[i] written through an escape? */
     int len = 0;
     int escaped = 0;            /* any escape seen in this token at all */
     int c = first_char;
@@ -605,7 +622,7 @@ static sexp_t *parse_hash(parser_t *p)
 
 static sexp_t *parse_string_lit(parser_t *p)
 {
-    char buf[65536];
+    static char buf[65536];     /* static: see parse_atom */
     int len = 0;
     for (;;) {
         int c = pgetc(p);
@@ -654,10 +671,14 @@ static sexp_t *parse_list(parser_t *p)
     for (;;) {
         skip_whitespace(p);
         int c = pgetc(p);
-        if (c == ')' || c == EOF) return head;
+        if (c == ')') return head;
+        if (c == EOF) {
+            fprintf(stderr, "Unexpected end of file in a list (truncated .oa file?)\n");
+            exit(1);
+        }
         pungetc(p, c);
 
-        sexp_t *car = parse_sexp(p);
+        sexp_t *car = parse_sexp_required(p);
         skip_whitespace(p);
 
         c = pgetc(p);
@@ -675,7 +696,7 @@ static sexp_t *parse_list(parser_t *p)
                Try dotted-pair: parse one sexp, check for closing ")".
                If ")" doesn't follow, it was actually the symbol ".". */
             if (c2 != EOF) pungetc(p, c2);
-            sexp_t *next = parse_sexp(p);
+            sexp_t *next = parse_sexp_required(p);
             skip_whitespace(p);
             c = pgetc(p);
             if (c == ')') {
@@ -698,7 +719,28 @@ static sexp_t *parse_list(parser_t *p)
 #undef LIST_APPEND
 }
 
+/* How deep data may nest: the parser recurses on it, and a damaged file
+   of nothing but open parentheses or quotes must get an error, not run
+   off the end of the C stack.  Compiled code nests a few levels. */
+#define MAX_NESTING 10000
+
+static sexp_t *parse_sexp_1(parser_t *p);
+
 static sexp_t *parse_sexp(parser_t *p)
+{
+    sexp_t *s;
+
+    if (++p->depth > MAX_NESTING) {
+        fprintf(stderr, "Data nested more than %d deep (damaged .oa file?)\n",
+                MAX_NESTING);
+        exit(1);
+    }
+    s = parse_sexp_1(p);
+    p->depth--;
+    return s;
+}
+
+static sexp_t *parse_sexp_1(parser_t *p)
 {
     skip_whitespace(p);
     int c = pgetc(p);
@@ -708,7 +750,7 @@ static sexp_t *parse_sexp(parser_t *p)
     if (c == '#') return parse_hash(p);
     if (c == '"') return parse_string_lit(p);
     if (c == '\'') {
-        sexp_t *val = parse_sexp(p);
+        sexp_t *val = parse_sexp_required(p);
         return make_pair(make_sym("QUOTE"), make_pair(val, SEXP_NIL));
     }
 
@@ -1276,6 +1318,66 @@ static sexp_t *triplify(sexp_t *lst)
     return out;
 }
 
+/* A malformed .oa file is refused with a message, never followed into
+   a crash: every block is (PATCHES OPCODES), the opcodes 16-bit
+   numbers, and each patch (KIND OFFSET VALUE) with KIND 0 (a variable:
+   VALUE a symbol), 1 (code: VALUE a block number) or 2 (a constant:
+   VALUE anything), OFFSET an opcode of the block. */
+static void oa_malformed(const char *filename, const char *what)
+{
+    fprintf(stderr, "Malformed .oa file %s: %s\n", filename, what);
+    exit(1);
+}
+
+/* The length of the proper list S, or -1. */
+static long proper_len(sexp_t *s)
+{
+    long n = 0;
+    while (s && s->type == S_PAIR) {
+        n++;
+        s = s->u.pair.cdr;
+    }
+    return (s && s->type == S_NIL) ? n : -1;
+}
+
+static int is_int(sexp_t *s) { return s && s->type == S_INT; }
+
+static void validate_oa_blocks(const char *filename, sexp_t *blocks)
+{
+    if (proper_len(blocks) < 0)
+        oa_malformed(filename, "the blocks are not a list");
+    for (sexp_t *bl = blocks; bl->type == S_PAIR; bl = bl->u.pair.cdr) {
+        sexp_t *blk = bl->u.pair.car;
+        if (proper_len(blk) != 2)
+            oa_malformed(filename, "a block is not (PATCHES OPCODES)");
+        sexp_t *patches = sexp_nth(blk, 0), *ops = sexp_nth(blk, 1);
+        long nops = proper_len(ops);
+        if (nops < 0)
+            oa_malformed(filename, "a block's opcodes are not a list");
+        for (sexp_t *o = ops; o->type == S_PAIR; o = o->u.pair.cdr)
+            if (!is_int(o->u.pair.car) || o->u.pair.car->u.ival < 0
+                || o->u.pair.car->u.ival > 0xFFFF)
+                oa_malformed(filename, "an opcode is not a 16-bit number");
+        if (proper_len(patches) < 0)
+            oa_malformed(filename, "a block's patches are not a list");
+        for (sexp_t *pl = patches; pl->type == S_PAIR; pl = pl->u.pair.cdr) {
+            sexp_t *pat = pl->u.pair.car;
+            if (proper_len(pat) != 3)
+                oa_malformed(filename, "a patch is not (KIND OFFSET VALUE)");
+            sexp_t *k = sexp_nth(pat, 0), *off = sexp_nth(pat, 1),
+                *v = sexp_nth(pat, 2);
+            if (!is_int(k) || k->u.ival < 0 || k->u.ival > 2)
+                oa_malformed(filename, "a patch kind is not 0, 1 or 2");
+            if (!is_int(off) || off->u.ival < 0 || off->u.ival >= nops)
+                oa_malformed(filename, "a patch offset lies outside its block");
+            if (k->u.ival == 0 && v->type != S_SYM)
+                oa_malformed(filename, "a variable patch names no symbol");
+            if (k->u.ival == 1 && !is_int(v))
+                oa_malformed(filename, "a code patch names no block");
+        }
+    }
+}
+
 static sexp_t *read_oa_file(const char *filename)
 {
     FILE *fp = fopen(filename, "r");
@@ -1333,6 +1435,7 @@ static sexp_t *read_oa_file(const char *filename)
 
     if (!old_format) {
         /* Already in new format: ((patches opcodes) ...) */
+        validate_oa_blocks(filename, form);
         return form;
     }
 
@@ -1341,6 +1444,13 @@ static sexp_t *read_oa_file(const char *filename)
     sexp_t *blocks = sexp_nth(form, 1);
 
     /* Build sym_vec array from sym_list */
+    if (proper_len(sym_list) < 0)
+        oa_malformed(filename, "the symbols are not a list");
+    for (sexp_t *sl = sym_list; sl->type == S_PAIR; sl = sl->u.pair.cdr)
+        if (sl->u.pair.car->type != S_SYM)
+            oa_malformed(filename, "the symbol list holds a non-symbol");
+    if (proper_len(blocks) < 0)
+        oa_malformed(filename, "the blocks are not a list");
     int nsyms = sexp_list_len(sym_list);
     sexp_t **sym_vec = NULL;
     if (nsyms > 0) {
@@ -1359,6 +1469,8 @@ static sexp_t *read_oa_file(const char *filename)
     sexp_t *blist = blocks;
     while (blist && blist->type == S_PAIR) {
         sexp_t *blk = blist->u.pair.car;
+        if (proper_len(blk) != 2 || proper_len(sexp_nth(blk, 0)) < 0)
+            oa_malformed(filename, "a block is not (PATCHES OPCODES)");
         sexp_t *flat_patches = sexp_nth(blk, 0);  /* flat patch list */
         sexp_t *opcodes = sexp_nth(blk, 1);       /* opcode list */
 
@@ -1375,11 +1487,15 @@ static sexp_t *read_oa_file(const char *filename)
             sexp_t *offset_s = sexp_nth(triple, 1);
             sexp_t *value_s = sexp_nth(triple, 2);
 
+            if (!is_int(type_s) || !is_int(offset_s))
+                oa_malformed(filename, "a patch kind or offset is not a number");
             long type_val = type_s->u.ival;
 
             if (type_val >= 5) {
                 /* Symbol reference */
                 long actual_type = type_val - 5;
+                if (!is_int(value_s))
+                    oa_malformed(filename, "a symbol patch names no index");
                 long sym_idx = value_s->u.ival;
                 if (sym_idx < 0 || sym_idx >= nsyms) {
                     fprintf(stderr, "Symbol index %ld out of range\n", sym_idx);
@@ -1405,6 +1521,7 @@ static sexp_t *read_oa_file(const char *filename)
     }
 
     if (sym_vec) free(sym_vec);
+    validate_oa_blocks(filename, result);
     return result;
 }
 

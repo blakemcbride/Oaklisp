@@ -55,12 +55,12 @@
 				 #||
 				 (destructure** r-charlist
 				   (('#\. '#\. '#\.)
-				    (cerror "Treat the '...' as if it were escaped."
+				    (read-cerror "Treat the '...' as if it were escaped."
 					    "The token '...' can not be read unescaped."))
 				   (otherwise ))
 				 ||#
 				 )
-			(cerror "Treat the '...' as if it were escaped."
+			(read-cerror "Treat the '...' as if it were escaped."
 				"The token '...' can not be read unescaped."))
 		      (intern (#^string (reverse r-charlist))))) )
 
@@ -122,7 +122,7 @@
 					   (cons (upcase c) r-charlist)
 					   escaped?))
 			   ((eq? c-syntax 'illegal)
-			    (cerror
+			    (read-cerror
 			     "Ignore the illegal character"
 			     "Illegal char ~C encountered while reading token."
 			     c)
@@ -158,7 +158,7 @@
 		   (if (eq? (car r-charlist) #\/)
 		       (no-denominator c r-charlist)
 		       (block (unread-char stream c)
-			      (/ numerator n)))
+			      (ratio numerator n r-charlist)))
 		   (let ((c-syntax (%vref/ci standard-read-table c)))
 		     (cond ((or (eq? c-syntax 'constituent)
 				(and (not (eq? c-syntax 'whitespace))
@@ -179,7 +179,7 @@
 			    (if (eq? (car r-charlist) #\/)
 				(no-denominator c r-charlist)
 				(block (unread-char stream c)
-				       (/ numerator n))))
+				       (ratio numerator n r-charlist))))
 			   (else
 			    (signal bad-syntax-table-entry c c-syntax))))) )
 
@@ -220,6 +220,14 @@
 	       (unread-char stream c)
 	       (let ((x (/ num denom)))
 		 (if neg? (- x) x)) )
+
+	     ( (ratio numerator n r-charlist)
+	       ;; A zero denominator is no number: a read error, not a
+	       ;; division error out of the reader.
+	       (if (zero? n)
+		   (read-error-signal "~A has a zero denominator."
+				      (#^string (reverse r-charlist)))
+		   (/ numerator n)) )
 	     )
 
 	    (let* ((c (read-char stream))

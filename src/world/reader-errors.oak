@@ -53,6 +53,32 @@
 
 (define-instance missing-denominator type '(token) (list proceedable-read-error object))
 
+;;; The reader's other complaints, made with a message as ERROR and
+;;; CERROR make them, are read errors all the same: the manual has every
+;;; malformed or truncated input signal a subtype of READ-ERROR, which is
+;;; what a program reading untrusted text catches.
+(define-instance generic-read-error type '() (list generic-fatal-error read-error))
+(define-instance generic-proceedable-read-error type '()
+  (list generic-proceedable-error proceedable-read-error))
+(define-instance generic-unexpected-eof type '() (list generic-fatal-error unexpected-eof))
+
+(define (read-error-signal format-string . format-args)
+  (signal generic-read-error format-string . format-args))
+
+(define (read-cerror proceed-message format-string . format-args)
+  (signal generic-proceedable-read-error proceed-message format-string . format-args))
+
+(define (read-eof-error format-string . format-args)
+  (signal generic-unexpected-eof format-string . format-args))
+
+;;; The datum a prefix (a quote, #x, #+FEATURE) applies to: the end of
+;;; the file there is a truncated input, not a datum to quote.
+(define (read-after-prefix stream what)
+  (let ((x (read stream)))
+    (if (eq? x the-eof-token)
+	(read-eof-error "EOF after ~A." what)
+	x)))
+
 
 
 

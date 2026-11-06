@@ -167,13 +167,13 @@
 			     (let ((x (subread stream)))
 			       (cond ((eq? x the-unread-object) (aux))
 				     ((eq? x the-dot-token)
-				      (cerror
+				      (read-cerror
 				       "Ignore the dot."
 				       "Read a second '.' inside a list construct closed by ~C."
 				       closing-delimiter)
 				      (aux))
 				     ((eq? x the-eof-token)
-				      (error "EOF reading the dotted ending of a list that was to be terminated with ~C."
+				      (read-eof-error "EOF reading the dotted ending of a list that was to be terminated with ~C."
 					     closing-delimiter))
 				     (else
 				      (iterate aux ()
@@ -185,17 +185,17 @@
 					       (let ((y (read stream)))
 						 (cond ((eq? y the-unread-object) (aux))
 						       (else
-							(error "Second object read after dot of a list to be terminated with ~C."
+							(read-error-signal "Second object read after dot of a list to be terminated with ~C."
 							       closing-delimiter))))))))))))
 			  (else
-			   (cerror
+			   (read-cerror
 			    "Ignore the dot."
 			    "Read a '.' inside a list construct closed by ~C ~
  not allowing one."
 			    closing-delimiter)
 			   (aux))))
 		   ((eq? c the-eof-token)
-		    (error "EOF encountered while reading a list that was to be terminated with ~C."
+		    (read-eof-error "EOF encountered while reading a list that was to be terminated with ~C."
 			   closing-delimiter))
 		   (else
 		    (cons x (read-until closing-delimiter closing-dot? stream)))))))))
@@ -229,7 +229,7 @@
 		   (read-char stream)
 		   (aux))
 		  ((eq? c-syntax 'illegal)
-		   (error "The character ~C is illegal." (read-char stream)))
+		   (read-error-signal "The character ~C is illegal." (read-char stream)))
 		  ((or (eq? c-syntax 'constituent)
 		       (eq? c-syntax 'single-escape))
 		   (read-token stream))

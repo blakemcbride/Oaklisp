@@ -24,7 +24,7 @@
 (define-hash-macro-char #\\
   (lambda (stream char arg)
     (when arg
-      (cerror
+      (read-cerror
        "Ignore the font specifier."
        "A #~A~C was encountered, but #~C does not understand fonts yet."
        arg char char))
@@ -41,7 +41,7 @@
 		      ;; except the first, which the backslash escapes, so
 		      ;; STR here is the half converted "nOSUCHNAME".
 		      ;; Report the name that was actually looked up.
-		      (cerror
+		      (read-cerror
 		       "Supply a character to be returned instead."
 		       "The token ~A cannot be interpreted as a character."
 		       name)))))))))

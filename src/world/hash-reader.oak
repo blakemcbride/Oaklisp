@@ -39,6 +39,8 @@
   (lambda (stream char)
     (iterate aux ((i nil))
       (let ((c (read-char stream)))
+	(when (eq? c the-eof-token)
+	  (read-eof-error "EOF after #~A." (or i "")))
 	(if (digit? c 10)
 	    (aux (+ (* (or i 0) 10)
 		    (digit-value c)))
@@ -60,7 +62,7 @@
     (lambda (stream char arg)
       (when arg
 	(signal cant-have-#-arg char arg))
-      (list sym (read stream)))))
+      (list sym (read-after-prefix stream (format #f "#~C" char))))))
 
 (define-quotelike-#-macro-char #\* 'fluid)
 (define-quotelike-#-macro-char #\^ 'coercer)
@@ -88,30 +90,33 @@
 	  ((eq? s 'or) (any? feature? (cdr x)))
 	  ((eq? s 'not)
 	   (when (not (null? (cddr x)))
-	     (error "~S is a bad feature specifier, as not only takes one argument."
+	     (read-error-signal "~S is a bad feature specifier, as not only takes one argument."
 		    x))
 	   (not (feature? (second x))))
-	  (else (error "~S is an unknown feature specifier." x)))))
+	  (else (read-error-signal "~S is an unknown feature specifier." x)))))
+
+(add-method (feature? (object) x)
+  (read-error-signal "~S is not a feature specifier." x))
 
 (define-hash-macro-char #\+
   (lambda (stream char arg)
     (when arg
       (signal cant-have-#-arg char arg))
-    (if (feature? (read stream))
-	(read stream)
+    (if (feature? (read-after-prefix stream "#+"))
+	(read-after-prefix stream "#+FEATURE")
 	(block (bind ((#*read-suppress #t))
-		 (read stream))
+		 (read-after-prefix stream "#+FEATURE"))
 	       the-unread-object))))
 
 (define-hash-macro-char #\-
   (lambda (stream char arg)
     (when arg
       (signal cant-have-#-arg char arg))
-    (if (feature? (read stream))
+    (if (feature? (read-after-prefix stream "#-"))
 	(block (bind ((#*read-suppress #t))
-		 (read stream))
+		 (read-after-prefix stream "#-FEATURE"))
 	       the-unread-object)
-	(read stream))))
+	(read-after-prefix stream "#-FEATURE"))))
 
 (set! (feature? 'oaklisp) #t)
 
@@ -120,9 +125,11 @@
   (lambda (stream char arg)
     (when arg
       (signal cant-have-#-arg char arg))
-    (let ((l (read stream)))
+    (let ((l (read-after-prefix stream "#C")))
+      (unless (and (pair? l) (pair? (cdr l)))
+	(read-error-signal "#~C~S is ill formed: not a list of two numbers." char l))
       (when (cddr l)
-	(cerror "Ignore the excess components."
+	(read-cerror "Ignore the excess components."
 		"#~C~A is ill formed: too many components." char l))
       (make-complex (car l) (cadr l)))))
 
@@ -130,7 +137,7 @@
   (lambda (stream char arg)
     (when arg
       (signal cant-have-#-arg char arg))
-    (let ((s (read stream)))
+    (let ((s (read-after-prefix stream "#.")))
       (if #*read-suppress
 	  ;; quote here is a hint that s was not evaluated
 	  `,s
@@ -141,28 +148,28 @@
     (when arg
       (signal cant-have-#-arg char arg))
     (bind ((#*input-base 2))
-      (read stream))))
+      (read-after-prefix stream "#B"))))
 
 (define-hash-macro-char #\o
   (lambda (stream char arg)
     (when arg
       (signal cant-have-#-arg char arg))
     (bind ((#*input-base 8))
-      (read stream))))
+      (read-after-prefix stream "#O"))))
 
 (define-hash-macro-char #\d
   (lambda (stream char arg)
     (when arg
       (signal cant-have-#-arg char arg))
     (bind ((#*input-base 10))
-      (read stream))))
+      (read-after-prefix stream "#D"))))
 
 (define-hash-macro-char #\x
   (lambda (stream char arg)
     (when arg
       (signal cant-have-#-arg char arg))
     (bind ((#*input-base 16))
-      (read stream))))
+      (read-after-prefix stream "#X"))))
 
 (define-hash-macro-char #\r
   (lambda (stream char arg)
@@ -171,7 +178,7 @@
 	     (aux (signal must-have-#-arg char arg)))
 	    (else
 	     (bind ((#*input-base arg))
-	       (read stream)))))))
+	       (read-after-prefix stream (format #f "#~DR" arg))))))))
 
 (define-hash-macro-char #\(
   (lambda (stream char arg)
@@ -179,7 +186,7 @@
 	   (l (length r))
 	   (arg (or arg l)))
       (when (< arg l)
-	(cerror
+	(read-cerror
 	 "Ignore the excess componants."
 	 "The construct #~D~S puts more things in the vector than it is long."
 	 arg r))
@@ -232,14 +239,14 @@
 
 (define-hash-macro-char #\[
   (lambda (stream char arg)
-    (let ((selector (read stream)))
+    (let ((selector (read-after-prefix stream "#[")))
       (cond ((hash-bracket-option selector)
 	     =>
 	     (lambda (op)
 	       (op char arg selector stream)))
 	    (else
 	     (block0
-	      (cerror "Return a value."
+	      (read-cerror "Return a value."
 		      "The #~A~A~A construct is unknown."
 		      (or arg "") char selector)
 	      (read-until #\] #f stream)))))))
@@ -262,19 +269,21 @@
 (set! (hash-bracket-option 'symbol)
       (lambda (char arg selector stream)
 	(when arg
-	  (cerror "Ignore the argument."
+	  (read-cerror "Ignore the argument."
 		  "The #~D~A~S construct is malformed; no argument is taken."
 		  arg char selector))
 	(let ((l (read-until #\] #f stream)))
+	  (unless (and (pair? l) (or (string? (car l)) (symbol? (car l))))
+	    (read-error-signal "The #~A~S construct names no symbol." char selector))
 	  (when (not (null? (cdr l)))
-	    (cerror "Ignore the extra stuff."
+	    (read-cerror "Ignore the extra stuff."
 		    "This contruct takes only one thing to coerce."))
 	  (#^symbol (car l)))))
 
 (set! (hash-bracket-option 'delay)
       (lambda (char arg selector stream)
 	(when arg
-	  (cerror "Ignore the argument."
+	  (read-cerror "Ignore the argument."
 		  "The #~D~A~S construct is malformed; no argument is taken."
 		  arg char selector))
 	(destructure* (val num) (read-until #\] #f stream)
@@ -284,7 +293,7 @@
   (lambda (stream char arg)
     (when arg
       (signal cant-have-#-arg char arg))
-    (let ((x (read stream)))
+    (let ((x (read-after-prefix stream "#E")))
       ;; (make-exact x)
       x)))
 
@@ -292,8 +301,8 @@
   (lambda (stream char arg)
     (when arg
       (signal cant-have-#-arg char arg))
-    (let ((x (read stream)))
-      (cerror "Return the corresponding exact number."
+    (let ((x (read-after-prefix stream "#I")))
+      (read-cerror "Return the corresponding exact number."
 	      "Inexact numbers are not supported.")
       x)))
 
@@ -307,7 +316,7 @@
     (when arg
       (signal cant-have-#-arg char arg))
     (bind ((#*read-suppress #t))
-      (read stream))
+      (read-after-prefix stream "#;"))
     the-unread-object))
 
 ;;; eof

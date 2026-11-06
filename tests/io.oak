@@ -45,6 +45,31 @@
 (check "print escape off" (let ((s (make string-output-stream))) (bind ((#*print-escape #f)) (print "s" s)) (#^string s)) "s")
 (check "newline freshline" (let ((s (make string-output-stream))) (write-string "a" s) (freshline s) (freshline s) (#^string s)) (append "a" nl))
 
+;;; Malformed and truncated input signals a READ-ERROR, as the manual
+;;; says, and never puts the end of file into the data: a reader fuzzing
+;;; campaign found a prefix at the end giving (QUOTE #<EOF>), a lone # and
+;;; #+ failing with no method, 1/0 dividing by zero, and many syntax
+;;; errors reported by a plain ERROR.
+(define (read-outcome str)
+  (catch-errors (general-error (lambda (e) 'other-error))
+    (catch-errors (read-error (lambda (e) 'read-error))
+      (read (make string-input-stream str)))))
+(define (eof-outcome str)
+  (catch-errors (general-error (lambda (e) 'other-error))
+    (catch-errors (unexpected-eof (lambda (e) 'eof))
+      (read (make string-input-stream str)))))
+(check "prefix at end of file"
+       (map eof-outcome '("'" "`" "," ",@" "#*" "#^" "#x" "#3r" "#C" "#+foo" "#-foo" "#+" "#" "#12" "#E" "#;" "#["))
+       '(eof eof eof eof eof eof eof eof eof eof eof eof eof eof eof eof eof))
+(check "malformed input is a read error"
+       (map read-outcome '("1/0" "-3/0" "#x1/0" "#C5" "#+5 x" "#[symbol]" "#[symbol 5]"
+			  "#\\Nosuchchar" "(1 . 2 3)" "#Z" "(1 . . 2)"))
+       '(read-error read-error read-error read-error read-error read-error read-error
+	 read-error read-error read-error read-error))
+(check "well formed input still reads"
+       (map read-outcome '("1/2" "#x1f" "'a" "#+oaklisp 5" "#-oaklisp 5 6"))
+       '(1/2 31 'a 5 6))
+
 ;;; Files, in the current directory (the test script cds to a scratch dir).
 (define fname "oaklisp-io-test.tmp")
 (write-file fname '(hello (world) 42))

@@ -44,7 +44,8 @@
 
 (define (define-quotelike-macro-char char prefix print-form)
   (if print-form (register-quotelike-prefix char prefix))
-  (define-macro-char char (lambda (stream char) (list prefix (read stream)))))
+  (define-macro-char char
+    (lambda (stream char) (list prefix (read-after-prefix stream char)))))
 
 ;;; Use the above facilities to define some useful stuff.
 
@@ -107,8 +108,8 @@
     (let ((n (peek-char stream)))
       (cond ((eq? n #\@)
 	     (read-char stream)
-	     (list 'unquote-splicing (read stream)))
-	    (else (list 'unquote (read stream)))))))
+	     (list 'unquote-splicing (read-after-prefix stream ",@")))
+	    (else (list 'unquote (read-after-prefix stream char)))))))
 
 ;;; Read characters up to and including the terminator.
 
